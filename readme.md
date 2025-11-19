@@ -82,27 +82,6 @@ Coming soon... (hopefully)
 
 ---
 
-## 📂 Project Structure
-
-```
-.
-├── build.sh         # Build script (macOS/Linux)
-├── build.bat        # Build script (Windows)
-├── baseband_recording.wav   # Default sample I/Q file
-└── src/
-    ├── main.cpp             # Main loop & threading logic
-    ├── IQSources.h          # RTL-SDR / SDRPlay / File input
-    ├── Demodulator.h        # FM/AM/SSB DSP pipeline
-    ├── AudioSink.h          # Audio output via miniaudio
-    ├── UI.h                 # Custom UI widgets
-    ├── DSP.h                # FFT, filters, and math tools
-    ├── NativeDialogs.h      # Cross-platform file dialogs
-    ├── RingBuffer.h         # Thread-safe buffer
-    └── miniaudio.h          # Single-header audio library
-```
-
----
-
 ## ⚠️ Troubleshooting
 
 ### **“SDRPlay API Open Failed”**

@@ -101,11 +101,11 @@ struct SharedData {
     std::mutex mtx;
     double tunedFreqPercent = 0.5;
     double bandwidth = 12000.0;
+    long long centerFreq = 0;
     
-    // Nowe/Zmienione pola kontrolne
-    float volume = 1.0f;     // Cyfrowa głośność
+    float volume = 1.0f;
     bool isMuted = false;
-    float rfGain = -1.0f;    // -1.0 oznacza AUTO, 0..50 manual
+    float rfGain = -1.0f;    // -1.0 is AUTO, 0..50 manual
     
     Mode mode = Mode::NFM;
     bool isPlaying = false;
@@ -216,21 +216,34 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
             lastRfGain = rfGainReq;
         }
 
-        // OBSŁUGA NAGRYWANIA - Start/Stop
         if (doRecord && !recorder.active) {
-             // Generowanie nazwy pliku
+             long long currentCenterHz;
+             { std::lock_guard<std::mutex> l(shared.mtx); currentCenterHz = shared.centerFreq; }
+
              char timeBuf[32]; std::time_t now = std::time(nullptr);
              std::strftime(timeBuf, sizeof(timeBuf), "%Y%m%d_%H%M%S", std::localtime(&now));
              
              std::string filename;
-             if (rPath.empty()) filename = "rec_" + std::string(timeBuf);
-             else filename = rPath + "/rec_" + std::string(timeBuf);
+             std::string freqLabel;
 
              if (rMode == RecMode::AUDIO) {
-                 filename += "_audio.wav";
+                 double offset = (targetFreqPct - 0.5) * src->getSampleRate();
+                 long long tunedHz = currentCenterHz + (long long)offset;
+                 
+                 // Format: 102500kHz
+                 freqLabel = "_" + std::to_string(tunedHz / 1000) + "kHz";
+                 
+                 if (rPath.empty()) filename = "rec_" + std::string(timeBuf) + freqLabel + "_audio.wav";
+                 else filename = rPath + "/rec_" + std::string(timeBuf) + freqLabel + "_audio.wav";
+
                  recorder.start(filename, (int)AUDIO_RATE, 1);
              } else {
-                 filename += "_IQ.wav";
+                 // use center frequency for iq filename
+                 freqLabel = "_" + std::to_string(currentCenterHz) + "Hz";
+
+                 if (rPath.empty()) filename = "rec_" + std::string(timeBuf) + freqLabel + "_IQ.wav";
+                 else filename = rPath + "/rec_" + std::string(timeBuf) + freqLabel + "_IQ.wav";
+
                  recorder.start(filename, (int)src->getSampleRate(), 2);
              }
              { std::lock_guard<std::mutex> l(shared.mtx); shared.recStatus = "REC: " + filename; }
@@ -259,9 +272,9 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
         int readCount = src->read(iqBuffer.data(), chunkSize);
 
         if (readCount > 0) {
-            // Nagrywanie Baseband (IQ)
+            // Recording Baseband (IQ)
             if (recorder.active && rMode == RecMode::BASEBAND) {
-                // Konwersja IQ (Complex) na float array (L R L R)
+                // convert IQ (Complex) to float array (L R L R)
                 std::vector<float> rawFloat(readCount * 2);
                 for(int i=0; i<readCount; i++) {
                     rawFloat[i*2] = (float)iqBuffer[i].real();
@@ -448,14 +461,41 @@ int main() {
                 std::lock_guard<std::mutex> lock(sharedData.mtx);
                 size_t lastSlash = path.find_last_of("/\\");
                 sharedData.currentFilename = (lastSlash == std::string::npos) ? path : path.substr(lastSlash + 1);
-                // Parse Frequency logic here (omitted for brevity)
+                std::string fn = sharedData.currentFilename;
+                long long parsedFreq = 0;
+                bool foundFreq = false;
+                size_t hzPos = fn.find("Hz");
+                if (hzPos != std::string::npos) {
+                    size_t underscorePos = fn.rfind('_', hzPos);
+                    if (underscorePos != std::string::npos) {
+                        std::string freqStr = fn.substr(underscorePos + 1, hzPos - underscorePos - 1);
+                        try {
+                            parsedFreq = std::stoll(freqStr);
+                            foundFreq = true;
+                        } catch (...) {}
+                    }
+                }
+
+                if (foundFreq) {
+                    currentCenterFreq = parsedFreq;
+                    freqVFO.setFrequency(parsedFreq); 
+                } else {
+                    currentCenterFreq = 0;
+                    freqVFO.setFrequency(0);
+                }
             }
             newSource->open(path);
             rateDropdown.setOptions({sharedData.currentFilename});
         } else if (sourceIdx == 1) { 
             newSource = std::make_shared<RtlSdrSource>();
             rateDropdown.setOptions(newSource->getAvailableSampleRatesText()); rateDropdown.setSelection(rateIdx);
-            if (!newSource->open("0", targetRate)) { sourceDropdown.selectedIndex = 0; sourceDropdown.selectedText.setString("File"); newSource = std::make_shared<FileSource>(); newSource->open("None"); } 
+            if (!newSource->open("0", targetRate)) { 
+                std::cerr << "[Error] Couldn't open RTL-SDR!" << std::endl;
+                sourceDropdown.selectedIndex = 0; 
+                sourceDropdown.selectedText.setString("File (WAV)"); 
+                newSource = std::make_shared<FileSource>(); 
+                newSource->open("None"); 
+            }
             else { newSource->setCenterFrequency(freqVFO.getFrequency()); currentCenterFreq = freqVFO.getFrequency(); }
         } else { 
             newSource = std::make_shared<SdrPlaySource>();
@@ -468,6 +508,10 @@ int main() {
         isPlaying = false; btnRecStart.setText("REC"); //btnRecStart.setColor(sf::Color(150,0,0));
         audio.stop(); btnPlay.setText(">"); btnPlay.setColor(sf::Color(116, 57, 57)); audio.clear(); std::fill(waterfall.begin(), waterfall.end(), 0);
     };
+
+    bool isDraggingScale = false;
+    bool isDraggingTuner = false;
+    float lastDragX = 0.0f;
 
     // === MAIN LOOP ===
     while (window.isOpen()) {
@@ -482,6 +526,7 @@ int main() {
              sharedData.isMuted = isMuted;
              sharedData.recMode = currentRecMode;
              sharedData.recPath = currentRecPath;
+             sharedData.centerFreq = currentCenterFreq;
              
              // Update status text from recording state
              if (sharedData.isRecording) {
@@ -597,6 +642,11 @@ int main() {
                     isPlaying = s;
                 }
 
+
+                sf::Vector2f m_fs = window.mapPixelToCoords(sf::Mouse::getPosition(window));
+                float axisY_FreqScale = (float)TOP_BAR_H + SPEC_H;
+                bool inFreqScaleZone = (m_fs.y >= axisY_FreqScale - 10 && m_fs.y <= axisY_FreqScale + 20 && m_fs.x < SPEC_W);
+                if (!inFreqScaleZone)
                 if (const auto* mb = ev->getIf<sf::Event::MouseButtonPressed>()) {
                     if (mb->button == sf::Mouse::Button::Left) {
                         sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window));
@@ -610,6 +660,7 @@ int main() {
                         }
                     }
                 }
+                    
                 if (const auto* me = ev->getIf<sf::Event::MouseMoved>()) {
                     sf::Vector2f m = window.mapPixelToCoords(me->position);
                     float graphY = m.y - TOP_BAR_H;
@@ -618,7 +669,83 @@ int main() {
                 }
             }
         }
-        
+
+        // --- LOGIC FOR SLIDING THE SCALE (DRAGGING THE SCALE / CENTER FREQUENCY) ---
+        if (isHw && !sourceDropdown.isOpen && !rateDropdown.isOpen && !isDraggingTuner) {
+            sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window));
+            float axisY = (float)TOP_BAR_H + SPEC_H;
+            
+            bool inScaleZone = (m.y >= axisY - 10 && m.y <= axisY + 20 && m.x < SPEC_W);
+
+            if (sf::Mouse::isButtonPressed(sf::Mouse::Button::Left)) {
+                if (!isDraggingScale && inScaleZone) {
+                    isDraggingScale = true;
+                    lastDragX = m.x;
+                }
+            } else {
+                isDraggingScale = false;
+            }
+
+            if (isDraggingScale) {
+                float deltaPx = lastDragX - m.x;
+                
+                if (std::abs(deltaPx) > 0.0f) {
+                    // Convert pixels to Hertz
+                    // Formula: (SampleRate / ScreenWidth) * Offset
+                    double hzPerPx = hwSampleRate / (double)SPEC_W;
+                    long long deltaHz = (long long)(deltaPx * hzPerPx);
+
+                    currentCenterFreq += deltaHz;
+
+                    lastDragX = m.x;
+
+                    // Send the command to the device (with a time limit to prevent lag)
+                    if (debouncer.getElapsedTime().asMilliseconds() > 30) {
+                        std::lock_guard<std::mutex> l(sourceMtx);
+                        if (currentSource) currentSource->setCenterFrequency(currentCenterFreq);
+                        debouncer.restart();
+                    }
+                }
+            }
+        }
+        // --- TUNER DRAGGING LOGIC ---
+        // Check if the left mouse button is being held continuously
+        if (!sourceDropdown.isOpen && !rateDropdown.isOpen && !audioDropdown.isOpen && !isDraggingScale) {
+            if (sf::Mouse::isButtonPressed(sf::Mouse::Button::Left)) {
+                sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window));
+                
+                float graphY = m.y - TOP_BAR_H;
+                
+                bool insideGraph = (m.x >= 0 && m.x < SPEC_W && graphY >= 0 && graphY < (SPEC_H + WATERFALL_H));
+                
+                if (insideGraph || isDraggingTuner) {
+                    if (insideGraph) isDraggingTuner = true; 
+                    if (isDraggingTuner) {
+                        double clickPct = m.x / SPEC_W;
+                        
+                        if (clickPct < 0.0) clickPct = 0.0;
+                        if (clickPct > 1.0) clickPct = 1.0;
+
+                        double offsetHz = (clickPct - 0.5) * hwSampleRate;
+                        long long clickedFreq = currentCenterFreq + (long long)offsetHz;
+                        
+                        if (stickyCenterMode && isHw) {
+                            // Center Tuning mode
+                            pendingCenterFreq = clickedFreq; 
+                            debouncer.restart(); 
+                            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; }
+                            freqVFO.setFrequency(clickedFreq);
+                        } else {
+                            // Standard mode
+                            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = clickPct; }
+                            freqVFO.setFrequency(clickedFreq);
+                        }
+                    }
+                }
+            } else {
+                isDraggingTuner = false;
+            }
+        }
         // --- CURSORS ---
         {
             bool hover = false;
@@ -635,6 +762,11 @@ int main() {
             
             if (volSlider.track.getGlobalBounds().contains(m)) hover = true;
             if (rfGainSlider.track.getGlobalBounds().contains(m)) hover = true;
+
+            float axisY = (float)TOP_BAR_H + SPEC_H;
+            if (isHw && m.y >= axisY - 10 && m.y <= axisY + 20 && m.x < SPEC_W) {
+                hover = true;
+            }
 
             if (hover) { if (cursorHand) window.setMouseCursor(*cursorHand); } else { if (cursorArrow) window.setMouseCursor(*cursorArrow); }
         }
