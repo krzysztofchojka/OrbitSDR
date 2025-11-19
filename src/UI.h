@@ -24,7 +24,7 @@ public:
         track.setFillColor({80, 80, 80});
         
         handle.setSize({10.f, 20.f}); 
-        handle.setFillColor(sf::Color::Green); 
+        handle.setFillColor({78, 78, 236}); 
         handle.setOrigin({5.f, 10.f});
         
         label.setPosition({x, y - 15}); 
@@ -119,7 +119,7 @@ public:
 
     void setActive(bool a) {
         active = a;
-        shape.setFillColor(active ? sf::Color(0, 150, 0) : sf::Color(60, 60, 60));
+        shape.setFillColor(active ? sf::Color(78, 78, 236) : sf::Color(60, 60, 60));
     }
 
     void setText(std::string t) { label.setString(t); }

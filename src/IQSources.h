@@ -7,7 +7,8 @@
 #include <atomic>
 #include <fstream>
 #include <mutex>
-#include <cstring> // memset
+#include <cstring> 
+#include <algorithm> // std::min_element, std::abs
 #include "RingBuffer.h"
 #include "NativeDialogs.h" 
 
@@ -34,7 +35,10 @@ public:
     virtual std::vector<uint32_t> getAvailableSampleRatesValues() { return {}; }
 
     virtual void setCenterFrequency(long long hz) {}
-    virtual void setGain(int db) {}
+    
+    // gainDb: -1 for Auto (AGC), 0..50 for Manual
+    virtual void setGain(int gainDb) {} 
+    
     virtual bool isHardware() { return false; }
     virtual bool isSeekable() { return false; } 
     virtual void seek(double percent) {}
@@ -52,19 +56,9 @@ class FileSource : public IQSource {
 
 #pragma pack(push, 1)
     struct WavHeader { 
-        char r[4];      // RIFF
-        uint32_t s;     // Size
-        char w[4];      // WAVE
-        char f[4];      // fmt
-        uint32_t l;     // Length
-        uint16_t t;     // Type
-        uint16_t c;     // Channels
-        uint32_t sr;    // Sample Rate
-        uint32_t br;    // Byte Rate
-        uint16_t a;     // Alignment
-        uint16_t b;     // Bits
-        char d[4];      // data
-        uint32_t ds;    // Data Size
+        char r[4]; uint32_t s; char w[4]; char f[4]; 
+        uint32_t l; uint16_t t; uint16_t c; uint32_t sr; 
+        uint32_t br; uint16_t a; uint16_t b; char d[4]; uint32_t ds; 
     };
 #pragma pack(pop)
 
@@ -76,9 +70,7 @@ public:
 
         WavHeader h; 
         file.read((char*)&h, sizeof(h)); 
-        
-        // Check if stereo (IQ requires 2 channels)
-        if (h.c != 2) return false;
+        if (h.c != 2) return false; // Must be stereo for IQ
 
         sampleRate = h.sr; 
         dataSize = h.ds; 
@@ -87,11 +79,7 @@ public:
         return true;
     }
 
-    void close() override { 
-        if (file.is_open()) file.close(); 
-        active = false; 
-    }
-
+    void close() override { if (file.is_open()) file.close(); active = false; }
     void start() override { active = true; }
     void stop() override { active = false; }
 
@@ -107,32 +95,22 @@ public:
         }
 
         currentPos += readSamples * 4; 
-        
-        if (file.eof()) { 
-            file.clear(); 
-            file.seekg(dataStart); 
-            currentPos = 0; 
-        }
+        if (file.eof()) { file.clear(); file.seekg(dataStart); currentPos = 0; }
         return readSamples;
     }
 
     double getSampleRate() override { return (double)sampleRate; }
-    
     bool isSeekable() override { return true; }
     
     void seek(double percent) override { 
         if (!file.is_open()) return; 
         uint64_t target = (uint64_t)(percent * dataSize); 
-        target -= (target % 4); // Align to block
-        file.clear(); 
-        file.seekg(dataStart + target); 
+        target -= (target % 4); 
+        file.clear(); file.seekg(dataStart + target); 
         currentPos = target; 
     }
     
-    double getProgress() override { 
-        return dataSize > 0 ? (double)currentPos / dataSize : 0.0; 
-    }
-
+    double getProgress() override { return dataSize > 0 ? (double)currentPos / dataSize : 0.0; }
     std::vector<std::string> getAvailableSampleRatesText() override { return {"File Default"}; }
     std::vector<uint32_t> getAvailableSampleRatesValues() override { return {0}; }
 };
@@ -146,6 +124,7 @@ class RtlSdrSource : public IQSource {
     uint32_t sampleRate = 2048000; 
     uint32_t centerFreq = 100000000;
     std::mutex hwMtx;
+    std::vector<int> availableGains; 
 
     static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx) {
         RtlSdrSource* self = (RtlSdrSource*)ctx; 
@@ -153,13 +132,8 @@ class RtlSdrSource : public IQSource {
         
         int samples = len / 2; 
         std::vector<Complex> converted(samples);
-        
-        // Convert 8-bit unsigned (0..255) to float (-1.0..1.0)
         for (int i = 0; i < samples; i++) {
-            converted[i] = Complex(
-                (buf[i * 2] - 127.5) / 127.5, 
-                (buf[i * 2 + 1] - 127.5) / 127.5
-            );
+            converted[i] = Complex((buf[i * 2] - 127.5) / 127.5, (buf[i * 2 + 1] - 127.5) / 127.5);
         }
         self->ringBuffer.push(converted.data(), samples);
     }
@@ -170,8 +144,7 @@ public:
 
     bool open(std::string id, uint32_t requestedRate = 0) override {
         std::lock_guard<std::mutex> lock(hwMtx);
-        int dev_index = 0; 
-        try { dev_index = std::stoi(id); } catch(...) {}
+        int dev_index = 0; try { dev_index = std::stoi(id); } catch(...) {}
 
         if (rtlsdr_open(&dev, dev_index) < 0) return false;
 
@@ -180,28 +153,28 @@ public:
 
         rtlsdr_set_sample_rate(dev, sampleRate); 
         rtlsdr_set_center_freq(dev, centerFreq); 
-        rtlsdr_set_tuner_gain_mode(dev, 0); // Auto gain default
+        rtlsdr_set_tuner_gain_mode(dev, 0); 
         rtlsdr_reset_buffer(dev);
         
+        int count = rtlsdr_get_tuner_gains(dev, NULL);
+        if (count > 0) {
+            availableGains.resize(count);
+            rtlsdr_get_tuner_gains(dev, availableGains.data());
+        }
         return true;
     }
 
     void close() override { 
         stop(); 
         std::lock_guard<std::mutex> lock(hwMtx);
-        if (dev) { 
-            rtlsdr_close(dev); 
-            dev = nullptr; 
-        } 
+        if (dev) { rtlsdr_close(dev); dev = nullptr; } 
     }
 
     void start() override { 
         if (running) return; 
         running = true; 
         if (dev) rtlsdr_reset_buffer(dev); 
-        worker = std::thread([this]() { 
-            rtlsdr_read_async(dev, rtlsdr_callback, this, 0, 0); 
-        }); 
+        worker = std::thread([this]() { rtlsdr_read_async(dev, rtlsdr_callback, this, 0, 0); }); 
     }
 
     void stop() override { 
@@ -212,10 +185,7 @@ public:
         } 
     }
 
-    int read(Complex* buffer, int count) override { 
-        return ringBuffer.pop(buffer, count); 
-    }
-    
+    int read(Complex* buffer, int count) override { return ringBuffer.pop(buffer, count); }
     double getSampleRate() override { return (double)sampleRate; }
     bool isHardware() override { return true; }
     
@@ -227,13 +197,22 @@ public:
     
     void setGain(int db) override { 
         std::lock_guard<std::mutex> lock(hwMtx);
-        if (dev && running) { 
-            if (db == -1) {
-                rtlsdr_set_tuner_gain_mode(dev, 0); 
-            } else { 
-                rtlsdr_set_tuner_gain_mode(dev, 1); 
-                rtlsdr_set_tuner_gain(dev, db * 10); 
-            } 
+        if (!dev || !running) return;
+
+        if (db == -1) {
+            rtlsdr_set_tuner_gain_mode(dev, 0); 
+        } else {
+            rtlsdr_set_tuner_gain_mode(dev, 1);
+            int targetGain = db * 10;
+            int bestGain = 0;
+            int minDiff = 100000;
+            if (!availableGains.empty()) {
+                for (int g : availableGains) {
+                    int diff = std::abs(g - targetGain);
+                    if (diff < minDiff) { minDiff = diff; bestGain = g; }
+                }
+            } else { bestGain = targetGain; }
+            rtlsdr_set_tuner_gain(dev, bestGain); 
         } 
     }
 
@@ -257,9 +236,7 @@ class SdrPlaySource : public IQSource {
     long long centerFreq = 100000000;
     std::mutex hwMtx;
     
-    // FIX: Store the structure copy, not a pointer to stack memory!
     sdrplay_api_DeviceT currentDevice;
-    
     sdrplay_api_DeviceParamsT *deviceParams = NULL;
     sdrplay_api_CallbackFnsT cbFns;
     std::atomic<bool> running {false};
@@ -270,11 +247,9 @@ class SdrPlaySource : public IQSource {
         
         Complex tempBuf[2048];
         unsigned int processed = 0;
-        
         while (processed < numSamples) {
             unsigned int chunk = (numSamples - processed);
             if (chunk > 2048) chunk = 2048;
-            
             for (unsigned int i = 0; i < chunk; i++) {
                 tempBuf[i] = Complex(xi[processed + i] / 32768.0, xq[processed + i] / 32768.0);
             }
@@ -282,7 +257,6 @@ class SdrPlaySource : public IQSource {
             processed += chunk;
         }
     }
-    
     static void EventCallback(sdrplay_api_EventT eventId, sdrplay_api_TunerSelectT tuner, sdrplay_api_EventParamsT *params, void *cbContext) {}
 
 public:
@@ -295,44 +269,28 @@ public:
 
         if (sdrplay_api_Open() != sdrplay_api_Success) return false;
         
-        sdrplay_api_DeviceT devs[6]; 
-        unsigned int nDevs = 0;
+        sdrplay_api_DeviceT devs[6]; unsigned int nDevs = 0;
         sdrplay_api_GetDevices(devs, &nDevs, 6);
+        if (nDevs == 0) { sdrplay_api_Close(); return false; }
         
-        if (nDevs == 0) { 
-            sdrplay_api_Close(); 
-            return false; 
-        }
-        
-        // FIX: Copy device info to class member
-        currentDevice = devs[0]; 
-        currentDevice.tuner = sdrplay_api_Tuner_A; 
-
-        // Select using the class member address
-        if (sdrplay_api_SelectDevice(&currentDevice) != sdrplay_api_Success) { 
-            sdrplay_api_Close(); 
-            return false; 
-        }
+        currentDevice = devs[0]; currentDevice.tuner = sdrplay_api_Tuner_A; 
+        if (sdrplay_api_SelectDevice(&currentDevice) != sdrplay_api_Success) { sdrplay_api_Close(); return false; }
         isSelected = true;
 
-        if (sdrplay_api_GetDeviceParams(currentDevice.dev, &deviceParams) != sdrplay_api_Success) { 
-             close(); 
-             return false; 
-        }
+        if (sdrplay_api_GetDeviceParams(currentDevice.dev, &deviceParams) != sdrplay_api_Success) { close(); return false; }
 
-        if (requestedRate > 0) sampleRate = (double)requestedRate;
-        else sampleRate = 2000000.0;
+        if (requestedRate > 0) sampleRate = (double)requestedRate; else sampleRate = 2000000.0;
 
         deviceParams->devParams->fsFreq.fsHz = sampleRate;
         deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)centerFreq;
         
-        // Bandwidth Selection
         deviceParams->rxChannelA->tunerParams.bwType = sdrplay_api_BW_1_536;
         if (sampleRate > 2000000) deviceParams->rxChannelA->tunerParams.bwType = sdrplay_api_BW_5_000;
         if (sampleRate > 8000000) deviceParams->rxChannelA->tunerParams.bwType = sdrplay_api_BW_8_000;
 
         deviceParams->rxChannelA->tunerParams.ifType = sdrplay_api_IF_Zero;
-        deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_CTRL_EN;
+        // FIX: USE SPECIFIC AGC RATE (50HZ) AS PER DOCS
+        deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_50HZ; 
 
         return true;
     }
@@ -352,20 +310,13 @@ public:
         if (running || !isSelected) return;
         std::lock_guard<std::mutex> lock(hwMtx);
         
-        // Safety Update before start
         if (deviceParams) {
              deviceParams->devParams->fsFreq.fsHz = sampleRate;
              deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)centerFreq;
         }
-
         memset(&cbFns, 0, sizeof(cbFns));
-        cbFns.StreamACbFn = StreamCallback; 
-        cbFns.EventCbFn = EventCallback;
-        
-        if (sdrplay_api_Init(currentDevice.dev, &cbFns, this) == sdrplay_api_Success) { 
-            isInitialized = true; 
-            running = true; 
-        }
+        cbFns.StreamACbFn = StreamCallback; cbFns.EventCbFn = EventCallback;
+        if (sdrplay_api_Init(currentDevice.dev, &cbFns, this) == sdrplay_api_Success) { isInitialized = true; running = true; }
     }
 
     void stop() override {
@@ -376,10 +327,7 @@ public:
         }
     }
 
-    int read(Complex* buffer, int count) override { 
-        return ringBuffer.pop(buffer, count); 
-    }
-    
+    int read(Complex* buffer, int count) override { return ringBuffer.pop(buffer, count); }
     double getSampleRate() override { return sampleRate; }
     bool isHardware() override { return true; }
     
@@ -388,12 +336,40 @@ public:
         centerFreq = hz;
         if (running && deviceParams) {
              deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)hz;
-             // API 3.06 Compatible Update
              sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Tuner_Frf, sdrplay_api_Update_Ext1_None);
         }
     }
     
-    void setGain(int db) override {}
+    // Correct Gain Implementation for SDRPlay using Doc 3.0
+    void setGain(int db) override {
+        std::lock_guard<std::mutex> lock(hwMtx);
+        if (!running || !deviceParams) return;
+
+        if (db == -1) {
+            // Enable AGC (Use 50Hz refresh)
+            deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_50HZ;
+            sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Ctrl_Agc, sdrplay_api_Update_Ext1_None);
+        } else {
+            // Disable AGC
+            deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_DISABLE;
+            
+            // Manual Logic: Force LNA to Max Sensitivity (State 0)
+            deviceParams->rxChannelA->tunerParams.gain.LNAstate = 0;
+
+            // Map Slider (0..50) to Gain Reduction dB (0..60+)
+            // Slider 50 (Max Gain) -> 0 dB Reduction
+            // Slider 0 (Min Gain)  -> ~60 dB Reduction
+            int reduction = (50 - db) * 1.2; 
+            if (reduction < 0) reduction = 0;
+            
+            deviceParams->rxChannelA->tunerParams.gain.gRdB = reduction;
+            
+            // Update AGC, Tuner Gain (LNA/gRdB). Note: Update_Tuner_Gr covers both.
+            sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, 
+                               (sdrplay_api_ReasonForUpdateT)(sdrplay_api_Update_Ctrl_Agc | sdrplay_api_Update_Tuner_Gr), 
+                               sdrplay_api_Update_Ext1_None);
+        }
+    }
 
     std::vector<std::string> getAvailableSampleRatesText() override {
         return {"2.0 MSps", "4.0 MSps", "6.0 MSps", "8.0 MSps", "10.0 MSps"};
@@ -405,16 +381,12 @@ public:
 
 #else
 
-// Stub class if SDRPlay is disabled
 class SdrPlaySource : public IQSource {
 public:
     bool open(std::string id, uint32_t r = 0) override { 
-        showPopup("Feature Not Available", "Run ./build.sh and enable SDRPlay."); 
-        return false; 
+        showPopup("Feature Not Available", "Run ./build.sh and enable SDRPlay."); return false; 
     }
-    void close() override {} 
-    void start() override {} 
-    void stop() override {}
+    void close() override {} void start() override {} void stop() override {}
     int read(Complex* b, int c) override { return 0; }
     double getSampleRate() override { return 2000000; }
     bool isHardware() override { return true; }
