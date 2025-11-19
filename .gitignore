@@ -1,0 +1,4 @@
+.vscode
+orbitsdr
+.DS_Store
+*.o
