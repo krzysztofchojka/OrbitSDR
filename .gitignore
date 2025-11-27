@@ -2,3 +2,9 @@
 orbitsdr
 .DS_Store
 *.o
+dump_files.sh
+dump.txt
+*.bak
+*.wav
+ax25
+aprs.log

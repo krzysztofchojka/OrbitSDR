@@ -84,7 +84,8 @@ public:
     void stop() override { active = false; }
 
     int read(Complex* out, int count) override {
-        if (!active || !file.is_open()) return 0;
+        //allow to read from file even on pause to provide FFT preview
+        if (!file.is_open()) return 0; 
         
         std::vector<int16_t> buf(count * 2);
         file.read((char*)buf.data(), buf.size() * 2);
@@ -217,7 +218,7 @@ public:
     }
 
     std::vector<std::string> getAvailableSampleRatesText() override {
-        return {"1.024 MSps", "1.4 MSps", "1.8 MSps", "2.048 MSps", "2.4 MSps", "3.2 MSps"};
+        return {/*"1.024 MSps",*/ "1.4 MSps", "1.8 MSps", "2.048 MSps", "2.4 MSps", "3.2 MSps"};
     }
     std::vector<uint32_t> getAvailableSampleRatesValues() override {
         return {1024000, 1400000, 1800000, 2048000, 2400000, 3200000};

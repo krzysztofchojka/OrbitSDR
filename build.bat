@@ -1,4 +1,5 @@
 @echo off
+REM -- THIS SCRIPT IS NOT CURRENTLY WORKING, BUILDING FOR WINDOWS IS POSSIBLE BUT NOT WITH THIS SCRIPT --
 echo Kompilacja projektu SDR na Windows...
 
 REM --- KONFIGURACJA ŚCIEŻEK (Zmień to na swoje ścieżki do SFML!) ---

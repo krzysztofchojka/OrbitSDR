@@ -19,23 +19,43 @@ public:
     Slider(float x, float y, float w, float minV, float maxV, float startV, std::string n, const sf::Font& font) 
         : minVal(minV), maxVal(maxV), currentVal(startV), name(n), label(font, n, 12) 
     {
-        track.setPosition({x, y}); 
         track.setSize({w, 5.f}); 
         track.setFillColor({80, 80, 80});
         
         handle.setSize({10.f, 20.f}); 
         handle.setFillColor({78, 78, 236}); 
-        handle.setOrigin({5.f, 10.f});
+        handle.setOrigin({5.f, 10.f}); // SFML 3: Vector
         
-        label.setPosition({x, y - 15}); 
         label.setFillColor(sf::Color::White);
         
+        setPosition(x, y);
+    }
+
+    void setPosition(float x, float y) {
+        track.setPosition({x, y}); // SFML 3: Vector
+        label.setPosition({x, y - 15}); // SFML 3: Vector
         updateHandlePos();
     }
+    
+    void setWidth(float w) {
+        track.setSize({w, 5.f}); // SFML 3: Vector
+        updateHandlePos();
+    }
+
+    void setLimits(float newMin, float newMax) {
+        if (minVal == newMin && maxVal == newMax) return;
+        minVal = newMin; maxVal = newMax;
+        if (currentVal < minVal) currentVal = minVal;
+        if (currentVal > maxVal) currentVal = maxVal;
+        updateHandlePos();
+    }
+
+    void setText(std::string t) { label.setString(t); }
 
     void updateHandlePos() {
         float p = (currentVal - minVal) / (maxVal - minVal);
         p = std::clamp(p, 0.0f, 1.0f);
+        // SFML 3: Vector
         handle.setPosition({
             track.getPosition().x + p * track.getSize().x, 
             track.getPosition().y + 2.5f
@@ -47,10 +67,8 @@ public:
             if (mb->button == sf::Mouse::Button::Left) {
                 sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
                 sf::FloatRect area = track.getGlobalBounds(); 
-                
-                // Expand hit area slightly for easier grabbing
-                area.position.y -= 10; 
-                area.size.y += 20;
+                // SFML 3: Rect members change
+                area.position.y -= 10; area.size.y += 20; 
                 
                 if (area.contains(m)) { 
                     isDragging = true; 
@@ -58,32 +76,24 @@ public:
                 }
             }
         } else if (const auto* mb = ev.getIf<sf::Event::MouseButtonReleased>()) {
-            if (mb->button == sf::Mouse::Button::Left) {
-                isDragging = false;
-            }
+            if (mb->button == sf::Mouse::Button::Left) isDragging = false;
         }
     }
 
     void update(const sf::RenderWindow& win) {
-        if (isDragging) {
-            updateValue(win.mapPixelToCoords(sf::Mouse::getPosition(win)).x);
-        }
+        if (isDragging) updateValue(win.mapPixelToCoords(sf::Mouse::getPosition(win)).x);
     }
 
     void updateValue(float mx) {
+        // SFML 3: getSize().x instead of getGlobalBounds().width for shapes is safer usually, or track.getSize().x
         float p = std::clamp((mx - track.getPosition().x) / track.getSize().x, 0.0f, 1.0f);
         currentVal = minVal + p * (maxVal - minVal);
         updateHandlePos();
     }
 
-    void draw(sf::RenderWindow& w) { 
-        w.draw(track); 
-        w.draw(handle); 
-        w.draw(label); 
-    }
+    void draw(sf::RenderWindow& w) { w.draw(track); w.draw(handle); w.draw(label); }
 };
 
-// --- BUTTON CLASS ---
 class SdrButton {
 public:
     sf::RectangleShape shape;
@@ -93,17 +103,27 @@ public:
     SdrButton(float x, float y, float w, float h, std::string t, const sf::Font& font) 
         : label(font, t, 14) 
     {
-        shape.setPosition({x, y}); 
-        shape.setSize({w, h});
+        shape.setSize({w, h}); // SFML 3
         shape.setFillColor(sf::Color(60, 60, 60));
         shape.setOutlineThickness(1); 
         shape.setOutlineColor(sf::Color::White);
-        
-        // Center text
+        setPosition(x, y);
+    }
+
+    void setPosition(float x, float y) {
+        shape.setPosition({x, y}); // SFML 3
+        centerText();
+    }
+    
+    void centerText() {
         sf::FloatRect textRect = label.getLocalBounds();
+        sf::Vector2f shapePos = shape.getPosition();
+        sf::Vector2f shapeSize = shape.getSize();
+        
+        // SFML 3: Rect uses size.x/y instead of width/height
         label.setPosition({
-            x + (w - textRect.size.x) / 2.0f, 
-            y + (h - textRect.size.y) / 2.0f - 4.0f
+            shapePos.x + (shapeSize.x - textRect.size.x) / 2.0f, 
+            shapePos.y + (shapeSize.y - textRect.size.y) / 2.0f - 4.0f
         });
     }
 
@@ -122,16 +142,11 @@ public:
         shape.setFillColor(active ? sf::Color(78, 78, 236) : sf::Color(60, 60, 60));
     }
 
-    void setText(std::string t) { label.setString(t); }
+    void setText(std::string t) { label.setString(t); centerText(); }
     void setColor(sf::Color c) { shape.setFillColor(c); }
-    
-    void draw(sf::RenderWindow& w) { 
-        w.draw(shape); 
-        w.draw(label); 
-    }
+    void draw(sf::RenderWindow& w) { w.draw(shape); w.draw(label); }
 };
 
-// --- DROPDOWN CLASS ---
 class Dropdown {
 public:
     sf::RectangleShape mainBox;
@@ -145,24 +160,24 @@ public:
     Dropdown(float _x, float _y, float _w, float _h, const sf::Font& font) 
         : x(_x), y(_y), w(_w), h(_h), fontRef(font), selectedText(font, "", 12) 
     {
-        mainBox.setPosition({x, y}); 
-        mainBox.setSize({w, h});
+        mainBox.setSize({w, h}); // SFML 3
         mainBox.setFillColor(sf::Color(60, 60, 60));
         mainBox.setOutlineColor(sf::Color::White); 
         mainBox.setOutlineThickness(1);
-        
-        selectedText.setPosition({x + 5, y + 5}); 
         selectedText.setFillColor(sf::Color::White);
+        setPosition(_x, _y);
+    }
+
+    void setPosition(float _x, float _y) {
+        x = _x; y = _y;
+        mainBox.setPosition({x, y}); // SFML 3
+        selectedText.setPosition({x + 5, y + 5}); // SFML 3
     }
 
     void setOptions(const std::vector<std::string>& opts) {
         options = opts;
-        if (!options.empty()) { 
-            selectedIndex = 0; 
-            selectedText.setString(options[0]); 
-        } else { 
-            selectedText.setString("No Devices"); 
-        }
+        if (!options.empty()) { selectedIndex = 0; selectedText.setString(options[0]); } 
+        else { selectedText.setString("No Devices"); }
     }
 
     void setSelection(int index) {
@@ -177,24 +192,23 @@ public:
             if (mb->button == sf::Mouse::Button::Left) {
                 sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
                 
-                // Click on main box
                 if (mainBox.getGlobalBounds().contains(m)) { 
                     isOpen = !isOpen; 
                     return false; 
                 }
                 
-                // Click on options
                 if (isOpen) {
                     for (size_t i = 0; i < options.size(); ++i) {
+                        // SFML 3: Rect ctor needs vector
                         sf::FloatRect optionRect({x, y + (i + 1) * h}, {w, h});
                         if (optionRect.contains(m)) {
                             selectedIndex = i; 
                             selectedText.setString(options[i]);
                             isOpen = false; 
-                            return true; // Changed
+                            return true; 
                         }
                     }
-                    isOpen = false; // Clicked outside
+                    isOpen = false; 
                 }
             }
         }
@@ -203,35 +217,27 @@ public:
 
     void draw(sf::RenderWindow& win) {
         win.draw(mainBox);
-        
         std::string display = selectedText.getString();
         if (display.length() > 22) display = display.substr(0, 20) + "..";
-        
-        sf::Text tempTxt = selectedText; 
-        tempTxt.setString(display); 
+        sf::Text tempTxt = selectedText; tempTxt.setString(display); 
         win.draw(tempTxt);
 
         if (isOpen) {
             for (size_t i = 0; i < options.size(); ++i) {
                 sf::RectangleShape optBox({w, h}); 
-                optBox.setPosition({x, y + (i + 1) * h});
+                optBox.setPosition({x, y + (i + 1) * h}); // SFML 3
                 optBox.setFillColor(sf::Color(80, 80, 80)); 
                 optBox.setOutlineColor(sf::Color(100, 100, 100)); 
                 optBox.setOutlineThickness(1);
                 
                 sf::Text optTxt(fontRef, options[i], 12); 
-                optTxt.setPosition({x + 5, y + (i + 1) * h + 5});
+                optTxt.setPosition({x + 5, y + (i + 1) * h + 5}); // SFML 3
                 
-                // Hover effect
                 sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
-                if (optBox.getGlobalBounds().contains(m)) {
-                    optBox.setFillColor(sf::Color(120, 120, 120));
-                }
+                if (optBox.getGlobalBounds().contains(m)) optBox.setFillColor(sf::Color(120, 120, 120));
                 
                 win.draw(optBox);
-                
-                std::string s = options[i]; 
-                if (s.length() > 22) s = s.substr(0, 20) + "..";
+                std::string s = options[i]; if (s.length() > 22) s = s.substr(0, 20) + "..";
                 optTxt.setString(s); 
                 win.draw(optTxt);
             }
@@ -239,7 +245,6 @@ public:
     }
 };
 
-// --- VFO / DIGIT TUNER CLASS ---
 class FrequencyDisplay {
 public:
     long long frequency;
@@ -258,20 +263,22 @@ public:
         frequency = 100000000;
         text.setCharacterSize(42); 
         text.setFillColor(sf::Color::White);
-        text.setPosition({x + 8, y});
-        
         hoverRect.setFillColor(sf::Color(255, 255, 255, 30)); 
+        setPosition(_x, _y);
+    }
+
+    void setPosition(float _x, float _y) {
+        x = _x; y = _y;
+        text.setPosition({x + 8, y}); // SFML 3
     }
 
     void setFrequency(long long f) { frequency = f; }
     long long getFrequency() const { return frequency; }
-    
     void setEnabled(bool e) { enabled = e; }
 
     std::string formatWithDots(long long freq) {
         std::string s = std::to_string(freq);
         while (s.length() < 10) s = "0" + s; 
-        
         std::string result = "";
         int count = 0;
         for (int i = s.length() - 1; i >= 0; i--) {
@@ -283,31 +290,17 @@ public:
     }
 
     void update(const sf::RenderWindow& win) {
-        // 1. ALWAYS update text, even if disabled.
-        // SFML's findCharacterPos() requires the string to be set to return correct coordinates
-        // later in the draw() loop or during interaction.
         std::string str = formatWithDots(frequency);
         text.setString(str); 
+        if (!enabled) { isHovered = false; return; }
 
-        // 2. If disabled, stop here (no hover/interaction logic needed)
-        if (!enabled) {
-            isHovered = false;
-            hoverPower = 0;
-            return; 
-        }
-
-        // --- Interaction Logic (Only when enabled) ---
         sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
         sf::FloatRect bounds = text.getGlobalBounds();
-        
-        isHovered = false;
-        hoverPower = 0;
+        isHovered = false; hoverPower = 0;
 
-        sf::FloatRect hitBounds = bounds;
-        hitBounds.position.x -= 2; 
-        hitBounds.size.x += 4;
-        hitBounds.position.y -= 2; 
-        hitBounds.size.y += 4;
+        sf::FloatRect hitBounds = bounds; 
+        hitBounds.position.x -= 2; hitBounds.size.x += 4; 
+        hitBounds.position.y -= 2; hitBounds.size.y += 4;
 
         if (hitBounds.contains(m)) {
             long long currentPower = 1;
@@ -317,11 +310,8 @@ public:
             for (int i = str.length() - 1; i >= 0; i--) {
                 char c = str[i];
                 if (c == '.') continue; 
-
                 sf::Vector2f charPos = text.findCharacterPos(i);
                 float charWidth = text.findCharacterPos(i + 1).x - charPos.x;
-                
-                // Fallback for width if calculation fails (e.g., last char)
                 if (charWidth <= 0) charWidth = text.getCharacterSize() * 0.6f; 
 
                 sf::FloatRect charRect({charPos.x, visualTop - 2.0f}, {charWidth, visualHeight + 4.0f});
@@ -329,12 +319,9 @@ public:
                 if (charRect.contains(m)) {
                     isHovered = true;
                     hoverPower = currentPower;
-                    
                     float midY = charRect.position.y + (charRect.size.y / 2.0f);
                     isTopHalf = (m.y < midY);
-
                     hoverRect.setSize({charWidth, charRect.size.y / 2.0f});
-                    
                     if (isTopHalf) hoverRect.setPosition(charRect.position);
                     else hoverRect.setPosition({charRect.position.x, midY});
                     break; 
@@ -345,21 +332,17 @@ public:
     }
 
     bool handleEvent(const sf::Event& ev) {
-        if (!enabled) return false;
-        if (!isHovered || hoverPower == 0) return false;
-
+        if (!enabled || !isHovered || hoverPower == 0) return false;
         if (const auto* mb = ev.getIf<sf::Event::MouseButtonPressed>()) {
             if (mb->button == sf::Mouse::Button::Left) {
-                if (isTopHalf) frequency += hoverPower;
-                else frequency -= hoverPower;
+                if (isTopHalf) frequency += hoverPower; else frequency -= hoverPower;
                 if (frequency < 0) frequency = 0;
                 return true; 
             }
         }
         if (const auto* scroll = ev.getIf<sf::Event::MouseWheelScrolled>()) {
             if (scroll->wheel == sf::Mouse::Wheel::Vertical) {
-                if (scroll->delta > 0) frequency += hoverPower;
-                else frequency -= hoverPower;
+                if (scroll->delta > 0) frequency += hoverPower; else frequency -= hoverPower;
                 if (frequency < 0) frequency = 0;
                 return true; 
             }
@@ -372,15 +355,11 @@ public:
         sf::RectangleShape bg({b.size.x + 30, b.size.y + 28});
         bg.setPosition({x - 5, y - 8});
         bg.setFillColor(sf::Color(20, 20, 20)); 
-        
-        // Darker outline if disabled
         bg.setOutlineColor(enabled ? sf::Color(60, 60, 60) : sf::Color(40, 40, 40));
         bg.setOutlineThickness(1);
         win.draw(bg);
 
-        if (enabled && isHovered && hoverPower > 0) {
-            win.draw(hoverRect);
-        }
+        if (enabled && isHovered && hoverPower > 0) win.draw(hoverRect);
 
         std::string str = formatWithDots(frequency);
         bool leadingZero = true;
@@ -390,21 +369,65 @@ public:
             char c = str[i];
             if (c != '0' && c != '.') leadingZero = false;
             if (i == str.length() - 1) leadingZero = false; 
-
-            // Color Logic
-            if (!enabled) {
-                // Grayed out mode (File Mode)
-                tempText.setFillColor(sf::Color(60, 60, 60)); 
-            } else {
-                // Normal mode: Dim leading zeros
+            if (!enabled) tempText.setFillColor(sf::Color(60, 60, 60)); 
+            else {
                 if (leadingZero) tempText.setFillColor(sf::Color(90, 90, 90)); 
                 else tempText.setFillColor(sf::Color::White); 
             }
-
             sf::Vector2f p = text.findCharacterPos(i);
             tempText.setPosition(p);
             tempText.setString(std::string(1, c));
             win.draw(tempText);
         }
+    }
+};
+
+class Checkbox {
+public:
+    sf::RectangleShape box;
+    sf::RectangleShape checkmark;
+    sf::Text label;
+    bool checked = false;
+
+    Checkbox(float x, float y, std::string text, const sf::Font& font, bool initial = false) 
+        : label(font, text, 12), checked(initial) 
+    {
+        box.setSize({20, 20});
+        box.setPosition({x, y}); // SFML 3
+        box.setFillColor(sf::Color(40, 40, 40));
+        box.setOutlineColor(sf::Color::White);
+        box.setOutlineThickness(1);
+
+        checkmark.setSize({10, 10});
+        checkmark.setPosition({x + 5, y + 5}); // SFML 3
+        checkmark.setFillColor(sf::Color::Green);
+
+        label.setFillColor(sf::Color::White);
+        label.setPosition({x, y - 16}); // SFML 3
+    }
+
+    void setPosition(float x, float y) {
+        box.setPosition({x, y});
+        checkmark.setPosition({x + 5, y + 5});
+        label.setPosition({x, y - 16});
+    }
+
+    bool isClicked(const sf::Event& ev, const sf::RenderWindow& win) {
+        if (const auto* mb = ev.getIf<sf::Event::MouseButtonPressed>()) {
+            if (mb->button == sf::Mouse::Button::Left) {
+                sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
+                if (box.getGlobalBounds().contains(m)) {
+                    checked = !checked;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    void draw(sf::RenderWindow& w) {
+        w.draw(box);
+        if (checked) w.draw(checkmark);
+        w.draw(label);
     }
 };
