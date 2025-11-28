@@ -2,13 +2,15 @@
 
 A lightweight, high-performance SDR receiver built with C++17 and SFML. 
 
-## ⚠️ Current Status: Very Early Access (Pre-Alpha)
+![Build](https://github.com/krzysztofchojka/OrbitSDR/actions/workflows/build.yml/badge.svg)
+
+## Current Status: Very Early Access (Pre-Alpha)
 
 Please note that this project is in a very early stage of development. It is currently tested primarily on **macOS** (Apple Silicon) but should also work on Linux and Windows.
 
 ![screenshot](screenshot.png)
 
-## ✨ Features
+## Features
 
 - **Baseband Player:** Play raw IQ `.wav` files with a seekable timeline slider to analyze recordings (for now only 16-bit PCM is supported).
 - **Integrated APRS:** Built-in AX.25 packet decoder with a live dashboard for messages and GPS telemetry (more digital modes planned).
