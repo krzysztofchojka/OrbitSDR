@@ -32,7 +32,7 @@ const int TOP_BAR_H = 60;
 const int SIDEBAR_W = 300; 
 
 // --- TUNING CONFIG ---
-const int TUNING_LATENCY_MS = 100; // Fixed latency to prevent USB stalling
+const int TUNING_LATENCY_MS = 50; // Fixed latency to prevent USB stalling
 
 // playback on 1.024msps is not smooth, disabled for now
 const std::vector<uint32_t> RTL_RATES_VAL = {/*1024000,*/ 1400000, 1800000, 2048000, 2400000, 3200000};

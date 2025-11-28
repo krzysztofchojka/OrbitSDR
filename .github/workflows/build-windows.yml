@@ -1,0 +1,55 @@
+name: Build OrbitSDR (Windows MinGW)
+
+on:
+  push:
+    branches: [ "main", "master", "test-ci" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-windows-mingw:
+    name: Windows (MinGW64)
+    runs-on: windows-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    # 1. Setup MSYS2
+    # To daje nam środowisko "linuxopodobne" na Windowsie z pacmanem
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: UCRT64
+        update: true
+        install: >-
+          mingw-w64-ucrt-x86_64-gcc
+          mingw-w64-ucrt-x86_64-rtl-sdr
+          mingw-w64-ucrt-x86_64-make
+          unzip
+          wget
+
+    # 2. Download SFML 3.0 (Wersja GCC MinGW!)
+    # UWAGA: Pobieramy wersję dla GCC, bo używamy g++, a nie cl.exe
+    - name: Download SFML 3.0 (MinGW)
+      shell: msys2 {0}
+      run: |
+        wget -q https://github.com/SFML/SFML/releases/download/3.0.0/SFML-3.0.0-windows-gcc-14.2.0-mingw-64-bit.zip -O sfml.zip
+        unzip -q sfml.zip
+        mv SFML-3.0.0 sfml
+
+    # 3. Kompilacja i Pakowanie
+    - name: Compile OrbitSDR
+      shell: msys2 {0}
+      run: |
+        chmod +x build_mingw.sh
+        ./build_mingw.sh
+
+    # 4. Upload Artifact
+    - name: Upload Windows Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: orbitsdr-windows-mingw
+        path: |
+          orbitsdr.exe
+          *.dll

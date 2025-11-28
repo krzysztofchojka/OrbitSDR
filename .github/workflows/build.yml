@@ -35,11 +35,11 @@ jobs:
 
     - name: Install SFML 3.0 (Pre-built)
       run: |
-        echo "Downloading SFML 3.0.0..."
-        wget -q https://www.sfml-dev.org/files/SFML-3.0.0-linux-gcc-64-bit.tar.gz
+        #echo "Downloading SFML 3.0.0..."
+        #wget -q https://www.sfml-dev.org/files/SFML-3.0.0-linux-gcc-64-bit.tar.gz
         
         echo "Extracting..."
-        tar -xzf SFML-3.0.0-linux-gcc-64-bit.tar.gz
+        tar -xzf $GITHUB_WORKSPACE/deps/SFML-3.0.0-linux-gcc-64-bit.tar.gz
         
         # Rename to a simple path "sfml" in the workspace root
         mv SFML-3.0.0 sfml
