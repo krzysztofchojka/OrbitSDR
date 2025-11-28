@@ -1,0 +1,96 @@
+name: Build OrbitSDR
+
+on:
+  push:
+    branches: [ "main", "master", "test-ci" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: Linux (Ubuntu)
+    runs-on: ubuntu-24.04
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install System Dependencies
+      run: |
+        sudo apt-get update
+        # Install dependencies required by SFML and OrbitSDR (runtime libs)
+        sudo apt-get install -y \
+          build-essential \
+          librtlsdr-dev \
+          libgl1-mesa-dev \
+          libudev-dev \
+          libopenal-dev \
+          libvorbis-dev \
+          libflac-dev \
+          libfreetype6-dev \
+          libx11-dev \
+          libxrandr-dev \
+          libxcursor-dev \
+          libxi-dev
+
+    - name: Install SFML 3.0 (Pre-built)
+      run: |
+        echo "Downloading SFML 3.0.0..."
+        wget -q https://www.sfml-dev.org/files/SFML-3.0.0-linux-gcc-64-bit.tar.gz
+        
+        echo "Extracting..."
+        tar -xzf SFML-3.0.0-linux-gcc-64-bit.tar.gz
+        
+        # Rename to a simple path "sfml" in the workspace root
+        mv SFML-3.0.0 sfml
+
+    - name: Compile OrbitSDR (Linux) using build.sh
+      run: |
+        chmod +x build.sh
+        
+        # Define paths to our downloaded SFML
+        SFML_PATH="$GITHUB_WORKSPACE/sfml"
+        
+        echo "Using SFML at: $SFML_PATH"
+        
+        # 1. Headers
+        export CXXFLAGS="-I$SFML_PATH/include"
+        
+        # 2. Linker - IMPORTANT: -L path MUST be before -l libraries
+        # We force the path to the 'lib' folder inside the downloaded package
+        export LIBS="-L$SFML_PATH/lib -lsfml-graphics -lsfml-window -lsfml-system -ldl -lpthread -lm -lrtlsdr"
+        
+        # 3. RPATH (so the binary knows where to look for .so files locally)
+        export LDFLAGS="-Wl,-rpath,$SFML_PATH/lib"
+        
+        # Execute build script
+        ./build.sh --disable-sdrplay
+
+    - name: Upload Linux Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: orbitsdr-linux
+        path: orbitsdr
+
+  build-macos:
+    name: macOS (Apple Silicon)
+    runs-on: macos-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Dependencies (Homebrew)
+      run: |
+        brew update
+        brew install sfml librtlsdr
+
+    - name: Compile OrbitSDR (macOS) using build.sh
+      run: |
+        chmod +x build.sh
+        ./build.sh --disable-sdrplay
+
+    - name: Upload macOS Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: orbitsdr-macos
+        path: orbitsdr
