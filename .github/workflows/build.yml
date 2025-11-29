@@ -2,7 +2,7 @@ name: Build OrbitSDR
 
 on:
   push:
-    branches: [ "main", "master", "test-ci" ]
+    branches: [ "main", "master", "test-ci"]
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch:
@@ -18,7 +18,6 @@ jobs:
     - name: Install System Dependencies
       run: |
         sudo apt-get update
-        # Install dependencies required by SFML and OrbitSDR (runtime libs)
         sudo apt-get install -y \
           build-essential \
           librtlsdr-dev \
@@ -35,36 +34,36 @@ jobs:
 
     - name: Install SFML 3.0 (Pre-built)
       run: |
-        #echo "Downloading SFML 3.0.0..."
-        #wget -q https://www.sfml-dev.org/files/SFML-3.0.0-linux-gcc-64-bit.tar.gz
-        
-        echo "Extracting..."
+        echo "Extracting SFML..."
+        # Assumes this tar.gz exists in deps/ as per your previous setup
         tar -xzf $GITHUB_WORKSPACE/deps/SFML-3.0.0-linux-gcc-64-bit.tar.gz
-        
-        # Rename to a simple path "sfml" in the workspace root
         mv SFML-3.0.0 sfml
 
     - name: Compile OrbitSDR (Linux) using build.sh
       run: |
         chmod +x build.sh
         
-        # Define paths to our downloaded SFML
+        # --- PATH DEFINITIONS ---
         SFML_PATH="$GITHUB_WORKSPACE/sfml"
-        
+        SDR_INC="$GITHUB_WORKSPACE/deps/sdrplay/include"
+        SDR_LIB="$GITHUB_WORKSPACE/deps/sdrplay/lib/linux"
+
         echo "Using SFML at: $SFML_PATH"
+        echo "Using SDRplay at: $SDR_LIB"
         
-        # 1. Headers
-        export CXXFLAGS="-I$SFML_PATH/include"
+        # 1. Headers (Include both SFML and SDRplay headers)
+        export CXXFLAGS="-I$SFML_PATH/include -I$SDR_INC"
         
-        # 2. Linker - IMPORTANT: -L path MUST be before -l libraries
-        # We force the path to the 'lib' folder inside the downloaded package
-        export LIBS="-L$SFML_PATH/lib -lsfml-graphics -lsfml-window -lsfml-system -ldl -lpthread -lm -lrtlsdr"
+        # 2. Linker
+        # Added -L$SDR_LIB and -lsdrplay_api
+        export LIBS="-L$SFML_PATH/lib -L$SDR_LIB -lsfml-graphics -lsfml-window -lsfml-system -ldl -lpthread -lm -lrtlsdr -lsdrplay_api"
         
-        # 3. RPATH (so the binary knows where to look for .so files locally)
-        export LDFLAGS="-Wl,-rpath,$SFML_PATH/lib"
+        # 3. RPATH 
+        # We allow the binary to search both the SFML lib folder AND the SDRplay lib folder relative to itself
+        export LDFLAGS="-Wl,-rpath,$SFML_PATH/lib -Wl,-rpath,$SDR_LIB"
         
-        # Execute build script
-        ./build.sh --disable-sdrplay
+        # Execute build script (Removed --disable-sdrplay)
+        ./build.sh --enable-sdrplay
 
     - name: Upload Linux Artifact
       uses: actions/upload-artifact@v4
@@ -87,7 +86,26 @@ jobs:
     - name: Compile OrbitSDR (macOS) using build.sh
       run: |
         chmod +x build.sh
-        ./build.sh --disable-sdrplay
+
+        # --- PATH DEFINITIONS ---
+        # Homebrew installs SFML automatically, so we rely on standard paths for that.
+        # We only need to configure SDRplay here.
+        SDR_INC="$GITHUB_WORKSPACE/deps/sdrplay/include"
+        SDR_LIB="$GITHUB_WORKSPACE/deps/sdrplay/lib/macos"
+
+        # 1. Headers
+        export CXXFLAGS="-I$SDR_INC"
+
+        # 2. Linker
+        # IMPORTANT: Added -L/opt/homebrew/lib so the linker can find librtlsdr on Apple Silicon
+        # -L for the local folder, -lsdrplay_api to link the dylib
+        export LDFLAGS="-L/opt/homebrew/lib -L$SDR_LIB -lsdrplay_api"
+        
+        # Note: On macOS, we might need to fix the install_name of the dylib later 
+        # or rely on the user having the driver installed in /usr/local/lib.
+        # For CI building purposes, the -L flag above is enough.
+
+        ./build.sh  --enable-sdrplay
 
     - name: Upload macOS Artifact
       uses: actions/upload-artifact@v4

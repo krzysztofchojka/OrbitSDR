@@ -1,30 +1,40 @@
 # OrbitSDR
 
-A lightweight, high-performance SDR receiver built with C++17 and SFML. 
+A lightweight, multiplatform SDR software built with C++17 and SFML. 
 
 ![Build](https://github.com/krzysztofchojka/OrbitSDR/actions/workflows/build.yml/badge.svg)
 
-## Current Status: Very Early Access (Pre-Alpha)
+Please note that this project is in a very early stage of development. It is currently tested primarily on **macOS** (Apple Silicon) but supports Linux and Windows. 
 
-Please note that this project is in a very early stage of development. It is currently tested primarily on **macOS** (Apple Silicon) but should also work on Linux and Windows.
+**Development builds** (artifacts) are available in the [GitHub Actions](https://github.com/krzysztofchojka/OrbitSDR/actions) tab (requires GitHub account).
 
 ![screenshot](screenshot.png)
 
 ## Features
 
+- **Hardware Support:**
+  - **SDRPlay (build with API 3.15):** Support includes **Notch Filters**, **Antenna Port selection**, and **Bias-T**.
+  - **RTL-SDR:** Supports standard operation and **Direct Sampling** mode.
 - **Baseband Player:** Play raw IQ `.wav` files with a seekable timeline slider to analyze recordings (for now only 16-bit PCM is supported).
 - **Integrated APRS:** Built-in AX.25 packet decoder with a live dashboard for messages and GPS telemetry (more digital modes planned).
 - **Recording:** Record both demodulated Audio or raw Baseband IQ data.
-- **Smooth UX:** Waterfall with drag-to-tune, axis panning, and frequency snapping.
+- **Smooth UX:** Responsive waterfall with drag-to-tune, axis panning, and frequency snapping.
 - **Demodulation:** Supports AM, NFM, LSB/USB, and WFM Stereo.
-- **Hardware Support:** Works with RTL-SDR and SDRPlay (API 3.x).
 
 ### To-Do / Known Limitations
 
-- **RTL-SDR:** Direct Sampling mode (HF) is not yet implemented.
-- **SDRPlay:** Basic support only (no antenna selection or notch filters yet).
 - **Decoders:** Currently only APRS (AX.25) is supported, more digital decoders will be added in future updates.
-- **Files:** Add support for 32-bit Float baseband recordings.
+- Add support for 32-bit Float baseband recordings.
+- Add sound card as source.
+
+---
+
+### ⚠️ SDRPlay Requirements
+To use SDRPlay devices, you must have the **SDRPlay API (Service)** installed on your system.
+* **Tested Version:** This software is developed and tested with **API 3.15**.
+* **Compatibility:** Other versions (e.g., 3.07 or newer 3.x releases) might work, but stability is not guaranteed.
+* **Download:** You can get the API drivers from the [SDRPlay Downloads page](https://www.sdrplay.com/downloads/).
+
 
 ## 🍎 Building on macOS
 ### 1. Install Dependencies (Homebrew):
@@ -52,3 +62,8 @@ chmod +x build.sh
 ./build.sh
 ```
 *The script will ask if you want to link SDRPlay libraries.*
+<br>
+### 🪟 Windows Users
+---
+For Windows, I recommend downloading the pre-compiled artifact from the GitHub Actions tab.
+Manual Compilation instructions for building from source on Windows are not yet documented. The automated builds use standard MSVC environment.
