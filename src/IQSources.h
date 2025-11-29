@@ -9,6 +9,7 @@
 #include <mutex>
 #include <cstring> 
 #include <algorithm>
+#include <sstream>
 #include "RingBuffer.h"
 #include "NativeDialogs.h" 
 
@@ -19,6 +20,11 @@
 #endif
 
 using Complex = std::complex<double>;
+
+struct SDRDeviceItem {
+    std::string name;
+    std::string id;
+};
 
 class IQSource {
 public:
@@ -75,8 +81,12 @@ public:
 class RtlSdrSource : public IQSource {
     rtlsdr_dev_t* dev = nullptr; std::thread worker; std::atomic<bool> running {false}; RingBuffer<Complex> ringBuffer;
     uint32_t sampleRate = 2048000; uint32_t centerFreq = 100000000; std::mutex hwMtx; std::vector<int> availableGains; 
+    
     static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx) {
-        RtlSdrSource* self = (RtlSdrSource*)ctx; if (!self->running) return;
+        RtlSdrSource* self = (RtlSdrSource*)ctx; 
+        if (!self->running) return;
+        // Basic lock to prevent race during destruction, though limited in callback performance
+        // In high perf scenario we rely on atomic running flag.
         int samples = len / 2; std::vector<Complex> converted(samples);
         for (int i = 0; i < samples; i++) { converted[i] = Complex((buf[i * 2] - 127.5) / 127.5, (buf[i * 2 + 1] - 127.5) / 127.5); }
         self->ringBuffer.push(converted.data(), samples);
@@ -84,21 +94,69 @@ class RtlSdrSource : public IQSource {
 public:
     RtlSdrSource() : ringBuffer(1024 * 1024) {} 
     ~RtlSdrSource() { close(); }
+
+    static std::vector<SDRDeviceItem> getDeviceList() {
+        std::vector<SDRDeviceItem> list;
+        int count = rtlsdr_get_device_count();
+        for(int i=0; i<count; i++) {
+            SDRDeviceItem item;
+            item.name = std::string(rtlsdr_get_device_name(i));
+            item.id = std::to_string(i);
+            list.push_back(item);
+        }
+        return list;
+    }
+
     bool open(std::string id, uint32_t requestedRate = 0) override {
-        std::lock_guard<std::mutex> lock(hwMtx); int dev_index = 0; try { dev_index = std::stoi(id); } catch(...) {}
+        std::lock_guard<std::mutex> lock(hwMtx); 
+        int dev_index = 0; try { dev_index = std::stoi(id); } catch(...) {}
         if (rtlsdr_open(&dev, dev_index) < 0) return false;
+        
         if (requestedRate > 0) sampleRate = requestedRate; else sampleRate = 2048000;
-        rtlsdr_set_sample_rate(dev, sampleRate); rtlsdr_set_center_freq(dev, centerFreq); rtlsdr_set_tuner_gain_mode(dev, 0); rtlsdr_reset_buffer(dev);
-        int count = rtlsdr_get_tuner_gains(dev, NULL); if (count > 0) { availableGains.resize(count); rtlsdr_get_tuner_gains(dev, availableGains.data()); }
+        rtlsdr_set_sample_rate(dev, sampleRate); 
+        rtlsdr_set_center_freq(dev, centerFreq); 
+        rtlsdr_set_tuner_gain_mode(dev, 0); 
+        rtlsdr_reset_buffer(dev);
+        
+        int count = rtlsdr_get_tuner_gains(dev, NULL); 
+        if (count > 0) { availableGains.resize(count); rtlsdr_get_tuner_gains(dev, availableGains.data()); }
         return true;
     }
-    void close() override { stop(); std::lock_guard<std::mutex> lock(hwMtx); if (dev) { rtlsdr_close(dev); dev = nullptr; } }
-    void start() override { if (running) return; running = true; if (dev) rtlsdr_reset_buffer(dev); worker = std::thread([this]() { rtlsdr_read_async(dev, rtlsdr_callback, this, 0, 0); }); }
-    void stop() override { if (running) { running = false; if (dev) rtlsdr_cancel_async(dev); if (worker.joinable()) worker.join(); } }
+
+    void close() override { 
+        stop(); 
+        std::lock_guard<std::mutex> lock(hwMtx); 
+        if (dev) { 
+            rtlsdr_close(dev); 
+            dev = nullptr; 
+        } 
+    }
+
+    void start() override { 
+        if (running) return; 
+        running = true; 
+        if (dev) rtlsdr_reset_buffer(dev); 
+        worker = std::thread([this]() { rtlsdr_read_async(dev, rtlsdr_callback, this, 0, 0); }); 
+    }
+
+    void stop() override { 
+        if (running) { 
+            running = false; 
+            if (dev) rtlsdr_cancel_async(dev); 
+            if (worker.joinable()) worker.join(); 
+        } 
+    }
+
     int read(Complex* buffer, int count) override { return ringBuffer.pop(buffer, count); }
     double getSampleRate() override { return (double)sampleRate; }
     bool isHardware() override { return true; }
-    void setCenterFrequency(long long hz) override { std::lock_guard<std::mutex> lock(hwMtx); centerFreq = hz; if (dev && running) rtlsdr_set_center_freq(dev, centerFreq); }
+    
+    void setCenterFrequency(long long hz) override { 
+        std::lock_guard<std::mutex> lock(hwMtx); 
+        centerFreq = hz; 
+        if (dev && running) rtlsdr_set_center_freq(dev, centerFreq); 
+    }
+    
     void setGain(int db) override { 
         std::lock_guard<std::mutex> lock(hwMtx); if (!dev || !running) return;
         if (db == -1) { rtlsdr_set_tuner_gain_mode(dev, 0); } else {
@@ -107,10 +165,13 @@ public:
             rtlsdr_set_tuner_gain(dev, bestGain); 
         } 
     }
+    
     void setHardwareOption(std::string name, int value) override {
         std::lock_guard<std::mutex> lock(hwMtx); if (!dev) return;
         if (name == "direct_sampling") { rtlsdr_set_direct_sampling(dev, value); }
+        else if (name == "bias_t") { rtlsdr_set_bias_tee(dev, value); }
     }
+    
     std::vector<std::string> getAvailableSampleRatesText() override { return {"1.4 MSps", "1.8 MSps", "2.048 MSps", "2.4 MSps", "3.2 MSps"}; }
     std::vector<uint32_t> getAvailableSampleRatesValues() override { return {1400000, 1800000, 2048000, 2400000, 3200000}; }
 };
@@ -119,7 +180,6 @@ public:
 
 #ifdef ENABLE_SDRPLAY
 
-// Helper macros if headers are missing explicit definitions for None
 #ifndef sdrplay_api_Update_None
     #define sdrplay_api_Update_None (sdrplay_api_ReasonForUpdateT)0
 #endif
@@ -130,6 +190,11 @@ public:
 class SdrPlaySource : public IQSource {
     bool isSelected = false; bool isInitialized = false; RingBuffer<Complex> ringBuffer; double sampleRate = 2000000.0; long long centerFreq = 100000000; std::mutex hwMtx;
     sdrplay_api_DeviceT currentDevice; sdrplay_api_DeviceParamsT *deviceParams = NULL; sdrplay_api_CallbackFnsT cbFns; std::atomic<bool> running {false};
+    
+    // !!! CRITICAL FIX: Global refcount for SDRPlay API
+    // Prevents getDeviceList() from closing the API while a device is running.
+    static std::atomic<int> activeInstances;
+
     static void StreamCallback(short *xi, short *xq, sdrplay_api_StreamCbParamsT *params, unsigned int numSamples, unsigned int reset, void *cbContext) {
         SdrPlaySource* self = (SdrPlaySource*)cbContext; if (!self->running) return;
         Complex tempBuf[2048]; unsigned int processed = 0;
@@ -140,25 +205,102 @@ class SdrPlaySource : public IQSource {
         }
     }
     static void EventCallback(sdrplay_api_EventT eventId, sdrplay_api_TunerSelectT tuner, sdrplay_api_EventParamsT *params, void *cbContext) {}
+
 public:
     SdrPlaySource() : ringBuffer(1024 * 1024) {}
     ~SdrPlaySource() { close(); }
+
+    static std::vector<SDRDeviceItem> getDeviceList() {
+        std::vector<SDRDeviceItem> list;
+        
+        // Only Open if not already open by an instance
+        bool openedLocally = false;
+        if (activeInstances == 0) {
+            if (sdrplay_api_Open() == sdrplay_api_Success) {
+                openedLocally = true;
+            } else {
+                return list;
+            }
+        }
+
+        sdrplay_api_DeviceT devs[6]; unsigned int nDevs = 0;
+        sdrplay_api_GetDevices(devs, &nDevs, 6);
+        for(unsigned int i=0; i<nDevs; i++) {
+            SDRDeviceItem item;
+            if (devs[i].hwVer == SDRPLAY_RSP1_ID) item.name = "RSP1";
+            else if (devs[i].hwVer == SDRPLAY_RSP1A_ID) item.name = "RSP1A";
+            else if (devs[i].hwVer == SDRPLAY_RSP2_ID) item.name = "RSP2";
+            else if (devs[i].hwVer == SDRPLAY_RSPduo_ID) item.name = "RSPduo";
+            else if (devs[i].hwVer == SDRPLAY_RSPdx_ID) item.name = "RSPdx";
+            else item.name = "RSP Unknown";
+            item.name += " (" + std::string(devs[i].SerNo) + ")";
+            item.id = std::string(devs[i].SerNo);
+            list.push_back(item);
+        }
+
+        // Only Close if WE opened it and no instances are running
+        if (openedLocally && activeInstances == 0) {
+            sdrplay_api_Close();
+        }
+        return list;
+    }
+
     bool open(std::string id, uint32_t requestedRate = 0) override {
         std::lock_guard<std::mutex> lock(hwMtx); if (isSelected) close();
-        if (sdrplay_api_Open() != sdrplay_api_Success) return false;
-        sdrplay_api_DeviceT devs[6]; unsigned int nDevs = 0; sdrplay_api_GetDevices(devs, &nDevs, 6); if (nDevs == 0) { sdrplay_api_Close(); return false; }
-        currentDevice = devs[0]; currentDevice.tuner = sdrplay_api_Tuner_A; 
-        if (sdrplay_api_SelectDevice(&currentDevice) != sdrplay_api_Success) { sdrplay_api_Close(); return false; } isSelected = true;
+        
+        // Ensure API is open
+        if (activeInstances == 0) {
+             if (sdrplay_api_Open() != sdrplay_api_Success) return false;
+        }
+        activeInstances++; // Increment refcount
+
+        sdrplay_api_DeviceT devs[6]; unsigned int nDevs = 0; sdrplay_api_GetDevices(devs, &nDevs, 6); 
+        if (nDevs == 0) { 
+            activeInstances--; 
+            if(activeInstances == 0) sdrplay_api_Close(); 
+            return false; 
+        }
+        
+        int foundIdx = 0;
+        if (!id.empty()) { for(unsigned int i=0; i<nDevs; i++) { if (std::string(devs[i].SerNo) == id) { foundIdx = i; break; } } }
+        
+        currentDevice = devs[foundIdx]; currentDevice.tuner = sdrplay_api_Tuner_A; 
+        if (sdrplay_api_SelectDevice(&currentDevice) != sdrplay_api_Success) { 
+            activeInstances--; 
+            if(activeInstances == 0) sdrplay_api_Close(); 
+            return false; 
+        } 
+        
+        isSelected = true;
         if (sdrplay_api_GetDeviceParams(currentDevice.dev, &deviceParams) != sdrplay_api_Success) { close(); return false; }
+        
         if (requestedRate > 0) sampleRate = (double)requestedRate; else sampleRate = 2000000.0;
         deviceParams->devParams->fsFreq.fsHz = sampleRate; deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)centerFreq;
         deviceParams->rxChannelA->tunerParams.bwType = sdrplay_api_BW_1_536;
         if (sampleRate > 2000000) deviceParams->rxChannelA->tunerParams.bwType = sdrplay_api_BW_5_000;
         if (sampleRate > 8000000) deviceParams->rxChannelA->tunerParams.bwType = sdrplay_api_BW_8_000;
-        deviceParams->rxChannelA->tunerParams.ifType = sdrplay_api_IF_Zero; deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_50HZ; 
+        deviceParams->rxChannelA->tunerParams.ifType = sdrplay_api_IF_Zero; 
+        deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_50HZ; 
         return true;
     }
-    void close() override { stop(); std::lock_guard<std::mutex> lock(hwMtx); if (isSelected) { sdrplay_api_ReleaseDevice(&currentDevice); sdrplay_api_Close(); isSelected = false; deviceParams = NULL; } }
+
+    void close() override { 
+        stop(); 
+        std::lock_guard<std::mutex> lock(hwMtx); 
+        if (isSelected) { 
+            sdrplay_api_ReleaseDevice(&currentDevice); 
+            isSelected = false; 
+            deviceParams = NULL; 
+            
+            // Decrement global refcount
+            activeInstances--;
+            if (activeInstances <= 0) {
+                activeInstances = 0;
+                sdrplay_api_Close();
+            }
+        } 
+    }
+
     void start() override { if (running || !isSelected) return; std::lock_guard<std::mutex> lock(hwMtx); if (deviceParams) { deviceParams->devParams->fsFreq.fsHz = sampleRate; deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)centerFreq; } memset(&cbFns, 0, sizeof(cbFns)); cbFns.StreamACbFn = StreamCallback; cbFns.EventCbFn = EventCallback; if (sdrplay_api_Init(currentDevice.dev, &cbFns, this) == sdrplay_api_Success) { isInitialized = true; running = true; } }
     void stop() override { if (isInitialized) { running = false; sdrplay_api_Uninit(currentDevice.dev); isInitialized = false; } }
     int read(Complex* buffer, int count) override { return ringBuffer.pop(buffer, count); }
@@ -175,74 +317,56 @@ public:
     void setHardwareOption(std::string name, int value) override {
         std::lock_guard<std::mutex> lock(hwMtx); if (!running || !deviceParams) return;
         
-        // 1. FM Notch
         if (name == "fm_notch") {
             if (currentDevice.hwVer == SDRPLAY_RSPdx_ID) {
-                // RSPdx uses Extension 1 update 
                 deviceParams->devParams->rspDxParams.rfNotchEnable = (value > 0) ? 1 : 0; 
-                sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, 
-                                   sdrplay_api_Update_None, 
-                                   sdrplay_api_Update_RspDx_RfNotchControl);
+                sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_None, sdrplay_api_Update_RspDx_RfNotchControl);
             }
             else if (currentDevice.hwVer == SDRPLAY_RSP1A_ID) {
-               // RSP1A uses Standard update 
                deviceParams->devParams->rsp1aParams.rfNotchEnable = (value > 0) ? 1 : 0; 
-               sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, 
-                                  sdrplay_api_Update_Rsp1a_RfNotchControl, 
-                                  sdrplay_api_Update_Ext1_None);
+               sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Rsp1a_RfNotchControl, sdrplay_api_Update_Ext1_None);
             }
         }
-        // 2. MW Notch
         else if (name == "mw_notch") {
              if (currentDevice.hwVer == SDRPLAY_RSPdx_ID) {
-                // RSPdx DAB/MW Notch 
                 deviceParams->devParams->rspDxParams.rfDabNotchEnable = (value > 0) ? 1 : 0; 
-                sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, 
-                                   sdrplay_api_Update_None, 
-                                   sdrplay_api_Update_RspDx_RfDabNotchControl);
+                sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_None, sdrplay_api_Update_RspDx_RfDabNotchControl);
              }
              else if (currentDevice.hwVer == SDRPLAY_RSP1A_ID) {
-                // RSP1A DAB Notch 
                 deviceParams->devParams->rsp1aParams.rfDabNotchEnable = (value > 0) ? 1 : 0; 
-                sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, 
-                                   sdrplay_api_Update_Rsp1a_RfDabNotchControl, 
-                                   sdrplay_api_Update_Ext1_None);
+                sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Rsp1a_RfDabNotchControl, sdrplay_api_Update_Ext1_None);
              }
         }
-        // 3. Bias-T (Fixed Typo: rsp1aTunerParams with '1')
         else if (name == "bias_t") {
             if (currentDevice.hwVer == SDRPLAY_RSPdx_ID) {
-                // RSPdx BiasT in devParams using Extension 1 
                 deviceParams->devParams->rspDxParams.biasTEnable = (value > 0) ? 1 : 0;
-                sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, 
-                                   sdrplay_api_Update_None, 
-                                   sdrplay_api_Update_RspDx_BiasTControl);
+                sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_None, sdrplay_api_Update_RspDx_BiasTControl);
             }
             else if (currentDevice.hwVer == SDRPLAY_RSP1A_ID) {
-                // RSP1A BiasT in tunerParams using Standard Update 
                 deviceParams->rxChannelA->rsp1aTunerParams.biasTEnable = (value > 0) ? 1 : 0;
-                sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, 
-                                   sdrplay_api_Update_Rsp1a_BiasTControl, 
-                                   sdrplay_api_Update_Ext1_None);
+                sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Rsp1a_BiasTControl, sdrplay_api_Update_Ext1_None);
             }
         }
-        // 4. Antenna (RSPdx Only)
         else if (name == "antenna") {
             if (currentDevice.hwVer == SDRPLAY_RSPdx_ID) {
-                // RSPdx Antenna using Extension 1
                 if (value == 0) deviceParams->devParams->rspDxParams.antennaSel = sdrplay_api_RspDx_ANTENNA_A; 
                 if (value == 1) deviceParams->devParams->rspDxParams.antennaSel = sdrplay_api_RspDx_ANTENNA_B; 
                 if (value == 2) deviceParams->devParams->rspDxParams.antennaSel = sdrplay_api_RspDx_ANTENNA_C; 
-                sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, 
-                                   sdrplay_api_Update_None, 
-                                   sdrplay_api_Update_RspDx_AntennaControl);
+                sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_None, sdrplay_api_Update_RspDx_AntennaControl);
             }
         }
     }
     std::vector<std::string> getAvailableSampleRatesText() override { return {"2.0 MSps", "4.0 MSps", "6.0 MSps", "8.0 MSps", "10.0 MSps"}; }
     std::vector<uint32_t> getAvailableSampleRatesValues() override { return {2000000, 4000000, 6000000, 8000000, 10000000}; }
 };
+
+// Define the static member
+std::atomic<int> SdrPlaySource::activeInstances{0};
+
 #else
 class SdrPlaySource : public IQSource {
-public: bool open(std::string id, uint32_t r = 0) override { showPopup("Feature Not Available", "Run ./build.sh and enable SDRPlay."); return false; } void close() override {} void start() override {} void stop() override {} int read(Complex* b, int c) override { return 0; } double getSampleRate() override { return 2000000; } bool isHardware() override { return true; } };
+public: 
+    static std::vector<SDRDeviceItem> getDeviceList() { return {}; }
+    bool open(std::string id, uint32_t r = 0) override { showPopup("Feature Not Available", "Run ./build.sh and enable SDRPlay."); return false; } void close() override {} void start() override {} void stop() override {} int read(Complex* b, int c) override { return 0; } double getSampleRate() override { return 2000000; } bool isHardware() override { return true; } 
+};
 #endif
