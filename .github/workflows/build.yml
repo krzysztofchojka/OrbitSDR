@@ -86,48 +86,55 @@ jobs:
       run: |
         brew update
         brew install sfml librtlsdr dylibbundler
-        # dylibbundler to magiczne narzędzie, które naprawia problem "działa tylko u mnie"
+
+    - name: Prepare SDRPlay Libraries (Fix Versioning)
+      run: |
+        # Wchodzimy do folderu z bibliotekami macOS
+        cd deps/sdrplay/lib/macos
+        
+        # Tworzymy symlink: system szuka .so.3, a my mamy .so.3.15
+        # To "oszukuje" dylibbundler, dając mu dokładnie tę nazwę, której szuka
+        ln -sf libsdrplay_api.so.3.15 libsdrplay_api.so.3
+        
+        # Dla pewności tworzymy też link dla .so
+        ln -sf libsdrplay_api.so.3.15 libsdrplay_api.so
+        
+        # Wyświetlamy zawartość, żebyś widział w logach, czy linki powstały
+        ls -la
 
     - name: Compile & Create Bundle
       run: |
         chmod +x build.sh
         
-        # --- NAPRAWA ---
-        # Zamiast kopiować do /usr/local (co powoduje błąd), wskazujemy ścieżki
-        # tak jak w starym pliku build.yml, który działał.
-        
         SDR_INC="$GITHUB_WORKSPACE/deps/sdrplay/include"
         SDR_LIB="$GITHUB_WORKSPACE/deps/sdrplay/lib/macos"
         
-        # 1. Headers: Wskazujemy folder w deps/sdrplay/include
+        # Ustawiamy flagi kompilacji
         export CXXFLAGS="-I$SDR_INC"
-
-        # 2. Linker: Wskazujemy biblioteki w deps ORAZ w Homebrew (dla librtlsdr)
-        # -L/opt/homebrew/lib jest kluczowe dla Apple Silicon
+        # Tu wskazujemy linkerowi folder, w którym przed chwilą zrobiliśmy symlinki
         export LDFLAGS="-L/opt/homebrew/lib -L$SDR_LIB -lsdrplay_api"
         
-        # Kompilacja (to stworzy OrbitSDR.app dzięki nowemu skryptowi build.sh)
-        # build.sh automatycznie "chwyci" te zmienne środowiskowe
+        # Kompilacja
         ./build.sh --enable-sdrplay
 
     - name: Bundle Dependencies (Fix "Library not loaded")
       run: |
-        # To jest najważniejszy krok dla macOS!
-        # dylibbundler szuka bibliotek (SFML, librtlsdr) w systemie, 
-        # kopiuje je do środka .app i naprawia ścieżki.
-        # Dodano flagę -s, aby szukał też w deps/sdrplay
-        
+        # Definiujemy ścieżkę do bibliotek SDRPlay
+        SDR_LIB_PATH="$GITHUB_WORKSPACE/deps/sdrplay/lib/macos"
+
+        # Uruchamiamy dylibbundler
+        # Flaga -s (search) jest kluczowa - wskazujemy folder z naszymi symlinkami
         dylibbundler -od -b -x ./OrbitSDR.app/Contents/MacOS/OrbitSDR \
           -d ./OrbitSDR.app/Contents/Frameworks/ \
           -p @executable_path/../Frameworks/ \
-          -s ./deps/sdrplay/lib/macos/
+          -s $SDR_LIB_PATH \
+          -s /opt/homebrew/lib
 
-        # Ponowne podpisanie aplikacji (wymagane po zmianie bibliotek)
+        # Podpisanie aplikacji
         codesign --force --deep --sign - OrbitSDR.app
 
     - name: Create DMG or Zip
       run: |
-        # Pakujemy .app do zipa, żeby zachować uprawnienia plików
         zip -r OrbitSDR-macOS.zip OrbitSDR.app
 
     - name: Upload macOS Artifact
