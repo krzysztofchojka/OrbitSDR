@@ -9,7 +9,7 @@ on:
 
 jobs:
   # --------------------------------------------------------
-  # LINUX (Your working setup)
+  # LINUX (Unchanged - Working)
   # --------------------------------------------------------
   build-linux:
     name: Linux (Ubuntu)
@@ -54,7 +54,7 @@ jobs:
         path: OrbitSDR_Linux/
 
   # --------------------------------------------------------
-  # MACOS (The Fixed "Manual" Method)
+  # MACOS (Fixed: Creates real .app structure)
   # --------------------------------------------------------
   build-macos:
     name: macOS (Universal)
@@ -67,7 +67,6 @@ jobs:
       run: |
         brew update
         brew install sfml librtlsdr 
-        # Note: We are NOT installing dylibbundler because it causes the hang.
 
     - name: Compile OrbitSDR
       run: |
@@ -75,40 +74,56 @@ jobs:
         SDR_INC="$GITHUB_WORKSPACE/deps/sdrplay/include"
         SDR_LIB="$GITHUB_WORKSPACE/deps/sdrplay/lib/macos"
 
-        # 1. Compilation Flags
         export CXXFLAGS="-I$SDR_INC"
-        
-        # 2. Linker Flags
-        # We explicitly link the library. The binary will "remember" it as libsdrplay_api.so.3
         export LDFLAGS="-L/opt/homebrew/lib -L$SDR_LIB -lsdrplay_api"
         
         ./build.sh --enable-sdrplay
 
-    - name: Manual Packaging (NO dylibbundler)
+    - name: Create .App Bundle Structure
       run: |
-        # 1. Create a clean folder
-        mkdir -p OrbitSDR_MacOS
-        
-        # 2. Copy the executable
-        cp orbitsdr OrbitSDR_MacOS/OrbitSDR
-        
-        # 3. Copy the SDRPlay library manually
-        cp deps/sdrplay/lib/macos/libsdrplay_api.dylib OrbitSDR_MacOS/libsdrplay_api.dylib
-        
-        # 4. FIX THE BINARY (The "Magic" Step)
-        # The binary thinks it needs "libsdrplay_api.so.3".
-        # We force it to look for "@executable_path/libsdrplay_api.dylib" instead.
-        # This completely prevents the "File not found" error.
-        install_name_tool -change libsdrplay_api.so.3 @executable_path/libsdrplay_api.dylib OrbitSDR_MacOS/OrbitSDR
-        
-        # 5. Verify it worked (prints output to log, doesn't hang)
-        otool -L OrbitSDR_MacOS/OrbitSDR
-        
-        # 6. Sign it
-        codesign --force --deep --sign - OrbitSDR_MacOS/OrbitSDR
+        # 1. Create the directories required for an App Bundle
+        mkdir -p OrbitSDR.app/Contents/MacOS
+        mkdir -p OrbitSDR.app/Contents/Frameworks
+        mkdir -p OrbitSDR.app/Contents/Resources
 
-    - name: Upload macOS Artifact
-      uses: actions/upload-artifact@v4
+        # 2. Copy the binary to the MacOS folder
+        cp orbitsdr OrbitSDR.app/Contents/MacOS/OrbitSDR
+        
+        # 3. Copy the SDRPlay library to the Frameworks folder
+        cp deps/sdrplay/lib/macos/libsdrplay_api.dylib OrbitSDR.app/Contents/Frameworks/
+
+        # 4. Create a minimal Info.plist (Required for the OS to recognize it as an App)
+        cat > OrbitSDR.app/Contents/Info.plist <<EOF
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>CFBundleExecutable</key>
+            <string>OrbitSDR</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.orbitsdr.app</string>
+            <key>CFBundleName</key>
+            <string>OrbitSDR</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>1.0</string>
+        </dict>
+        </plist>
+        EOF
+
+        # 5. Fix the Binary Paths (Crucial Step)
+        # Change the reference from "libsdrplay_api.so.3" to the internal Frameworks path
+        install_name_tool -change libsdrplay_api.so.3 @executable_path/../Frameworks/libsdrplay_api.dylib OrbitSDR.app/Contents/MacOS/OrbitSDR
+        
+        # 6. Sign the app (Ad-hoc signature)
+        codesign --force --deep --sign - OrbitSDR.app
+
+    - name: Zip and Upload
+      run: |
+        zip -r OrbitSDR-macOS.zip OrbitSDR.app
+        
+    - uses: actions/upload-artifact@v4
       with:
         name: OrbitSDR-macOS
-        path: OrbitSDR_MacOS/
+        path: OrbitSDR-macOS.zip
