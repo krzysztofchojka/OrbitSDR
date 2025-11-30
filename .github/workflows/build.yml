@@ -8,6 +8,53 @@ on:
   workflow_dispatch:
 
 jobs:
+  build-windows-mingw:
+      name: Windows (MinGW64)
+      runs-on: windows-latest
+      
+      steps:
+      - uses: actions/checkout@v4
+      
+      # 1. Setup MSYS2
+      # Install gcc, make, and rtlsdr (which provides librtlsdr)
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-rtl-sdr
+            mingw-w64-ucrt-x86_64-make
+            unzip
+            wget
+
+      # 2. Download SFML 3.0 (MinGW Version)
+      - name: Download SFML 3.0 (MinGW)
+        shell: msys2 {0}
+        run: |
+          wget -q https://github.com/SFML/SFML/releases/download/3.0.0/SFML-3.0.0-windows-gcc-14.2.0-mingw-64-bit.zip -O sfml.zip
+          unzip -q sfml.zip
+          mv SFML-3.0.0 sfml
+
+      # 3. Compilation and Packaging
+      # Run our build_mingw.sh script within the MSYS2 environment
+      # This script automatically copies sdrplay_api.dll next to the exe file
+      - name: Compile OrbitSDR
+        shell: msys2 {0}
+        run: |
+          chmod +x build_mingw.sh
+          ./build_mingw.sh
+
+      # 4. Upload Artifact
+      # Collect exe and all dlls (including sdrplay_api.dll, which the script copied)
+      - name: Upload Windows Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: orbitsdr-windows-mingw
+          path: |
+            orbitsdr.exe
+            *.dll
   # --------------------------------------------------------
   # LINUX (Unchanged - Working)
   # --------------------------------------------------------
@@ -79,26 +126,48 @@ jobs:
         
         ./build.sh --enable-sdrplay
 
-    - name: Create .App Bundle Structure
+    - name: Create .App Bundle with Icon
       run: |
-        # 1. Create the directories required for an App Bundle
+        # 1. Create Directories
         mkdir -p OrbitSDR.app/Contents/MacOS
         mkdir -p OrbitSDR.app/Contents/Frameworks
         mkdir -p OrbitSDR.app/Contents/Resources
 
-        # 2. Copy the binary to the MacOS folder
+        # 2. Copy Binary & Libs
         cp orbitsdr OrbitSDR.app/Contents/MacOS/OrbitSDR
-        
-        # 3. Copy the SDRPlay library to the Frameworks folder
         cp deps/sdrplay/lib/macos/libsdrplay_api.dylib OrbitSDR.app/Contents/Frameworks/
 
-        # 4. Create a minimal Info.plist (Required for the OS to recognize it as an App)
+        # --- ICON GENERATION START ---
+        # macOS requires an .icns file, which contains the icon in multiple resolutions.
+        # We use 'sips' to resize your icon.png and 'iconutil' to bundle them.
+        mkdir OrbitSDR.iconset
+        sips -z 16 16     icon.png --out OrbitSDR.iconset/icon_16x16.png
+        sips -z 32 32     icon.png --out OrbitSDR.iconset/icon_16x16@2x.png
+        sips -z 32 32     icon.png --out OrbitSDR.iconset/icon_32x32.png
+        sips -z 64 64     icon.png --out OrbitSDR.iconset/icon_32x32@2x.png
+        sips -z 128 128   icon.png --out OrbitSDR.iconset/icon_128x128.png
+        sips -z 256 256   icon.png --out OrbitSDR.iconset/icon_128x128@2x.png
+        sips -z 256 256   icon.png --out OrbitSDR.iconset/icon_256x256.png
+        sips -z 512 512   icon.png --out OrbitSDR.iconset/icon_256x256@2x.png
+        sips -z 512 512   icon.png --out OrbitSDR.iconset/icon_512x512.png
+        sips -z 1024 1024 icon.png --out OrbitSDR.iconset/icon_512x512@2x.png
+        
+        # Convert the folder into a .icns file
+        iconutil -c icns OrbitSDR.iconset
+        
+        # Move it to Resources
+        cp OrbitSDR.icns OrbitSDR.app/Contents/Resources/
+        # --- ICON GENERATION END ---
+
+        # 3. Create Info.plist (Updated to include Icon)
         cat > OrbitSDR.app/Contents/Info.plist <<EOF
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
         <plist version="1.0">
         <dict>
             <key>CFBundleExecutable</key>
+            <string>OrbitSDR</string>
+            <key>CFBundleIconFile</key>
             <string>OrbitSDR</string>
             <key>CFBundleIdentifier</key>
             <string>com.orbitsdr.app</string>
@@ -108,15 +177,16 @@ jobs:
             <string>APPL</string>
             <key>CFBundleShortVersionString</key>
             <string>1.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
         </dict>
         </plist>
         EOF
 
-        # 5. Fix the Binary Paths (Crucial Step)
-        # Change the reference from "libsdrplay_api.so.3" to the internal Frameworks path
+        # 4. Fix Binary Paths
         install_name_tool -change libsdrplay_api.so.3 @executable_path/../Frameworks/libsdrplay_api.dylib OrbitSDR.app/Contents/MacOS/OrbitSDR
         
-        # 6. Sign the app (Ad-hoc signature)
+        # 5. Sign
         codesign --force --deep --sign - OrbitSDR.app
 
     - name: Zip and Upload
