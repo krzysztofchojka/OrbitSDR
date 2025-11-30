@@ -2,6 +2,8 @@ name: Build OrbitSDR (Portable)
 
 on:
   push:
+    branches: [ "main", "master", "test-ci"]
+  pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch:
 
