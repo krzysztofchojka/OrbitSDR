@@ -81,11 +81,18 @@ jobs:
     
     steps:
     - uses: actions/checkout@v4
-
     - name: Install Dependencies
       run: |
         brew update
         brew install sfml librtlsdr dylibbundler
+        
+    - name: Fix SDRPlay Library Naming
+      # This step creates a symlink so dylibbundler finds the file
+      run: |
+        cd deps/sdrplay/lib/macos
+        # Link .so.3 to the .dylib so the tool finds it
+        ln -sf libsdrplay_api.dylib libsdrplay_api.so.3
+        ls -l # Debug: show that the link exists
 
     - name: Compile & Create Bundle
       run: |
@@ -94,34 +101,31 @@ jobs:
         SDR_INC="$GITHUB_WORKSPACE/deps/sdrplay/include"
         SDR_LIB="$GITHUB_WORKSPACE/deps/sdrplay/lib/macos"
         
-        # Ustawiamy flagi kompilacji
+        # Linker flags
         export CXXFLAGS="-I$SDR_INC"
-        # Tu wskazujemy linkerowi folder, w którym przed chwilą zrobiliśmy symlinki
         export LDFLAGS="-L/opt/homebrew/lib -L$SDR_LIB -lsdrplay_api"
         
-        # Kompilacja
         ./build.sh --enable-sdrplay
 
     - name: Bundle Dependencies (Fix "Library not loaded")
       run: |
-        # Definiujemy ścieżkę do bibliotek SDRPlay
+        # Define path to SDR libs
         SDR_LIB_PATH="$GITHUB_WORKSPACE/deps/sdrplay/lib/macos"
-
-        # Uruchamiamy dylibbundler
-        # Flaga -s (search) jest kluczowa - wskazujemy folder z naszymi symlinkami
+        
+        # Run dylibbundler with the search path (-s) set to our SDR lib folder
         dylibbundler -od -b -x ./OrbitSDR.app/Contents/MacOS/OrbitSDR \
           -d ./OrbitSDR.app/Contents/Frameworks/ \
           -p @executable_path/../Frameworks/ \
-          -s $SDR_LIB_PATH \
+          -s "$SDR_LIB_PATH" \
           -s /opt/homebrew/lib
-
-        # Podpisanie aplikacji
+          
+        # Sign the app
         codesign --force --deep --sign - OrbitSDR.app
 
     - name: Create DMG or Zip
       run: |
         zip -r OrbitSDR-macOS.zip OrbitSDR.app
-
+        
     - name: Upload macOS Artifact
       uses: actions/upload-artifact@v4
       with:
