@@ -85,14 +85,6 @@ jobs:
       run: |
         brew update
         brew install sfml librtlsdr dylibbundler
-        
-    - name: Fix SDRPlay Library Naming
-      # This step creates a symlink so dylibbundler finds the file
-      run: |
-        cd deps/sdrplay/lib/macos
-        # Link .so.3 to the .dylib so the tool finds it
-        ln -sf libsdrplay_api.dylib libsdrplay_api.so.3
-        ls -l # Debug: show that the link exists
 
     - name: Compile & Create Bundle
       run: |
@@ -107,13 +99,29 @@ jobs:
         
         ./build.sh --enable-sdrplay
 
-    - name: Bundle Dependencies (Fix "Library not loaded")
+    - name: Fix Binary & Bundle Dependencies
       run: |
-        # Define path to SDR libs
+        # Path definitions
+        EXE_PATH="./OrbitSDR.app/Contents/MacOS/OrbitSDR"
         SDR_LIB_PATH="$GITHUB_WORKSPACE/deps/sdrplay/lib/macos"
         
-        # Run dylibbundler with the search path (-s) set to our SDR lib folder
-        dylibbundler -od -b -x ./OrbitSDR.app/Contents/MacOS/OrbitSDR \
+        echo "--- PRE-FIX: Checking dependencies ---"
+        otool -L $EXE_PATH
+        
+        # CRITICAL FIX: 
+        # The binary is asking for "libsdrplay_api.so.3". 
+        # We forcibly change that request to "libsdrplay_api.dylib".
+        install_name_tool -change libsdrplay_api.so.3 @rpath/libsdrplay_api.dylib $EXE_PATH
+        
+        # We also ensure the SDRPlay dylib has a valid ID so bundling works
+        install_name_tool -id @rpath/libsdrplay_api.dylib "$SDR_LIB_PATH/libsdrplay_api.dylib"
+        
+        echo "--- POST-FIX: Checking dependencies ---"
+        otool -L $EXE_PATH
+        
+        # Now run dylibbundler. 
+        # It will now see a request for .dylib (which exists) and succeed.
+        dylibbundler -od -b -x $EXE_PATH \
           -d ./OrbitSDR.app/Contents/Frameworks/ \
           -p @executable_path/../Frameworks/ \
           -s "$SDR_LIB_PATH" \
