@@ -216,11 +216,17 @@ public:
         // Only Open if not already open by an instance
         bool openedLocally = false;
         if (activeInstances == 0) {
-            if (sdrplay_api_Open() == sdrplay_api_Success) {
-                openedLocally = true;
-            } else {
+            sdrplay_api_ErrT err = sdrplay_api_Open();
+            if (err != sdrplay_api_Success) {
+                // --- NOWOŚĆ: Wyświetlanie błędu ---
+                std::string msg = "Could not initialize SDRPlay API (Error: " + std::to_string(err) + ").\n\n"
+                                  "Please ensure the SDRPlay API/Service is installed and running.\n"
+                                  "Download from: www.sdrplay.com/downloads";
+                showPopup("SDRPlay Error", msg);
+                // ----------------------------------
                 return list;
             }
+            openedLocally = true;
         }
 
         sdrplay_api_DeviceT devs[6]; unsigned int nDevs = 0;
@@ -236,6 +242,13 @@ public:
             item.name += " (" + std::string(devs[i].SerNo) + ")";
             item.id = std::string(devs[i].SerNo);
             list.push_back(item);
+        }
+        
+        // Jeśli lista pusta, ale API działa, to znaczy że urządzenie nie jest podłączone
+        if (nDevs == 0 && openedLocally) {
+             // Opcjonalnie: Można tu dać popup "No SDRPlay devices found", 
+             // ale zazwyczaj pusta lista w dropdownie wystarczy.
+             // Zostawiamy bez popupu, żeby nie denerwować użytkownika.
         }
 
         // Only Close if WE opened it and no instances are running
@@ -308,9 +321,42 @@ public:
     bool isHardware() override { return true; }
     void setCenterFrequency(long long hz) override { std::lock_guard<std::mutex> lock(hwMtx); centerFreq = hz; if (running && deviceParams) { deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)hz; sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Tuner_Frf, sdrplay_api_Update_Ext1_None); } }
     void setGain(int db) override {
-        std::lock_guard<std::mutex> lock(hwMtx); if (!running || !deviceParams) return;
-        if (db == -1) { deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_50HZ; sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Ctrl_Agc, sdrplay_api_Update_Ext1_None); } 
-        else { deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_DISABLE; deviceParams->rxChannelA->tunerParams.gain.LNAstate = 0; int reduction = (50 - db) * 1.2; if (reduction < 0) reduction = 0; deviceParams->rxChannelA->tunerParams.gain.gRdB = reduction; sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, (sdrplay_api_ReasonForUpdateT)(sdrplay_api_Update_Ctrl_Agc | sdrplay_api_Update_Tuner_Gr), sdrplay_api_Update_Ext1_None); }
+        std::lock_guard<std::mutex> lock(hwMtx); 
+        if (!running || !deviceParams) return;
+
+        // Debug: Sprawdźmy czy funkcja jest w ogóle wołana
+        // std::cout << "[DEBUG] Setting Gain to: " << db << " dB" << std::endl;
+
+        if (db == -1) { 
+            // Włącz AGC
+            if (deviceParams->rxChannelA->ctrlParams.agc.enable != sdrplay_api_AGC_50HZ) {
+                deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_50HZ; 
+                sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Ctrl_Agc, sdrplay_api_Update_Ext1_None);
+            }
+        } 
+        else { 
+            // Manual Gain
+            deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_DISABLE; 
+            
+            // Logika: SDRPlay używa "Redukcji Wzmocnienia" (Reduction).
+            // Zakładamy max gain ok. 50dB. Jeśli suwak jest na 50 (max), redukcja = 0.
+            // Jeśli suwak na 0, redukcja duża.
+            int reduction = (50 - db); 
+            if (reduction < 0) reduction = 0;
+            if (reduction > 59) reduction = 59; // Limity RSP
+
+            // Ustawiamy redukcję
+            deviceParams->rxChannelA->tunerParams.gain.gRdB = reduction;
+            
+            // WAŻNE: Wymuszamy LNA State na max (0), żeby sterować tylko redukcją IF,
+            // chyba że chcesz pełną kontrolę. Dla prostoty LNA=0 (max czułość) + tłumik IF.
+            deviceParams->rxChannelA->tunerParams.gain.LNAstate = 0;
+
+            // Wywołujemy Update z poprawnymi flagami (Ctrl_Agc wyłącza AGC, Tuner_Gr zmienia gain)
+            sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, 
+                (sdrplay_api_ReasonForUpdateT)(sdrplay_api_Update_Ctrl_Agc | sdrplay_api_Update_Tuner_Gr), 
+                sdrplay_api_Update_Ext1_None);
+        }
     }
     
     // --- SDRPLAY API 3.14 HARDWARE CONTROLS ---

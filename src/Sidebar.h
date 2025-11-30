@@ -20,6 +20,10 @@ public:
         headerText.setStyle(sf::Text::Bold);
         headerText.setLetterSpacing(2);
     }
+
+    void updateStyle() {
+        for(auto& w : widgets) w->updateStyle();
+    }
     
     void addWidget(std::shared_ptr<Widget> w) { widgets.push_back(w); }
     
@@ -70,7 +74,9 @@ public:
     std::shared_ptr<Module> addModule(std::string title) { auto m = std::make_shared<Module>(title, width - 20.0f, font); modules.push_back(m); return m; }
     
     void setGeometry(float _x, float _y, float _h) { x = _x; y = _y; height = _h; sbTrack.setPosition({x + width - 12, y}); sbTrack.setSize({12, height}); recalculateLayout(); }
-    
+    void updateStyle() {
+        for(auto& m : modules) m->updateStyle();
+    }
     void recalculateLayout() {
         totalContentHeight = 0; float cy = y - scrollOffset;
         for (auto& m : modules) { m->layout(x, cy); float h = m->getTotalHeight(); cy += h + 3.0f; totalContentHeight += h + 3.0f; } 

@@ -23,6 +23,7 @@
 #include "NativeDialogs.h"
 #include "IQSources.h"
 #include "APRS_Decoder.h"
+#include "Settings.h" // Obsługa JSON i ścieżek
 
 // --- CONSTANTS ---
 const int FFT_SIZE = 1024;
@@ -31,17 +32,35 @@ const double AUDIO_RATE = 48000.0;
 const int TOP_BAR_H = 60; 
 const int SIDEBAR_W = 320;
 const int TUNING_LATENCY_MS = 50; 
+const int GAIN_LATENCY_MS = 50; 
 
 const std::vector<uint32_t> RTL_RATES_VAL = {1400000, 1800000, 2048000, 2400000, 3200000};
 const std::vector<uint32_t> SDRPLAY_RATES_VAL = {2000000, 4000000, 6000000, 8000000, 10000000};
 const std::vector<std::string> STEP_NAMES = {"None", "1 kHz", "5 kHz", "6.25k", "10 kHz", "12.5k", "25 kHz", "100 kHz"};
 const std::vector<long long> STEP_VALUES = {0, 1000, 5000, 6250, 10000, 12500, 25000, 100000};
 
-const std::vector<std::string> THEME_NAMES = {"Orbit Original", "Magma (Neon)", "Matrix (Green)", "Grayscale", "Orbit Plus (Aurora)"};
+// Zaktualizowana nazwa motywu nr 1
+const std::vector<std::string> THEME_NAMES = {"Orbit Original", "Neon (Pink/Blue)", "Matrix (Green)", "Grayscale", "Orbit Plus (Aurora)"};
+
+// --- GLOBAL PERSISTENT STATE ---
+// Stores hardware flags so they persist when rebuilding UI
+struct GlobalHwState {
+    bool fmNotch = false;
+    bool mwNotch = false;
+    bool biasT = false;
+    int directSampling = 0;
+    int antennaIndex = 0;
+} hwState;
 
 std::string getTimestamp() {
     auto now = std::time(nullptr); auto tm = *std::localtime(&now);
     std::ostringstream oss; oss << std::put_time(&tm, "[%Y-%m-%d %H:%M:%S]"); return oss.str();
+}
+
+// Funkcja pomocnicza do skracania ścieżek w UI
+std::string truncatePath(std::string path, size_t maxLen) {
+    if (path.length() <= maxLen) return path;
+    return "..." + path.substr(path.length() - (maxLen - 3));
 }
 
 std::deque<std::string> loadLastLogLines(const std::string& filename, int count) {
@@ -81,34 +100,35 @@ struct SharedData {
     float maxDb = 0.0f; 
     std::vector<double> fftSpectrum; std::vector<uint8_t> waterfallRow; bool newWaterfallData = false; std::string currentFilename = "None"; float mouseX_spectrum = -1.0f; float mouseY_spectrum = -1.0f; bool isRecording = false; RecMode recMode = RecMode::AUDIO; std::string recPath = ""; std::string recStatus = "Idle"; bool aprsEnabled = false; std::deque<std::string> aprsLog; AprsLastPacket lastAprs; 
     float zoomLevel = 1.0f; 
-    int waterfallTheme = 4; 
+    int waterfallTheme = 0;
     SharedData() : fftSpectrum(FFT_SIZE, -100.0), waterfallRow(INTERNAL_WATERFALL_WIDTH * 4, 0) {} 
 };
 
 std::mutex sourceMtx; std::shared_ptr<IQSource> currentSource;
 
+// ZMODYFIKOWANA FUNKCJA GETHEATMAP (NEON THEME)
 sf::Color getHeatmap(float v, int theme) { 
     v = std::clamp(v, 0.0f, 1.0f); 
     std::uint8_t r=0,g=0,b=0; 
-    if (theme == 0 || theme == 4) { 
+    
+    if (theme == 0 || theme == 4) { // Orbit Original & Plus
         if(v<0.25f) b=static_cast<std::uint8_t>(v*4*255);
         else if(v<0.5f) {b=255; g=static_cast<std::uint8_t>((v-0.25f)*4*255);}
         else if(v<0.75f) {r=static_cast<std::uint8_t>((v-0.5f)*4*255); g=255; b=static_cast<std::uint8_t>(255-r);}
         else {r=255; g=static_cast<std::uint8_t>((1.0f-v)*4*255);}
+        //if (theme == 4) { std::uint8_t temp = g; g = r; r = b; b = temp; if (v > 0.5f) r = 255; }
     }
-    else if (theme == 1) { 
-        if(v < 0.33f) { r=0; g=0; b=static_cast<std::uint8_t>(v*3*255); }
-        else if(v < 0.66f) { r=static_cast<std::uint8_t>((v-0.33f)*3*255); g=0; b=255; }
-        else { r=255; g=static_cast<std::uint8_t>((v-0.66f)*3*255); b=static_cast<std::uint8_t>(255 - (v-0.66f)*3*255); }
+    else if (theme == 1) { // NEON (Pink/Blue) - Zastępuje Magmę
+        if(v < 0.3f) { r=0; g=0; b=static_cast<std::uint8_t>(v * 3.33f * 255); }
+        else if(v < 0.6f) { float t = (v - 0.3f) / 0.3f; r = static_cast<std::uint8_t>(t * 180); g = 0; b = 255; }
+        else if(v < 0.85f) { float t = (v - 0.6f) / 0.25f; r = 180 + static_cast<std::uint8_t>(t * 75); g = 0; b = 255 - static_cast<std::uint8_t>(t * 100); }
+        else { float t = (v - 0.85f) / 0.15f; r = 255; g = static_cast<std::uint8_t>(t * 255); b = 155 + static_cast<std::uint8_t>(t * 100); }
     }
-    else if (theme == 2) { 
-        r = 0;
-        if(v < 0.5f) { g = static_cast<std::uint8_t>(v * 2 * 200); b=0; }
-        else { g = 200 + static_cast<std::uint8_t>((v-0.5f)*2*55); b = static_cast<std::uint8_t>((v-0.5f)*2*255); r = b; }
+    else if (theme == 2) { // Matrix
+        r = 0; if(v < 0.5f) { g = static_cast<std::uint8_t>(v * 2 * 200); b=0; } else { g = 200 + static_cast<std::uint8_t>((v-0.5f)*2*55); b = static_cast<std::uint8_t>((v-0.5f)*2*255); r = b; }
     }
-    else if (theme == 3) { 
-        std::uint8_t lum = static_cast<std::uint8_t>(v * 255);
-        r = lum; g = lum; b = lum;
+    else if (theme == 3) { // Grayscale
+        std::uint8_t lum = static_cast<std::uint8_t>(v * 255); r = lum; g = lum; b = lum; 
     }
     return {r,g,b}; 
 }
@@ -119,14 +139,10 @@ void drawGrid(sf::RenderWindow& window, const sf::Font& font, float x, float y, 
     float dbStep = 20.0f; 
     for (float db = 0; db >= -140; db -= dbStep) { 
         if (db > maxDb || db < minDb) continue; 
-        float norm = (db - minDb) / (maxDb - minDb); 
-        float yPos = y + h - (norm * h); 
-        sf::RectangleShape line({w, 1}); line.setPosition({x, yPos}); 
-        line.setFillColor(sf::Color(80, 80, 80, 100)); 
-        window.draw(line); 
-        sf::Text l(font, std::to_string((int)db), 10); l.setPosition({x+2, yPos-12}); 
-        l.setFillColor(sf::Color(200, 200, 200, 150)); 
-        window.draw(l); 
+        float norm = (db - minDb) / (maxDb - minDb); float yPos = y + h - (norm * h); 
+        sf::RectangleShape line({w, 1}); line.setPosition({x, yPos}); line.setFillColor(sf::Color(80, 80, 80, 100)); window.draw(line); 
+        sf::Text l(font, std::to_string((int)db), 20); l.setScale({0.5f, 0.5f}); 
+        l.setPosition({x+2, yPos-12}); l.setFillColor(sf::Color(200, 200, 200, 150)); window.draw(l); 
     }
     double startFreq = (double)cf - visibleSpan / 2.0; double endFreq = (double)cf + visibleSpan / 2.0;
     double stepHz = 200000.0; 
@@ -136,7 +152,8 @@ void drawGrid(sf::RenderWindow& window, const sf::Font& font, float x, float y, 
         float normPos = (float)((f - startFreq) / visibleSpan); float xPos = x + normPos * w;
         sf::RectangleShape line({1, h}); line.setPosition({xPos, y}); line.setFillColor(sf::Color(80, 80, 80, 100)); window.draw(line);
         std::string freqStr = formatHz((long long)f); if(freqStr.size() > 4) freqStr = freqStr.substr(0, freqStr.size()-4);
-        sf::Text l(font, freqStr, 10); sf::FloatRect b = l.getLocalBounds(); l.setPosition({xPos - b.size.x/2, y + h - 15}); l.setFillColor(sf::Color(220, 220, 220, 200)); window.draw(l);
+        sf::Text l(font, freqStr, 20); l.setScale({0.5f, 0.5f});
+        sf::FloatRect b = l.getGlobalBounds(); l.setPosition({xPos - b.size.x/2, y + h - 15}); l.setFillColor(sf::Color(220, 220, 220, 200)); window.draw(l);
     }
 }
 
@@ -150,35 +167,37 @@ void parseAprsData(std::string raw, AprsLastPacket& pkt) {
 
 void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio) {
     Demodulator demod(2000000, AUDIO_RATE); APRSDecoder aprsDecoder(AUDIO_RATE);
-    aprsDecoder.onMessage = [&](std::string msg) { std::string ts = getTimestamp(); std::string fullLog = ts + " " + msg; std::ofstream logFile("aprs.log", std::ios::app); if (logFile.is_open()) { logFile << fullLog << "\n"; logFile.close(); } std::lock_guard<std::mutex> l(shared.mtx); shared.aprsLog.push_back(fullLog); if (shared.aprsLog.size() > 500) shared.aprsLog.pop_front(); parseAprsData(fullLog, shared.lastAprs); };
+    
+    // ZAPIS APRS DO PLIKU CONFIG
+    aprsDecoder.onMessage = [&](std::string msg) { 
+        std::string ts = getTimestamp(); 
+        std::string fullLog = ts + " " + msg; 
+        std::ofstream logFile(getAprsLogFilePath(), std::ios::app); 
+        if (logFile.is_open()) { logFile << fullLog << "\n"; logFile.close(); } 
+        std::lock_guard<std::mutex> l(shared.mtx); 
+        shared.aprsLog.push_back(fullLog); 
+        if (shared.aprsLog.size() > 500) shared.aprsLog.pop_front(); 
+        parseAprsData(fullLog, shared.lastAprs); 
+    };
+
     double lastSampleRate = 0; std::vector<Complex> iqBuffer; std::vector<double> winFunc = makeWindow(FFT_SIZE); std::vector<double> localFftHistory(FFT_SIZE, -100.0); WavWriter recorder; 
     float lastRfGain = -9999.0f;
 
     while (running) {
         std::shared_ptr<IQSource> src = nullptr; { std::lock_guard<std::mutex> lock(sourceMtx); src = currentSource; }
-        
-        // Safety: If no source, just wait.
-        if (!src) { 
-            std::this_thread::sleep_for(std::chrono::milliseconds(20)); 
-            continue; 
-        }
+        if (!src) { std::this_thread::sleep_for(std::chrono::milliseconds(20)); continue; }
 
         double targetFreqPct, bw; float vol, rfGainReq; bool muted; Mode mode; bool play, aprsActive; float minDb, maxDb; bool doRecord; RecMode rMode; std::string rPath; float sqThr; bool stereo; double seekReq = -1.0; int themeID = 0;
         { std::lock_guard<std::mutex> lock(shared.mtx); seekReq = shared.pendingSeekRequest; shared.pendingSeekRequest = -1.0; float rawPct = shared.tunedFreqPercent; if (std::isnan(rawPct) || std::isinf(rawPct)) rawPct = 0.5f; targetFreqPct = std::clamp(rawPct, 0.0f, 1.0f); bw = shared.bandwidth; vol = shared.volume; muted = shared.isMuted; rfGainReq = shared.rfGain; mode = shared.mode; play = shared.isPlaying; minDb = shared.minDb; maxDb = shared.maxDb; doRecord = shared.isRecording; rMode = shared.recMode; rPath = shared.recPath; aprsActive = shared.aprsEnabled; sqThr = shared.squelchThreshold; stereo = shared.stereoEnabled; themeID = shared.waterfallTheme; }
         
-        bool justSeeked = false; 
-        if (seekReq >= 0.0 && src->isSeekable()) { src->seek(seekReq); demod.clear(); audio.clear(); justSeeked = true; } 
-        
+        bool justSeeked = false; if (seekReq >= 0.0 && src->isSeekable()) { src->seek(seekReq); demod.clear(); audio.clear(); justSeeked = true; } 
         if (!play && !justSeeked) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
-        if (src->isHardware()) { if (std::abs(rfGainReq - lastRfGain) > 0.1f) { src->setGain((int)rfGainReq); lastRfGain = rfGainReq; } }
         
-        // Recording Logic
         if (doRecord && !recorder.active) { long long currentCenterHz; { std::lock_guard<std::mutex> l(shared.mtx); currentCenterHz = shared.centerFreq; } char timeBuf[32]; std::time_t now = std::time(nullptr); std::strftime(timeBuf, sizeof(timeBuf), "%Y%m%d_%H%M%S", std::localtime(&now)); std::string filename, freqLabel; if (rMode == RecMode::AUDIO) { double offset = (targetFreqPct - 0.5) * src->getSampleRate(); long long tunedHz = currentCenterHz + (long long)offset; freqLabel = "_" + std::to_string(tunedHz / 1000) + "kHz"; filename = (rPath.empty() ? "." : rPath) + "/rec_" + std::string(timeBuf) + freqLabel + "_audio.wav"; recorder.start(filename, (int)AUDIO_RATE, 2); } else { freqLabel = "_" + std::to_string(currentCenterHz) + "Hz"; filename = (rPath.empty() ? "." : rPath) + "/rec_" + std::string(timeBuf) + freqLabel + "_IQ.wav"; recorder.start(filename, (int)src->getSampleRate(), 2); } { std::lock_guard<std::mutex> l(shared.mtx); shared.recStatus = "REC: " + filename; } } else if (!doRecord && recorder.active) { recorder.stop(); { std::lock_guard<std::mutex> l(shared.mtx); shared.recStatus = "Saved."; } }
         
         if (play && !src->isHardware() && !justSeeked) { size_t safeLevel = 9600; while (audio.getBufferedCount() > safeLevel) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); if (!running) return; } }
         double sr = src->getSampleRate(); if (sr != lastSampleRate) { demod = Demodulator(sr, AUDIO_RATE); lastSampleRate = sr; }
         int chunkSize = (int)sr / 60; if (!play && justSeeked) chunkSize = FFT_SIZE * 2; if (chunkSize > 200000) chunkSize = 200000; if (iqBuffer.size() != chunkSize) iqBuffer.resize(chunkSize);
-        
         int readCount = src->read(iqBuffer.data(), chunkSize);
         
         if (readCount > 0) {
@@ -198,16 +217,37 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
 struct LayoutState { float winW, winH, sidebarX, specW, specH, waterfallH; };
 
 int main() {
+    #ifdef _WIN32
+        HMODULE hUser32 = LoadLibraryA("user32.dll"); if (hUser32) { typedef BOOL (WINAPI *SetProcessDpiAwarenessContextProc)(void*); auto setDpiAware = (SetProcessDpiAwarenessContextProc)GetProcAddress(hUser32, "SetProcessDpiAwarenessContext"); if (setDpiAware) { setDpiAware((void*)-4); } }
+    #endif
+
     { std::lock_guard<std::mutex> lock(sourceMtx); currentSource = std::make_shared<FileSource>(); if (currentSource->open("None")) {} }
     AudioSink audio; std::vector<std::string> deviceNames; for (const auto& dev : audio.availableDevices) deviceNames.push_back(dev.name);
     audio.initDevice(0, (int)AUDIO_RATE); audio.start();
-    SharedData sharedData; sharedData.aprsLog = loadLastLogLines("aprs.log", 10);
+    
+    // WCZYTANIE LOGÓW APRS Z POPRAWNEJ ŚCIEŻKI
+    SharedData sharedData; sharedData.aprsLog = loadLastLogLines(getAprsLogFilePath(), 10);
     std::atomic<bool> dspRunning {true}; std::thread dspThread(dspWorker, std::ref(dspRunning), std::ref(sharedData), std::ref(audio));
-    sf::RenderWindow window(sf::VideoMode({1280, 800}), "OrbitSDR"); window.setFramerateLimit(60);
+    
+    sf::ContextSettings settings; settings.antiAliasingLevel = 8;
+    sf::RenderWindow window(sf::VideoMode::getDesktopMode(), "OrbitSDR", sf::Style::Default, sf::State::Windowed, settings);
+    window.setFramerateLimit(60);
+    auto size = window.getSize();
+    std::cout << "[DEBUG] Window Size: " << size.x << "x" << size.y << std::endl;
+
+    sf::Image icon;
+    if (!icon.loadFromFile("icon.png") && !icon.loadFromFile("../Resources/icon.png")) {
+        std::cerr << "Warning: Could not load icon.png" << std::endl;
+    } else {
+        window.setIcon(icon);
+    }
+    
     sf::Font font; if (!font.openFromFile("/System/Library/Fonts/Helvetica.ttc") && !font.openFromFile("C:/Windows/Fonts/arial.ttf") && !font.openFromFile("arial.ttf")) { std::cerr << "Font not found!\n"; }
     auto cursorArrow = sf::Cursor::createFromSystem(sf::Cursor::Type::Arrow); auto cursorHand = sf::Cursor::createFromSystem(sf::Cursor::Type::Hand); auto cursorSizeH = sf::Cursor::createFromSystem(sf::Cursor::Type::SizeHorizontal);
 
     sf::RectangleShape topBar; topBar.setFillColor(sf::Color(19, 19, 21));
+    Theme::setTheme(0);
+    
     FrequencyDisplay freqVFO(20, 8, font); freqVFO.setFrequency(100000000);
     SdrButton btnTuningMode(40, 40, "FIX", font); btnTuningMode.setColor(sf::Color(80, 80, 80)); bool stickyCenterMode = false;
     SdrButton btnPlay(40, 40, ">", font); btnPlay.setColor(sf::Color(116, 57, 57));
@@ -230,46 +270,54 @@ int main() {
     auto chkAgc = std::make_shared<Checkbox>("Automatic Gain Control (AGC)", font, true); 
     int currentSourceType = 0; 
     
+    // --- GAIN THROTTLING VARIABLES ---
+    sf::Clock gainDebouncer; 
+    float pendingRfGain = -999.0f; 
+
     slGain->onChange = [&](float v) { 
         std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.rfGain = v; 
         std::stringstream ss; ss << std::fixed << std::setprecision(1);
         if (currentSourceType == 1) { ss << "RF Gain: " << v << " dB"; } else { ss << "RF Gain (dB): " << (int)v; }
         slGain->setText(ss.str());
+        pendingRfGain = v;
     }; 
-    chkAgc->onToggle = [&](bool b) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.rfGain = b ? -1.0f : slGain->currentVal; slGain->setEnabled(!b); }; 
+    chkAgc->onToggle = [&](bool b) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.rfGain = b ? -1.0f : slGain->currentVal; slGain->setEnabled(!b); pendingRfGain = b ? -1.0f : slGain->currentVal; }; 
     slGain->setEnabled(false);
 
-    auto lblAntenna = std::make_shared<Label>("Antenna (SDRPlay):", font); auto ddAntenna = std::make_shared<Dropdown>(SIDEBAR_W - 40, 25.0f, font); ddAntenna->setOptions({"Antenna A / Default", "Antenna B", "Antenna C / Hi-Z"}); ddAntenna->onChange = [&](int idx) { std::lock_guard<std::mutex> l(sourceMtx); if(currentSource) currentSource->setHardwareOption("antenna", idx); };
-    auto lblDirectSamp = std::make_shared<Label>("Direct Sampling (RTL):", font); auto ddDirectSamp = std::make_shared<Dropdown>(SIDEBAR_W - 40, 25.0f, font); ddDirectSamp->setOptions({"Off (Default)", "I-ADC", "Q-ADC"}); ddDirectSamp->onChange = [&](int idx) { std::lock_guard<std::mutex> l(sourceMtx); if(currentSource) currentSource->setHardwareOption("direct_sampling", idx); };
-    auto rowFilters = std::make_shared<RowContainer>(); auto chkFmNotch = std::make_shared<Checkbox>("FM Notch", font); chkFmNotch->onToggle = [&](bool b) { std::lock_guard<std::mutex> l(sourceMtx); if(currentSource) currentSource->setHardwareOption("fm_notch", b?1:0); }; auto chkMwNotch = std::make_shared<Checkbox>("MW Notch", font); chkMwNotch->onToggle = [&](bool b) { std::lock_guard<std::mutex> l(sourceMtx); if(currentSource) currentSource->setHardwareOption("mw_notch", b?1:0); }; rowFilters->add(chkFmNotch); rowFilters->add(chkMwNotch);
-    auto chkBiasT = std::make_shared<Checkbox>("Bias-T Power", font); chkBiasT->onToggle = [&](bool b) { std::lock_guard<std::mutex> l(sourceMtx); if(currentSource) currentSource->setHardwareOption("bias_t", b?1:0); };
+    auto lblAntenna = std::make_shared<Label>("Antenna (SDRPlay):", font); auto ddAntenna = std::make_shared<Dropdown>(SIDEBAR_W - 40, 25.0f, font); ddAntenna->setOptions({"Antenna A / Default", "Antenna B", "Antenna C / Hi-Z"}); ddAntenna->onChange = [&](int idx) { hwState.antennaIndex = idx; std::lock_guard<std::mutex> l(sourceMtx); if(currentSource) currentSource->setHardwareOption("antenna", idx); };
+    auto lblDirectSamp = std::make_shared<Label>("Direct Sampling (RTL):", font); auto ddDirectSamp = std::make_shared<Dropdown>(SIDEBAR_W - 40, 25.0f, font); ddDirectSamp->setOptions({"Off (Default)", "I-ADC", "Q-ADC"}); ddDirectSamp->onChange = [&](int idx) { hwState.directSampling = idx; std::lock_guard<std::mutex> l(sourceMtx); if(currentSource) currentSource->setHardwareOption("direct_sampling", idx); };
+    auto rowFilters = std::make_shared<RowContainer>(); 
+    
+    auto chkFmNotch = std::make_shared<Checkbox>("FM Notch", font); chkFmNotch->onToggle = [&](bool b) { hwState.fmNotch = b; std::lock_guard<std::mutex> l(sourceMtx); if(currentSource) currentSource->setHardwareOption("fm_notch", b?1:0); }; 
+    auto chkMwNotch = std::make_shared<Checkbox>("MW Notch", font); chkMwNotch->onToggle = [&](bool b) { hwState.mwNotch = b; std::lock_guard<std::mutex> l(sourceMtx); if(currentSource) currentSource->setHardwareOption("mw_notch", b?1:0); }; 
+    rowFilters->add(chkFmNotch); rowFilters->add(chkMwNotch);
+    auto chkBiasT = std::make_shared<Checkbox>("Bias-T Power", font); chkBiasT->onToggle = [&](bool b) { hwState.biasT = b; std::lock_guard<std::mutex> l(sourceMtx); if(currentSource) currentSource->setHardwareOption("bias_t", b?1:0); };
 
     auto updateRadioControls = [&](int sourceIdx) {
         modRadio->widgets.clear();
         if (sourceIdx != 0) { modRadio->addWidget(slGain); modRadio->addWidget(chkAgc); }
-        if (sourceIdx == 1) { modRadio->addWidget(lblDirectSamp); modRadio->addWidget(ddDirectSamp); modRadio->addWidget(chkBiasT); } 
-        else if (sourceIdx == 2) { modRadio->addWidget(lblAntenna); modRadio->addWidget(ddAntenna); modRadio->addWidget(rowFilters); modRadio->addWidget(chkBiasT); }
-        sidebar.recalculateLayout();
+        if (sourceIdx == 1) { 
+            modRadio->addWidget(lblDirectSamp); modRadio->addWidget(ddDirectSamp); modRadio->addWidget(chkBiasT); 
+            ddDirectSamp->setSelection(hwState.directSampling);
+            chkBiasT->checked = hwState.biasT;
+        } 
+        else if (sourceIdx == 2) { 
+            modRadio->addWidget(lblAntenna); modRadio->addWidget(ddAntenna); modRadio->addWidget(rowFilters); modRadio->addWidget(chkBiasT); 
+            ddAntenna->setSelection(hwState.antennaIndex);
+            chkFmNotch->checked = hwState.fmNotch;
+            chkMwNotch->checked = hwState.mwNotch;
+            chkBiasT->checked = hwState.biasT;
+        }
+        sidebar.recalculateLayout(); sidebar.updateStyle();
     };
     updateRadioControls(0);
 
     long long currentCenterFreq = 0; long long pendingCenterFreq = 0;
     std::function<void(int, std::string, int, std::string)> doOpenSource = 
         [&](int sourceIdx, std::string deviceID, int rateIdx, std::string pathOverride) {
-        
-        // SAFE CLEANUP: Detach old source properly
-        {
-            std::lock_guard<std::mutex> lock(sourceMtx); 
-            if (currentSource) {
-                currentSource->stop();
-                currentSource->close();
-                currentSource = nullptr;
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(200)); // Crucial pause for driver cleanup
-
+        { std::lock_guard<std::mutex> lock(sourceMtx); if (currentSource) { currentSource->stop(); currentSource->close(); currentSource = nullptr; } }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200)); 
         std::shared_ptr<IQSource> newSource; uint32_t targetRate = 0; bool success = false; currentSourceType = sourceIdx; updateRadioControls(sourceIdx);
-
         if (sourceIdx == 0) { 
             newSource = std::make_shared<FileSource>(); std::string path = pathOverride.empty() ? "None" : pathOverride; success = newSource->open(path); 
             { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.currentFilename = path; } 
@@ -282,23 +330,24 @@ int main() {
             long long startFreq = 97800000; freqVFO.setFrequency(startFreq); currentCenterFreq = startFreq; newSource->setCenterFrequency(startFreq); 
             { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; sharedData.centerFreq = startFreq; }
             slGain->setLimits(0.0f, 49.6f); slGain->setText("RF Gain: AGC");
+            newSource->setHardwareOption("direct_sampling", hwState.directSampling);
+            newSource->setHardwareOption("bias_t", hwState.biasT ? 1 : 0);
         }
         else if (sourceIdx == 2) { 
             targetRate = (rateIdx < SDRPLAY_RATES_VAL.size()) ? SDRPLAY_RATES_VAL[rateIdx] : 2000000;
             auto sdr = std::make_shared<SdrPlaySource>(); ddRate->setOptions(sdr->getAvailableSampleRatesText()); ddRate->setSelection(rateIdx); success = sdr->open(deviceID, targetRate); newSource = sdr;
             long long startFreq = 97800000; freqVFO.setFrequency(startFreq); currentCenterFreq = startFreq; newSource->setCenterFrequency(startFreq); 
             { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; sharedData.centerFreq = startFreq; }
-            slGain->setLimits(0.0f, 50.0f);
-            
-            chkAgc->checked = true; slGain->setEnabled(false); sharedData.rfGain = -1.0f; 
+            slGain->setLimits(0.0f, 50.0f); chkAgc->checked = true; slGain->setEnabled(false); sharedData.rfGain = -1.0f; 
+            newSource->setHardwareOption("antenna", hwState.antennaIndex);
+            newSource->setHardwareOption("fm_notch", hwState.fmNotch ? 1 : 0);
+            newSource->setHardwareOption("mw_notch", hwState.mwNotch ? 1 : 0);
+            newSource->setHardwareOption("bias_t", hwState.biasT ? 1 : 0);
         }
-
         if (!success && sourceIdx != 0) { showPopup("Error", "Could not open device."); return; }
-        
         { std::lock_guard<std::mutex> lock(sourceMtx); currentSource = newSource; } 
         { std::lock_guard<std::mutex> lock(sharedData.mtx); sharedData.isPlaying = false; sharedData.isRecording = false; } 
-        
-        audio.stop(); btnPlay.setText(">"); btnPlay.setColor(sf::Color(116, 57, 57)); audio.clear();
+        audio.stop(); btnPlay.setText(">"); btnPlay.setActive(false); audio.clear();
     };
 
     std::vector<SDRDeviceItem> cachedDevices;
@@ -306,59 +355,28 @@ int main() {
         modSource->widgets.clear(); modSource->addWidget(std::make_shared<Label>("Source Type:", font)); modSource->addWidget(ddSourceType);
         if (ddSourceType->selectedIndex == 0) { modSource->addWidget(std::make_shared<Label>("Loaded File:", font)); modSource->addWidget(ddRate); } 
         else { modSource->addWidget(lblDevice); modSource->addWidget(ddDevice); modSource->addWidget(btnRefresh); modSource->addWidget(std::make_shared<Label>("Sample Rate:", font)); modSource->addWidget(ddRate); }
-        sidebar.recalculateLayout();
+        sidebar.recalculateLayout(); sidebar.updateStyle();
     };
 
     ddSourceType->onChange = [&](int idx) {
         if (idx == 0) { std::string path = openFileDialog(); if (!path.empty()) doOpenSource(0, "", 0, path); refreshSourceUI(); } 
         else {
-            // DO NOT Auto Open on selection change (prevents lock). Just list devices if possible.
             cachedDevices.clear(); std::vector<std::string> names;
             if (idx == 1) cachedDevices = RtlSdrSource::getDeviceList(); else if (idx == 2) cachedDevices = SdrPlaySource::getDeviceList();
             for(auto& d : cachedDevices) names.push_back(d.name); if (names.empty()) names.push_back("No Devices Found");
             ddDevice->setOptions(names); refreshSourceUI();
-            
-            // Auto open first device IF we found one? 
-            // Better to wait for user to select device OR click refresh to be safe.
-            // But for UX, let's auto-open first one found.
             if (!cachedDevices.empty()) { doOpenSource(idx, cachedDevices[0].id, 0, ""); }
         }
     };
-
     ddDevice->onChange = [&](int idx) { if (idx >= 0 && idx < cachedDevices.size()) { doOpenSource(ddSourceType->selectedIndex, cachedDevices[idx].id, ddRate->selectedIndex, ""); } };
-    
-    // --- UPDATED REFRESH LOGIC ---
     btnRefresh->onClick = [&]() { 
-        // 1. Force close current device to release lock on driver
-        {
-            std::lock_guard<std::mutex> lock(sourceMtx);
-            if (currentSource) {
-                currentSource->stop();
-                currentSource->close();
-                currentSource = nullptr;
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(200)); // Wait for release
-
-        // 2. Now scan freely
+        { std::lock_guard<std::mutex> lock(sourceMtx); if (currentSource) { currentSource->stop(); currentSource->close(); currentSource = nullptr; } }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200)); 
         int idx = ddSourceType->selectedIndex; 
-        if (idx == 1) cachedDevices = RtlSdrSource::getDeviceList(); 
-        else if (idx == 2) cachedDevices = SdrPlaySource::getDeviceList(); 
-        
-        std::vector<std::string> names; 
-        for(auto& d : cachedDevices) names.push_back(d.name); 
-        
-        if (names.empty()) {
-            names.push_back("No Devices Found");
-            ddDevice->setOptions(names); 
-        } else {
-            ddDevice->setOptions(names);
-            // AUTO SELECT FIRST DEVICE
-            ddDevice->setSelection(0);
-            doOpenSource(idx, cachedDevices[0].id, ddRate->selectedIndex, "");
-        }
+        if (idx == 1) cachedDevices = RtlSdrSource::getDeviceList(); else if (idx == 2) cachedDevices = SdrPlaySource::getDeviceList(); 
+        std::vector<std::string> names; for(auto& d : cachedDevices) names.push_back(d.name); 
+        if (names.empty()) { names.push_back("No Devices Found"); ddDevice->setOptions(names); } else { ddDevice->setOptions(names); ddDevice->setSelection(0); doOpenSource(idx, cachedDevices[0].id, ddRate->selectedIndex, ""); }
     };
-    
     ddRate->onChange = [&](int idx) { if (ddSourceType->selectedIndex != 0 && !cachedDevices.empty()) { doOpenSource(ddSourceType->selectedIndex, cachedDevices[ddDevice->selectedIndex].id, idx, ""); } };
 
     refreshSourceUI();
@@ -371,7 +389,6 @@ int main() {
     Mode previousMode = Mode::NFM;
     auto setMode = [&](Mode m, SdrButton* me) { if (chkAprs->checked) { chkAprs->checked = false; { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.aprsEnabled = false; } rowModes->setEnabled(true); } btnNFM->setActive(false); btnAM->setActive(false); btnWFM->setActive(false); btnUSB->setActive(false); btnLSB->setActive(false); btnOFF->setActive(false); me->setActive(true); std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.mode = m; if (m == Mode::WFM) { slBW->setLimits(50000, 200000); slBW->setValueSilent(180000); sharedData.bandwidth = 180000; slBW->setText("Bandwidth: 180 kHz"); } else if (m == Mode::NFM || m == Mode::AM) { slBW->setLimits(4000, 40000); slBW->setValueSilent(12500); sharedData.bandwidth = 12500; slBW->setText("Bandwidth: 12.5 kHz"); } else if (m == Mode::OFF) { } else { slBW->setLimits(1000, 10000); slBW->setValueSilent(3000); sharedData.bandwidth = 3000; slBW->setText("Bandwidth: 3 kHz"); } };
     btnNFM->onClick = [&](){ setMode(Mode::NFM, btnNFM.get()); }; btnAM->onClick = [&](){ setMode(Mode::AM, btnAM.get()); }; btnWFM->onClick = [&](){ setMode(Mode::WFM, btnWFM.get()); }; btnUSB->onClick = [&](){ setMode(Mode::USB, btnUSB.get()); }; btnLSB->onClick = [&](){ setMode(Mode::LSB, btnLSB.get()); }; btnOFF->onClick = [&](){ setMode(Mode::OFF, btnOFF.get()); };
-
     chkAprs->onToggle = [&](bool b) { { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.aprsEnabled = b; } rowModes->setEnabled(!b); if (b) { { std::lock_guard<std::mutex> l(sharedData.mtx); previousMode = sharedData.mode; } btnNFM->setActive(true); btnAM->setActive(false); btnWFM->setActive(false); btnUSB->setActive(false); btnLSB->setActive(false); btnOFF->setActive(false); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.mode = Mode::NFM; sharedData.bandwidth = 12000; } slBW->setValueSilent(12000); slBW->setText("Bandwidth: 12 kHz"); } else { if(previousMode == Mode::NFM) setMode(Mode::NFM, btnNFM.get()); else if(previousMode == Mode::AM) setMode(Mode::AM, btnAM.get()); else if(previousMode == Mode::WFM) setMode(Mode::WFM, btnWFM.get()); else if(previousMode == Mode::USB) setMode(Mode::USB, btnUSB.get()); else if(previousMode == Mode::LSB) setMode(Mode::LSB, btnLSB.get()); else setMode(Mode::OFF, btnOFF.get()); } }; 
     auto modDigi = sidebar.addModule("Decoders"); modDigi->addWidget(chkAprs); btnCopyAprs->onClick = [&](){ std::lock_guard<std::mutex> l(sharedData.mtx); sf::Clipboard::setString(sharedData.lastAprs.raw); }; modDigi->addWidget(btnCopyAprs);
 
@@ -379,15 +396,148 @@ int main() {
     auto slMinDb = std::make_shared<Slider>(SIDEBAR_W - 40, -120.0f, -20.0f, -90.0f, "Min dB", font); slMinDb->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.minDb = v; }; modDisp->addWidget(slMinDb);
     auto slMaxDb = std::make_shared<Slider>(SIDEBAR_W - 40, -40.0f, 40.0f, 0.0f, "Max dB", font); slMaxDb->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.maxDb = v; }; modDisp->addWidget(slMaxDb);
     auto slZoom = std::make_shared<Slider>(SIDEBAR_W - 40, 1.0f, 8.0f, 1.0f, "Zoom", font); slZoom->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.zoomLevel = v; }; modDisp->addWidget(slZoom);
-    auto ddTheme = std::make_shared<Dropdown>(SIDEBAR_W - 40, 25.0f, font); ddTheme->setOptions(THEME_NAMES); ddTheme->setSelection(4); ddTheme->onChange = [&](int idx) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.waterfallTheme = idx; }; modDisp->addWidget(std::make_shared<Label>("Waterfall Theme:", font)); modDisp->addWidget(ddTheme);
+    auto ddTheme = std::make_shared<Dropdown>(SIDEBAR_W - 40, 25.0f, font); ddTheme->setOptions(THEME_NAMES); ddTheme->setSelection(0); 
+    ddTheme->onChange = [&](int idx) { 
+        std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.waterfallTheme = idx; Theme::setTheme(idx); 
+        freqVFO.updateStyle(); btnTuningMode.updateStyle(); btnPlay.updateStyle(); btnMute.updateStyle(); volSlider.updateStyle(); timeSlider.updateStyle(); sidebar.updateStyle(); 
+    }; 
+    modDisp->addWidget(std::make_shared<Label>("Waterfall Theme:", font)); modDisp->addWidget(ddTheme);
     auto ddSnap = std::make_shared<Dropdown>(150.0f, 25.0f, font); ddSnap->setOptions(STEP_NAMES); ddSnap->setSelection(5); modDisp->addWidget(std::make_shared<Label>("Tuning Step:", font)); modDisp->addWidget(ddSnap);
     
-    auto modRec = sidebar.addModule("Recording"); auto rowRecMode = std::make_shared<RowContainer>(); auto btnRecAudio = std::make_shared<SdrButton>(80, 25, "Audio", font); btnRecAudio->setActive(true); auto btnRecIQ = std::make_shared<SdrButton>(80, 25, "Baseband", font); btnRecAudio->onClick = [&](){ btnRecAudio->setActive(true); btnRecIQ->setActive(false); std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.recMode = RecMode::AUDIO; }; btnRecIQ->onClick = [&](){ btnRecAudio->setActive(false); btnRecIQ->setActive(true); std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.recMode = RecMode::BASEBAND; }; rowRecMode->add(btnRecAudio); rowRecMode->add(btnRecIQ); modRec->addWidget(rowRecMode); auto btnSetFolder = std::make_shared<SdrButton>(110, 25, "Output Folder...", font); btnSetFolder->onClick = [&](){ std::string p = selectFolderDialog(); if(!p.empty()) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.recPath = p; } }; rowRecMode->add(btnSetFolder); auto btnRecToggle = std::make_shared<SdrButton>(SIDEBAR_W-40, 35, "START RECORDING", font); btnRecToggle->setColor(sf::Color(40, 40, 45)); btnRecToggle->onClick = [&](){ std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.isRecording = !sharedData.isRecording; if(sharedData.isRecording) { btnRecToggle->setText("STOP RECORDING"); btnRecToggle->setColor(sf::Color(180, 50, 50)); } else { btnRecToggle->setText("START RECORDING"); btnRecToggle->setColor(sf::Color(40, 40, 45)); } }; modRec->addWidget(btnRecToggle);
+    // --- UI NAGRYWANIA Z ETYKIETĄ ŚCIEŻKI ---
+    auto modRec = sidebar.addModule("Recording"); 
+    auto rowRecMode = std::make_shared<RowContainer>(); 
+    auto btnRecAudio = std::make_shared<SdrButton>(80, 25, "Audio", font); btnRecAudio->setActive(true); 
+    auto btnRecIQ = std::make_shared<SdrButton>(80, 25, "Baseband", font); 
+    
+    btnRecAudio->onClick = [&](){ 
+        btnRecAudio->setActive(true); btnRecIQ->setActive(false); 
+        std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.recMode = RecMode::AUDIO; 
+    }; 
+    btnRecIQ->onClick = [&](){ 
+        btnRecAudio->setActive(false); btnRecIQ->setActive(true); 
+        std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.recMode = RecMode::BASEBAND; 
+    }; 
+    rowRecMode->add(btnRecAudio); rowRecMode->add(btnRecIQ); 
+    modRec->addWidget(rowRecMode); 
+
+    auto lblRecPath = std::make_shared<Label>("Path: ...", font, 11, sf::Color(150,150,150));
+    modRec->addWidget(lblRecPath);
+
+    auto btnSetFolder = std::make_shared<SdrButton>(SIDEBAR_W - 40, 25, "Change Folder...", font); 
+    btnSetFolder->onClick = [&](){ 
+        std::string p = selectFolderDialog(); 
+        if(!p.empty()) { 
+            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.recPath = p; } 
+            lblRecPath->setText("Path: " + truncatePath(p, 25)); 
+        } 
+    }; 
+    modRec->addWidget(btnSetFolder);
+
+    auto btnRecToggle = std::make_shared<SdrButton>(SIDEBAR_W-40, 35, "START RECORDING", font); 
+    btnRecToggle->setColor(sf::Color(40, 40, 45)); 
+    btnRecToggle->onClick = [&](){ 
+        std::lock_guard<std::mutex> l(sharedData.mtx); 
+        sharedData.isRecording = !sharedData.isRecording; 
+        if(sharedData.isRecording) { 
+            btnRecToggle->setText("STOP RECORDING"); 
+            btnRecToggle->setColor(sf::Color(180, 50, 50)); 
+        } else { 
+            btnRecToggle->setText("START RECORDING"); 
+            btnRecToggle->setColor(sf::Color(40, 40, 45)); 
+        } 
+    }; 
+    modRec->addWidget(btnRecToggle);
 
     std::vector<std::uint8_t> waterfall(INTERNAL_WATERFALL_WIDTH * 2048 * 4, 0); sf::Texture wTex; if(!wTex.resize({INTERNAL_WATERFALL_WIDTH, 2048})) return 1; sf::Sprite wSpr(wTex); 
     LayoutState layout; sf::Vector2u lastSize = window.getSize();
     auto updateLayout = [&](int w, int h) { layout.winW = (float)w; layout.winH = (float)h; layout.sidebarX = layout.winW - SIDEBAR_W; layout.specW = layout.sidebarX; layout.specH = 250.0f; layout.waterfallH = layout.winH - TOP_BAR_H - layout.specH; if (layout.waterfallH < 100) layout.waterfallH = 100; topBar.setSize({layout.winW, (float)TOP_BAR_H}); freqVFO.setPosition(20, 4); btnTuningMode.setPosition(370, 10); btnPlay.setPosition(320, 10); volSlider.setPosition(layout.winW - 170, 10); btnMute.setPosition(layout.winW - 220, 10); sidebar.setGeometry(layout.sidebarX, TOP_BAR_H, layout.winH - TOP_BAR_H); timeSlider.setPosition(20, layout.winH - 30); timeSlider.setWidth(layout.specW - 40); wSpr.setPosition({0, TOP_BAR_H + layout.specH}); float scaleX = layout.specW / (float)INTERNAL_WATERFALL_WIDTH; wSpr.setScale({scaleX, 1.0f}); wSpr.setTextureRect(sf::IntRect({0, 0}, {INTERNAL_WATERFALL_WIDTH, (int)layout.waterfallH})); };
     updateLayout(window.getSize().x, window.getSize().y);
+
+    // --- LOAD SETTINGS START ---
+    SettingsManager settingsMgr;
+    std::string settingsPath = getSettingsFilePath();
+    std::cout << "[INFO] Loading settings from: " << settingsPath << std::endl;
+    settingsMgr.load(settingsPath);
+
+    // 1. Sidebar State (Exception: Source always open)
+    for (auto& mod : sidebar.modules) {
+        if (mod->title == "Source / Input") mod->isOpen = true;
+        else mod->isOpen = settingsMgr.getBool("sidebar_" + mod->title, mod->isOpen);
+    }
+    
+    // 2. UI Theme & Display
+    int savedTheme = settingsMgr.getInt("theme", 0);
+    ddTheme->setSelection(savedTheme);
+    ddTheme->onChange(savedTheme); // Triggers theme apply
+
+    slMinDb->setValueSilent(settingsMgr.getFloat("min_db", -90.0f));
+    slMinDb->onChange(slMinDb->currentVal);
+
+    slMaxDb->setValueSilent(settingsMgr.getFloat("max_db", 0.0f));
+    slMaxDb->onChange(slMaxDb->currentVal);
+
+    slZoom->setValueSilent(settingsMgr.getFloat("zoom", 1.0f));
+    slZoom->onChange(slZoom->currentVal);
+
+    ddSnap->setSelection(settingsMgr.getInt("step_index", 5));
+
+    // 3. Demodulator Settings
+    int savedMode = settingsMgr.getInt("mode_index", 1); // Default NFM
+    Mode mEnum = (Mode)savedMode;
+    // Map index back to button (NFM=1, AM=0, WFM=2, USB=4, LSB=3, OFF=5 based on row container add order)
+    if (mEnum == Mode::NFM) setMode(Mode::NFM, btnNFM.get());
+    else if (mEnum == Mode::AM) setMode(Mode::AM, btnAM.get());
+    else if (mEnum == Mode::WFM) setMode(Mode::WFM, btnWFM.get());
+    else if (mEnum == Mode::USB) setMode(Mode::USB, btnUSB.get());
+    else if (mEnum == Mode::LSB) setMode(Mode::LSB, btnLSB.get());
+    else setMode(Mode::OFF, btnOFF.get());
+
+    float savedBw = settingsMgr.getFloat("bandwidth", 12500.0f);
+    slBW->setValueSilent(savedBw); slBW->onChange(savedBw);
+
+    float savedSq = settingsMgr.getFloat("squelch", -100.0f);
+    slSq->setValueSilent(savedSq); slSq->onChange(savedSq);
+
+    bool savedStereo = settingsMgr.getBool("stereo", false);
+    chkStereo->checked = savedStereo; chkStereo->onToggle(savedStereo);
+
+    float savedGain = settingsMgr.getFloat("rf_gain", -1.0f);
+    if (savedGain < 0) { 
+        chkAgc->checked = true; chkAgc->onToggle(true); 
+    } else {
+        chkAgc->checked = false; chkAgc->onToggle(false);
+        slGain->setValueSilent(savedGain); slGain->onChange(savedGain);
+    }
+
+    // 4. Source & Hardware Options (Not Audio)
+    hwState.fmNotch = settingsMgr.getBool("hw_fm_notch", false);
+    hwState.mwNotch = settingsMgr.getBool("hw_mw_notch", false);
+    hwState.biasT = settingsMgr.getBool("hw_bias_t", false);
+    hwState.directSampling = settingsMgr.getInt("hw_direct_samp", 0);
+    hwState.antennaIndex = settingsMgr.getInt("hw_antenna", 0);
+
+    int savedSourceIdx = settingsMgr.getInt("source_type", 0);
+    if (savedSourceIdx != 0) { // Don't auto-load file source, only hardware
+        ddSourceType->setSelection(savedSourceIdx);
+        // We set the selection but don't auto-open because device ID might have changed.
+        refreshSourceUI();
+    }
+    
+    // 5. Recording Path
+    std::string savedRecPath = settingsMgr.getString("rec_path", "");
+    if (savedRecPath.empty()) {
+        savedRecPath = getDefaultRecordingPath();
+    }
+    { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.recPath = savedRecPath; }
+    lblRecPath->setText("Path: " + truncatePath(savedRecPath, 25));
+
+    // Restore Frequency if saved
+    long long savedFreq = (long long)settingsMgr.getFloat("frequency", 100000000.0f);
+    freqVFO.setFrequency(savedFreq);
+    currentCenterFreq = savedFreq;
+    { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.centerFreq = savedFreq; }
+    // --- LOAD SETTINGS END ---
 
     sf::Clock debouncer; sf::Clock interactionCooldown; bool isDraggingScale = false, isSpectrumDragging = false; bool isDraggingBW = false; float dragStartBW = 0.0f; float dragStartMouseX = 0.0f; float lastDragX = 0.0f; float aprsLogScrollOffset = 0.0f;
     auto applySpectrumTuning = [&](float mouseX) { bool isHw = false; double hwSampleRate = 2e6; { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) { isHw = currentSource->isHardware(); hwSampleRate = currentSource->getSampleRate(); } } float zoom = 1.0f; { std::lock_guard<std::mutex> l(sharedData.mtx); zoom = sharedData.zoomLevel; } double effectiveRate = hwSampleRate / zoom; double clickPct = mouseX / layout.specW; double offsetHz = (clickPct - 0.5) * effectiveRate; long long clickedFreq = currentCenterFreq + (long long)offsetHz; long long step = STEP_VALUES[ddSnap->selectedIndex]; if (step > 0) { clickedFreq = (long long)std::round((double)clickedFreq / step) * step; double newOffset = (double)(clickedFreq - currentCenterFreq); clickPct = 0.5 + (newOffset / effectiveRate); } if (stickyCenterMode && isHw) { pendingCenterFreq = clickedFreq; debouncer.restart(); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } freqVFO.setFrequency(clickedFreq); } else { { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5 + (offsetHz / hwSampleRate); } freqVFO.setFrequency(clickedFreq); } };
@@ -401,13 +551,25 @@ int main() {
         { std::lock_guard<std::mutex> l(sharedData.mtx); aprsOn = sharedData.aprsEnabled; tunePct = sharedData.tunedFreqPercent; mode = sharedData.mode; currentZoom = sharedData.zoomLevel; currentTheme = sharedData.waterfallTheme; }
         slZoom->update(window); 
 
+        // --- APPLY THROTTLED GAIN ---
+        if (pendingRfGain > -900.0f && gainDebouncer.getElapsedTime().asMilliseconds() > GAIN_LATENCY_MS) {
+            {
+                std::lock_guard<std::mutex> l(sourceMtx);
+                if (currentSource && currentSource->isHardware()) {
+                    currentSource->setGain((int)pendingRfGain);
+                }
+            }
+            pendingRfGain = -999.0f;
+            gainDebouncer.restart();
+        }
+
         while (const std::optional<sf::Event> ev = window.pollEvent()) {
             if (ev->is<sf::Event::Closed>()) window.close();
             volSlider.handleEvent(*ev, window); slZoom->handleEvent(*ev, window);
             if (!isHw) timeSlider.handleEvent(*ev, window);
-            if (btnMute.isClicked(*ev, window)) { static bool m = false; m = !m; btnMute.setColor(m ? sf::Color(116, 57, 57) : sf::Color(60, 60, 60)); std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.isMuted = m; }
-            if (btnPlay.isClicked(*ev, window)) { bool s; { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.isPlaying = !sharedData.isPlaying; s = sharedData.isPlaying; } if (s) { btnPlay.setText("||"); btnPlay.setColor(sf::Color(78, 78, 236)); audio.start(); { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->start(); } } else { btnPlay.setText(">"); btnPlay.setColor(sf::Color(116, 57, 57)); audio.stop(); { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->stop(); } } }
-            if (isHw && btnTuningMode.isClicked(*ev, window)) { stickyCenterMode = !stickyCenterMode; if(stickyCenterMode) { btnTuningMode.setText("CTR"); btnTuningMode.setColor(sf::Color(0,100,200)); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } pendingCenterFreq = freqVFO.getFrequency(); debouncer.restart(); } else { btnTuningMode.setText("FIX"); btnTuningMode.setColor(sf::Color(80,80,80)); } }
+            if (btnMute.isClicked(*ev, window)) { static bool m = false; m = !m; if(m) btnMute.setActive(true); else btnMute.setActive(false); std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.isMuted = m; }
+            if (btnPlay.isClicked(*ev, window)) { bool s; { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.isPlaying = !sharedData.isPlaying; s = sharedData.isPlaying; } if (s) { btnPlay.setText("||"); btnPlay.setActive(true); audio.start(); { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->start(); } } else { btnPlay.setText(">"); btnPlay.setActive(false); audio.stop(); { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->stop(); } } }
+            if (isHw && btnTuningMode.isClicked(*ev, window)) { stickyCenterMode = !stickyCenterMode; if(stickyCenterMode) { btnTuningMode.setText("CTR"); btnTuningMode.setActive(true); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } pendingCenterFreq = freqVFO.getFrequency(); debouncer.restart(); } else { btnTuningMode.setText("FIX"); btnTuningMode.setActive(false); } }
             if (isHw && freqVFO.handleEvent(*ev)) { long long targetVFO = freqVFO.getFrequency(); if (stickyCenterMode) { pendingCenterFreq = targetVFO; debouncer.restart(); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } } else { double halfBW = hwSampleRate / 2.0; double minF = (double)currentCenterFreq - halfBW; double maxF = (double)currentCenterFreq + halfBW; if (targetVFO > maxF || targetVFO < minF) { pendingCenterFreq = targetVFO; debouncer.restart(); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } } else { double pct = 0.5 + ((double)(targetVFO - currentCenterFreq) / hwSampleRate); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = pct; } } } }
             bool overAprs = (aprsOn && window.mapPixelToCoords(sf::Mouse::getPosition(window)).y > (layout.winH - 200));
             if (const auto* scroll = ev->getIf<sf::Event::MouseWheelScrolled>()) { if (overAprs) { aprsLogScrollOffset += scroll->delta * 20.0f; if (aprsLogScrollOffset > 0.0f) aprsLogScrollOffset = 0.0f; } else { sf::Vector2f m = window.mapPixelToCoords(sf::Vector2i((int)scroll->position.x, (int)scroll->position.y)); if (m.y > TOP_BAR_H && m.x < layout.specW) { long long step = STEP_VALUES[ddSnap->selectedIndex]; if (step == 0) step = 100; long long current = freqVFO.getFrequency(); long long rawNext = current + (long long)(scroll->delta * step); if (step > 0) { long long remainder = rawNext % step; if (remainder > step / 2) rawNext += (step - remainder); else rawNext -= remainder; } if (rawNext < 0) rawNext = 0; freqVFO.setFrequency(rawNext); if (stickyCenterMode && isHw) { pendingCenterFreq = rawNext; debouncer.restart(); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } } else { double newOffset = (double)(rawNext - currentCenterFreq); double clickPct = 0.5 + (newOffset / hwSampleRate); clickPct = std::clamp(clickPct, 0.0, 1.0); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = clickPct; } } } } }
@@ -427,8 +589,11 @@ int main() {
         
         std::vector<double> smoothedSpectrum = spectrum; for (size_t i = 1; i < spectrum.size() - 1; i++) { smoothedSpectrum[i] = (spectrum[i-1] + spectrum[i] * 2.0 + spectrum[i+1]) / 4.0; }
         sf::VertexArray fillArea(sf::PrimitiveType::TriangleStrip); sf::VertexArray outline(sf::PrimitiveType::LineStrip);
-        sf::Color coreColor(100, 200, 255, 255); sf::Color glowColor(0, 150, 255, 180); sf::Color bottomColor(0, 100, 200, 0);    
-        if (currentTheme == 1) { coreColor = sf::Color(255, 200, 100, 255); glowColor = sf::Color(255, 100, 50, 180); bottomColor = sf::Color(200, 50, 0, 0); } else if (currentTheme == 2) { coreColor = sf::Color(100, 255, 100, 255); glowColor = sf::Color(0, 255, 50, 180); bottomColor = sf::Color(0, 200, 0, 0); } else if (currentTheme == 3) { coreColor = sf::Color(255, 255, 255, 255); glowColor = sf::Color(200, 200, 200, 180); bottomColor = sf::Color(100, 100, 100, 0); }
+        
+        sf::Color coreColor = Theme::Accent; 
+        sf::Color glowColor = Theme::Glow; 
+        sf::Color bottomColor = Theme::AccentDim; bottomColor.a = 20;
+
         int centerBin = spectrum.size() / 2; int spanBins = (int)(spectrum.size() / currentZoom); int startBin = centerBin - spanBins / 2; int endBin = centerBin + spanBins / 2; if (startBin < 0) startBin = 0; if (endBin > (int)spectrum.size()) endBin = spectrum.size();
         int numPoints = endBin - startBin; if (numPoints < 0) numPoints = 0;
         fillArea.resize(numPoints * 2); outline.resize(numPoints);
@@ -451,15 +616,54 @@ int main() {
             AprsLastPacket pkt; std::deque<std::string> logs; { std::lock_guard<std::mutex> l(sharedData.mtx); pkt = sharedData.lastAprs; logs = sharedData.aprsLog; } 
             float compassX = 60.0f; float compassY = overlayY + 70.0f; float compassR = 40.0f;
             sf::CircleShape compass(compassR); compass.setOrigin({compassR, compassR}); compass.setPosition({compassX, compassY}); compass.setFillColor(sf::Color::Transparent); compass.setOutlineColor(sf::Color(100,100,100)); compass.setOutlineThickness(2); window.draw(compass);
-            sf::Text dirT(font, "N", 12); dirT.setFillColor(sf::Color::Yellow); dirT.setPosition({compassX - 4, compassY - compassR - 15}); window.draw(dirT); sf::RectangleShape northTick({2, 6}); northTick.setFillColor(sf::Color::Yellow); northTick.setPosition({compassX - 1, compassY - compassR}); window.draw(northTick);
-            if (pkt.course >= 0) { sf::VertexArray arrow(sf::PrimitiveType::Lines, 2); float rad = (pkt.course - 90.0f) * (3.14159f / 180.0f); arrow[0].position = {compassX, compassY}; arrow[0].color = sf::Color::Red; arrow[1].position = {compassX + cos(rad)*compassR, compassY + sin(rad)*compassR}; arrow[1].color = sf::Color::Red; window.draw(arrow); sf::Text crsTxt(font, std::to_string((int)pkt.course) + " deg", 12); crsTxt.setPosition({compassX - 20, compassY + compassR + 5}); window.draw(crsTxt); }
-            float textX = compassX + compassR + 40.0f; float curY = overlayY + 20.0f; sf::Text lblCall(font, pkt.src.empty() ? "-- WAITING --" : pkt.src, 32); lblCall.setPosition({textX, curY}); lblCall.setFillColor(sf::Color::Green); lblCall.setStyle(sf::Text::Bold); window.draw(lblCall); if (!pkt.dest.empty()) { sf::Text lblDest(font, "> " + pkt.dest, 20); lblDest.setPosition({textX + lblCall.getLocalBounds().size.x + 15, curY + 12}); lblDest.setFillColor(sf::Color(200,200,200)); window.draw(lblDest); } curY += 40.0f; if (!pkt.coords.empty()) { sf::Text lblGPS(font, "GPS: " + pkt.coords, 18); lblGPS.setPosition({textX, curY}); lblGPS.setFillColor(sf::Color::Cyan); window.draw(lblGPS); curY += 25.0f; } if (!pkt.comment.empty()) { std::string wrappedMsg = wrapText(pkt.comment, font, 16, layout.specW - 350.0f - textX); sf::Text lblMsg(font, wrappedMsg, 16); lblMsg.setPosition({textX, curY}); lblMsg.setFillColor(sf::Color::Yellow); window.draw(lblMsg); }
-            float logX = layout.specW - 300; float logW = 300; sf::RectangleShape divLine({2, aprsH}); divLine.setPosition({logX, overlayY}); divLine.setFillColor(sf::Color::White); window.draw(divLine); sf::Text logTitle(font, "PACKET HISTORY", 12); logTitle.setPosition({logX + 10, overlayY + 5}); logTitle.setFillColor(sf::Color(150,150,150)); window.draw(logTitle); float listTopY = overlayY + 25.0f; int i=0; for(const auto& log : logs) { float yPos = listTopY + aprsLogScrollOffset + (i*16.0f); if (yPos > listTopY - 10 && yPos < layout.winH - 5) { std::string lShort = log; if(lShort.length()>35) lShort=lShort.substr(0,32)+"..."; sf::Text l(font, lShort, 12); l.setPosition({logX + 10, yPos}); l.setFillColor(sf::Color(200,200,200)); window.draw(l); } i++; }
+            sf::Text dirT(font, "N", 24); dirT.setScale({0.5f, 0.5f});
+            dirT.setFillColor(sf::Color::Yellow); dirT.setPosition({compassX - 4, compassY - compassR - 15}); window.draw(dirT); sf::RectangleShape northTick({2, 6}); northTick.setFillColor(sf::Color::Yellow); northTick.setPosition({compassX - 1, compassY - compassR}); window.draw(northTick);
+            if (pkt.course >= 0) { sf::VertexArray arrow(sf::PrimitiveType::Lines, 2); float rad = (pkt.course - 90.0f) * (3.14159f / 180.0f); arrow[0].position = {compassX, compassY}; arrow[0].color = sf::Color::Red; arrow[1].position = {compassX + cos(rad)*compassR, compassY + sin(rad)*compassR}; arrow[1].color = sf::Color::Red; window.draw(arrow); sf::Text crsTxt(font, std::to_string((int)pkt.course) + " deg", 24); crsTxt.setScale({0.5f, 0.5f}); crsTxt.setPosition({compassX - 20, compassY + compassR + 5}); window.draw(crsTxt); }
+            float textX = compassX + compassR + 40.0f; float curY = overlayY + 20.0f; sf::Text lblCall(font, pkt.src.empty() ? "-- WAITING --" : pkt.src, 64); lblCall.setScale({0.5f, 0.5f}); lblCall.setPosition({textX, curY}); lblCall.setFillColor(sf::Color::Green); lblCall.setStyle(sf::Text::Bold); window.draw(lblCall); if (!pkt.dest.empty()) { sf::Text lblDest(font, "> " + pkt.dest, 40); lblDest.setScale({0.5f, 0.5f}); lblDest.setPosition({textX + lblCall.getGlobalBounds().size.x + 15, curY + 12}); lblDest.setFillColor(sf::Color(200,200,200)); window.draw(lblDest); } curY += 40.0f; if (!pkt.coords.empty()) { sf::Text lblGPS(font, "GPS: " + pkt.coords, 36); lblGPS.setScale({0.5f, 0.5f}); lblGPS.setPosition({textX, curY}); lblGPS.setFillColor(sf::Color::Cyan); window.draw(lblGPS); curY += 25.0f; } if (!pkt.comment.empty()) { std::string wrappedMsg = wrapText(pkt.comment, font, 32, (layout.specW - 350.0f - textX) * 2.0f); sf::Text lblMsg(font, wrappedMsg, 32); lblMsg.setScale({0.5f, 0.5f}); lblMsg.setPosition({textX, curY}); lblMsg.setFillColor(sf::Color::Yellow); window.draw(lblMsg); }
+            float logX = layout.specW - 300; float logW = 300; sf::RectangleShape divLine({2, aprsH}); divLine.setPosition({logX, overlayY}); divLine.setFillColor(sf::Color::White); window.draw(divLine); sf::Text logTitle(font, "PACKET HISTORY", 24); logTitle.setScale({0.5f, 0.5f}); logTitle.setPosition({logX + 10, overlayY + 5}); logTitle.setFillColor(sf::Color(150,150,150)); window.draw(logTitle); float listTopY = overlayY + 25.0f; int i=0; for(const auto& log : logs) { float yPos = listTopY + aprsLogScrollOffset + (i*16.0f); if (yPos > listTopY - 10 && yPos < layout.winH - 5) { std::string lShort = log; if(lShort.length()>35) lShort=lShort.substr(0,32)+"..."; sf::Text l(font, lShort, 24); l.setScale({0.5f, 0.5f}); l.setPosition({logX + 10, yPos}); l.setFillColor(sf::Color(200,200,200)); window.draw(l); } i++; }
         }
 
         if (!isHw) timeSlider.draw(window); sidebar.draw(window); window.draw(topBar); freqVFO.draw(window); btnPlay.draw(window); if (isHw) btnTuningMode.draw(window); btnMute.draw(window); volSlider.draw(window);
         window.display();
     }
+
+    // --- SAVE SETTINGS ---
+    SettingsManager saveMgr;
+    
+    // Sidebar
+    for (auto& mod : sidebar.modules) {
+        saveMgr.set("sidebar_" + mod->title, mod->isOpen);
+    }
+    
+    saveMgr.set("theme", ddTheme->selectedIndex);
+    saveMgr.set("zoom", slZoom->currentVal);
+    saveMgr.set("min_db", slMinDb->currentVal);
+    saveMgr.set("max_db", slMaxDb->currentVal);
+    saveMgr.set("step_index", ddSnap->selectedIndex);
+    
+    saveMgr.set("mode_index", (int)sharedData.mode);
+    saveMgr.set("bandwidth", slBW->currentVal);
+    saveMgr.set("squelch", slSq->currentVal);
+    saveMgr.set("stereo", chkStereo->checked);
+    saveMgr.set("rf_gain", sharedData.rfGain); 
+    
+    saveMgr.set("source_type", ddSourceType->selectedIndex);
+    
+    saveMgr.set("hw_fm_notch", hwState.fmNotch);
+    saveMgr.set("hw_mw_notch", hwState.mwNotch);
+    saveMgr.set("hw_bias_t", hwState.biasT);
+    saveMgr.set("hw_direct_samp", hwState.directSampling);
+    saveMgr.set("hw_antenna", hwState.antennaIndex);
+    
+    // SAVE REC PATH
+    { std::lock_guard<std::mutex> l(sharedData.mtx); saveMgr.set("rec_path", sharedData.recPath); }
+
+    // SAVE FREQ
+    { std::lock_guard<std::mutex> l(sharedData.mtx); saveMgr.set("frequency", (double)sharedData.centerFreq); }
+
+    saveMgr.save(settingsPath);
+    // --- END SAVE ---
+
     dspRunning = false; if (dspThread.joinable()) dspThread.join();
     return 0;
 }

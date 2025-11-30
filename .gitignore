@@ -8,3 +8,6 @@ dump.txt
 *.wav
 ax25
 aprs.log
+git-cheatcodes.txt
+Settings.json
+OrbitSDR.app
