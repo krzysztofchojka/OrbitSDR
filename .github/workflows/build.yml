@@ -87,21 +87,6 @@ jobs:
         brew update
         brew install sfml librtlsdr dylibbundler
 
-    - name: Prepare SDRPlay Libraries (Fix Versioning)
-      run: |
-        # Wchodzimy do folderu z bibliotekami macOS
-        cd deps/sdrplay/lib/macos
-        
-        # Tworzymy symlink: system szuka .so.3, a my mamy .so.3.15
-        # To "oszukuje" dylibbundler, dając mu dokładnie tę nazwę, której szuka
-        ln -sf libsdrplay_api.so.3.15 libsdrplay_api.so.3
-        
-        # Dla pewności tworzymy też link dla .so
-        ln -sf libsdrplay_api.so.3.15 libsdrplay_api.so
-        
-        # Wyświetlamy zawartość, żebyś widział w logach, czy linki powstały
-        ls -la
-
     - name: Compile & Create Bundle
       run: |
         chmod +x build.sh
