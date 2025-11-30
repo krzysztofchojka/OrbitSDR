@@ -2,7 +2,7 @@ name: Build OrbitSDR (Portable)
 
 on:
   push:
-    branches: [ "main", "master", "test-ci"]
+    branches: [ "main", "master", "test-ci" ]
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch:
@@ -22,7 +22,6 @@ jobs:
 
     - name: Download & Prepare SFML 3.0
       run: |
-        # Pobieramy prekompilowane SFML, żeby nie kompilować go w CI (szybciej)
         wget https://github.com/SFML/SFML/releases/download/3.0.0/SFML-3.0.0-linux-gcc-64-bit.tar.gz
         tar -xzf SFML-3.0.0-linux-gcc-64-bit.tar.gz
         mv SFML-3.0.0 sfml
@@ -31,50 +30,43 @@ jobs:
       run: |
         chmod +x build.sh
         
-        # Definicje ścieżek
         SFML_PATH="$GITHUB_WORKSPACE/sfml"
         SDR_INC="$GITHUB_WORKSPACE/deps/sdrplay/include"
         SDR_LIB="$GITHUB_WORKSPACE/deps/sdrplay/lib/linux"
 
-        # Kompilacja z flagami wskazującymi na lokalne foldery
-        # -Wl,-rpath,'$ORIGIN/libs' -> TO JEST KLUCZ! Mówi: szukaj bibliotek w folderze ./libs obok pliku exe
         export CXXFLAGS="-I$SFML_PATH/include -I$SDR_INC"
         export LDFLAGS="-L$SFML_PATH/lib -L$SDR_LIB -Wl,-rpath,'\$ORIGIN/libs'"
         export LIBS="-lsfml-graphics -lsfml-window -lsfml-system -lsfml-audio -lrtlsdr -lsdrplay_api"
         
-        # Uruchamiamy build
         ./build.sh --enable-sdrplay
 
-      - name: Create Portable Linux Bundle
-        run: |
-          mkdir -p OrbitSDR_Linux/libs
-          cp orbitsdr OrbitSDR_Linux/OrbitSDR
-          cp icon.png OrbitSDR_Linux/
-          
-          # Kopiujemy biblioteki SFML i SDRPlay (to już miałeś)
-          cp sfml/lib/*.so* OrbitSDR_Linux/libs/
-          cp deps/sdrplay/lib/linux/*.so* OrbitSDR_Linux/libs/
-          
-          # --- DODAJ TO DLA 100% STANDALONE ---
-          # Znajdujemy i kopiujemy librtlsdr oraz libusb z systemu
-          cp /usr/lib/x86_64-linux-gnu/librtlsdr.so* OrbitSDR_Linux/libs/ || echo "Warning: librtlsdr not found"
-          cp /usr/lib/x86_64-linux-gnu/libusb-1.0.so* OrbitSDR_Linux/libs/ || echo "Warning: libusb not found"
-          # ------------------------------------
+    - name: Create Portable Linux Bundle
+      run: |
+        mkdir -p OrbitSDR_Linux/libs
+        cp orbitsdr OrbitSDR_Linux/OrbitSDR
+        cp icon.png OrbitSDR_Linux/
+        
+        cp sfml/lib/*.so* OrbitSDR_Linux/libs/
+        cp deps/sdrplay/lib/linux/*.so* OrbitSDR_Linux/libs/
+        
+        # Copy system libraries for standalone usage
+        cp /usr/lib/x86_64-linux-gnu/librtlsdr.so* OrbitSDR_Linux/libs/ || echo "Warning: librtlsdr not found"
+        cp /usr/lib/x86_64-linux-gnu/libusb-1.0.so* OrbitSDR_Linux/libs/ || echo "Warning: libusb not found"
 
-          cat > OrbitSDR_Linux/OrbitSDR_Run.sh <<EOF
-          #!/bin/bash
-          cd "\$(dirname "\$0")"
-          export LD_LIBRARY_PATH="\$LD_LIBRARY_PATH:./libs"
-          ./OrbitSDR
-          EOF
-          chmod +x OrbitSDR_Linux/OrbitSDR_Run.sh
-          chmod +x OrbitSDR_Linux/OrbitSDR
+        cat > OrbitSDR_Linux/OrbitSDR_Run.sh <<EOF
+        #!/bin/bash
+        cd "\$(dirname "\$0")"
+        export LD_LIBRARY_PATH="\$LD_LIBRARY_PATH:./libs"
+        ./OrbitSDR
+        EOF
+        chmod +x OrbitSDR_Linux/OrbitSDR_Run.sh
+        chmod +x OrbitSDR_Linux/OrbitSDR
 
-          - name: Upload Linux Artifact
-            uses: actions/upload-artifact@v4
-            with:
-              name: OrbitSDR-Linux-Portable
-              path: OrbitSDR_Linux/
+    - name: Upload Linux Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: OrbitSDR-Linux-Portable
+        path: OrbitSDR_Linux/
 
   build-macos:
     name: macOS (Universal App)
@@ -87,40 +79,29 @@ jobs:
       run: |
         brew update
         brew install sfml librtlsdr dylibbundler
-        # dylibbundler to magiczne narzędzie, które naprawia problem "działa tylko u mnie"
 
     - name: Compile & Create Bundle
       run: |
         chmod +x build.sh
         
-        # Ustawiamy ścieżki dla SDRPlay (SFML jest w Homebrew, system go znajdzie sam)
         SDR_INC="$GITHUB_WORKSPACE/deps/sdrplay/include"
-        # Na macOS w CI nie mamy sterowników w /usr/local/lib, więc wskazujemy na deps
-        # Ale build.sh szuka w systemie, więc zrobimy mały trick:
         mkdir -p /usr/local/include
         mkdir -p /usr/local/lib
         cp $SDR_INC/*.h /usr/local/include/
         cp deps/sdrplay/lib/macos/libsdrplay_api.so.3 /usr/local/lib/
         
-        # Kompilacja (to stworzy OrbitSDR.app dzięki nowemu skryptowi build.sh)
         ./build.sh --enable-sdrplay
 
     - name: Bundle Dependencies (Fix "Library not loaded")
       run: |
-        # To jest najważniejszy krok dla macOS!
-        # dylibbundler szuka bibliotek (SFML, librtlsdr) w systemie, 
-        # kopiuje je do środka .app i naprawia ścieżki.
-        
         dylibbundler -od -b -x ./OrbitSDR.app/Contents/MacOS/OrbitSDR \
           -d ./OrbitSDR.app/Contents/Frameworks/ \
           -p @executable_path/../Frameworks/
 
-        # Ponowne podpisanie aplikacji (wymagane po zmianie bibliotek)
         codesign --force --deep --sign - OrbitSDR.app
 
     - name: Create DMG or Zip
       run: |
-        # Pakujemy .app do zipa, żeby zachować uprawnienia plików
         zip -r OrbitSDR-macOS.zip OrbitSDR.app
 
     - name: Upload macOS Artifact
@@ -128,3 +109,43 @@ jobs:
       with:
         name: OrbitSDR-macOS
         path: OrbitSDR-macOS.zip
+
+  build-windows-mingw:
+    name: Windows (MinGW64)
+    runs-on: windows-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: UCRT64
+        update: true
+        install: >-
+          mingw-w64-ucrt-x86_64-gcc
+          mingw-w64-ucrt-x86_64-rtl-sdr
+          mingw-w64-ucrt-x86_64-make
+          unzip
+          wget
+
+    - name: Download SFML 3.0 (MinGW)
+      shell: msys2 {0}
+      run: |
+        wget -q https://github.com/SFML/SFML/releases/download/3.0.0/SFML-3.0.0-windows-gcc-14.2.0-mingw-64-bit.zip -O sfml.zip
+        unzip -q sfml.zip
+        mv SFML-3.0.0 sfml
+
+    - name: Compile OrbitSDR
+      shell: msys2 {0}
+      run: |
+        chmod +x build_mingw.sh
+        ./build_mingw.sh
+
+    - name: Upload Windows Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: orbitsdr-windows-mingw
+        path: |
+          orbitsdr.exe
+          *.dll
