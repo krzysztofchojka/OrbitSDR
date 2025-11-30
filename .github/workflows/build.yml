@@ -22,9 +22,8 @@ jobs:
 
     - name: Download & Prepare SFML 3.0
       run: |
-        # Pobieramy prekompilowane SFML, żeby nie kompilować go w CI (szybciej)
-        wget https://github.com/SFML/SFML/releases/download/3.0.0/SFML-3.0.0-linux-gcc-64-bit.tar.gz
-        tar -xzf SFML-3.0.0-linux-gcc-64-bit.tar.gz
+        # POPRAWKA: Było "tar tar", zmieniono na "tar"
+        tar -xzf $GITHUB_WORKSPACE/deps/SFML-3.0.0-linux-gcc-64-bit.tar.gz
         mv SFML-3.0.0 sfml
 
     - name: Compile OrbitSDR
@@ -51,7 +50,7 @@ jobs:
         cp orbitsdr OrbitSDR_Linux/OrbitSDR
         cp icon.png OrbitSDR_Linux/
         
-        # Kopiujemy biblioteki SFML i SDRPlay (to już miałeś)
+        # Kopiujemy biblioteki SFML i SDRPlay
         cp sfml/lib/*.so* OrbitSDR_Linux/libs/
         cp deps/sdrplay/lib/linux/*.so* OrbitSDR_Linux/libs/
         
@@ -70,11 +69,11 @@ jobs:
         chmod +x OrbitSDR_Linux/OrbitSDR_Run.sh
         chmod +x OrbitSDR_Linux/OrbitSDR
 
-        - name: Upload Linux Artifact
-          uses: actions/upload-artifact@v4
-          with:
-            name: OrbitSDR-Linux-Portable
-            path: OrbitSDR_Linux/
+    - name: Upload Linux Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: OrbitSDR-Linux-Portable
+        path: OrbitSDR_Linux/
 
   build-macos:
     name: macOS (Universal App)
@@ -93,16 +92,22 @@ jobs:
       run: |
         chmod +x build.sh
         
-        # Ustawiamy ścieżki dla SDRPlay (SFML jest w Homebrew, system go znajdzie sam)
+        # --- NAPRAWA ---
+        # Zamiast kopiować do /usr/local (co powoduje błąd), wskazujemy ścieżki
+        # tak jak w starym pliku build.yml, który działał.
+        
         SDR_INC="$GITHUB_WORKSPACE/deps/sdrplay/include"
-        # Na macOS w CI nie mamy sterowników w /usr/local/lib, więc wskazujemy na deps
-        # Ale build.sh szuka w systemie, więc zrobimy mały trick:
-        mkdir -p /usr/local/include
-        mkdir -p /usr/local/lib
-        cp $SDR_INC/*.h /usr/local/include/
-        cp deps/sdrplay/lib/macos/libsdrplay_api.so.3 /usr/local/lib/
+        SDR_LIB="$GITHUB_WORKSPACE/deps/sdrplay/lib/macos"
+        
+        # 1. Headers: Wskazujemy folder w deps/sdrplay/include
+        export CXXFLAGS="-I$SDR_INC"
+
+        # 2. Linker: Wskazujemy biblioteki w deps ORAZ w Homebrew (dla librtlsdr)
+        # -L/opt/homebrew/lib jest kluczowe dla Apple Silicon
+        export LDFLAGS="-L/opt/homebrew/lib -L$SDR_LIB -lsdrplay_api"
         
         # Kompilacja (to stworzy OrbitSDR.app dzięki nowemu skryptowi build.sh)
+        # build.sh automatycznie "chwyci" te zmienne środowiskowe
         ./build.sh --enable-sdrplay
 
     - name: Bundle Dependencies (Fix "Library not loaded")
@@ -110,10 +115,12 @@ jobs:
         # To jest najważniejszy krok dla macOS!
         # dylibbundler szuka bibliotek (SFML, librtlsdr) w systemie, 
         # kopiuje je do środka .app i naprawia ścieżki.
+        # Dodano flagę -s, aby szukał też w deps/sdrplay
         
         dylibbundler -od -b -x ./OrbitSDR.app/Contents/MacOS/OrbitSDR \
           -d ./OrbitSDR.app/Contents/Frameworks/ \
-          -p @executable_path/../Frameworks/
+          -p @executable_path/../Frameworks/ \
+          -s ./deps/sdrplay/lib/macos/
 
         # Ponowne podpisanie aplikacji (wymagane po zmianie bibliotek)
         codesign --force --deep --sign - OrbitSDR.app
