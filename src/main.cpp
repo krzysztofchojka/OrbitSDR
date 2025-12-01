@@ -220,7 +220,17 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
             }
             std::vector<uint8_t> tempRow(INTERNAL_WATERFALL_WIDTH * 4); for (int x = 0; x < INTERNAL_WATERFALL_WIDTH; x++) { int fftIdx = (int)((float)x / INTERNAL_WATERFALL_WIDTH * FFT_SIZE); int sIdx = (fftIdx + FFT_SIZE / 2) % FFT_SIZE; float rawMag = std::abs(fftData[sIdx]) / FFT_SIZE; float rawDb = 20 * std::log10(rawMag + 1e-12); float norm = (rawDb - minDb) / (maxDb - minDb); sf::Color c = getHeatmap(norm, themeID); int px = x * 4; tempRow[px] = c.r; tempRow[px + 1] = c.g; tempRow[px + 2] = c.b; tempRow[px + 3] = 255; }
             float alpha = (play) ? 0.3f : 1.0f; for (int i = 0; i < FFT_SIZE; i++) { int idx = (i + FFT_SIZE / 2) % FFT_SIZE; float mag = std::abs(fftData[idx]) / FFT_SIZE; float db = 20 * std::log10(mag + 1e-12); localFftHistory[i] = localFftHistory[i] * (1.0f - alpha) + db * alpha; }
-            { std::lock_guard<std::mutex> lock(shared.mtx); shared.fftSpectrum = localFftHistory; shared.waterfallRow = tempRow; shared.newWaterfallData = true; }
+            
+            // --- FIX: TRY_LOCK TO PREVENT AUDIO STUTTER ---
+            // If UI holds the lock, skip waterfall update for this frame. Audio is priority.
+            { 
+                std::unique_lock<std::mutex> lock(shared.mtx, std::try_to_lock); 
+                if (lock.owns_lock()) {
+                    shared.fftSpectrum = localFftHistory; 
+                    shared.waterfallRow = tempRow; 
+                    shared.newWaterfallData = true; 
+                }
+            }
         } else { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
     }
     if (recorder.active) recorder.stop();
@@ -674,7 +684,36 @@ int main() {
             if (btnMute.isClicked(*ev, window)) { static bool m = false; m = !m; if(m) btnMute.setActive(true); else btnMute.setActive(false); std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.isMuted = m; }
             if (btnPlay.isClicked(*ev, window)) { bool s; { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.isPlaying = !sharedData.isPlaying; s = sharedData.isPlaying; } if (s) { btnPlay.setText("||"); btnPlay.setActive(true); audio.start(); { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->start(); } } else { btnPlay.setText(">"); btnPlay.setActive(false); audio.stop(); { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->stop(); } } }
             if (isHw && btnTuningMode.isClicked(*ev, window)) { stickyCenterMode = !stickyCenterMode; if(stickyCenterMode) { btnTuningMode.setText("CTR"); btnTuningMode.setActive(true); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } pendingCenterFreq = freqVFO.getFrequency(); debouncer.restart(); } else { btnTuningMode.setText("FIX"); btnTuningMode.setActive(false); } }
-            if (isHw && freqVFO.handleEvent(*ev)) { long long targetVFO = freqVFO.getFrequency(); if (stickyCenterMode) { pendingCenterFreq = targetVFO; debouncer.restart(); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } } else { double halfBW = hwSampleRate / 2.0; double minF = (double)currentCenterFreq - halfBW; double maxF = (double)currentCenterFreq + halfBW; if (targetVFO > maxF || targetVFO < minF) { pendingCenterFreq = targetVFO; debouncer.restart(); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } } else { double pct = 0.5 + ((double)(targetVFO - currentCenterFreq) / hwSampleRate); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = pct; } } } }
+            
+            // --- FIX FOR SCROLL VFO LOCKUP (Hardware not retuning) ---
+            if (isHw && freqVFO.handleEvent(*ev)) { 
+                long long targetVFO = freqVFO.getFrequency(); 
+                if (stickyCenterMode) { 
+                    pendingCenterFreq = targetVFO; 
+                    debouncer.restart(); 
+                    { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } 
+                } else { 
+                    double halfBW = hwSampleRate / 2.0; 
+                    double minF = (double)currentCenterFreq - halfBW; 
+                    double maxF = (double)currentCenterFreq + halfBW; 
+                    
+                    if (targetVFO > maxF || targetVFO < minF) { 
+                        // Hardware Retune Needed
+                        // FIX: Only restart debouncer if target actually changed to avoid constant resets
+                        if (pendingCenterFreq != targetVFO) {
+                             pendingCenterFreq = targetVFO; 
+                             // FIX: Optimistic update of local state to prevent "outside bandwidth" check failing on next frame
+                             currentCenterFreq = targetVFO;
+                             debouncer.restart(); 
+                             { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.centerFreq = targetVFO; sharedData.tunedFreqPercent = 0.5; } 
+                        }
+                    } else { 
+                        double pct = 0.5 + ((double)(targetVFO - currentCenterFreq) / hwSampleRate); 
+                        { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = pct; } 
+                    } 
+                } 
+            }
+
             bool overAprs = (aprsOn && window.mapPixelToCoords(sf::Mouse::getPosition(window)).y > (layout.winH - 200));
             if (const auto* scroll = ev->getIf<sf::Event::MouseWheelScrolled>()) { if (overAprs) { aprsLogScrollOffset += scroll->delta * 20.0f; if (aprsLogScrollOffset > 0.0f) aprsLogScrollOffset = 0.0f; } else { sf::Vector2f m = window.mapPixelToCoords(sf::Vector2i((int)scroll->position.x, (int)scroll->position.y)); if (m.y > TOP_BAR_H && m.x < layout.specW) { long long step = STEP_VALUES[ddSnap->selectedIndex]; if (step == 0) step = 100; long long current = freqVFO.getFrequency(); long long rawNext = current + (long long)(scroll->delta * step); if (step > 0) { long long remainder = rawNext % step; if (remainder > step / 2) rawNext += (step - remainder); else rawNext -= remainder; } if (rawNext < 0) rawNext = 0; freqVFO.setFrequency(rawNext); if (stickyCenterMode && isHw) { pendingCenterFreq = rawNext; debouncer.restart(); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } } else { double newOffset = (double)(rawNext - currentCenterFreq); double clickPct = 0.5 + (newOffset / hwSampleRate); clickPct = std::clamp(clickPct, 0.0, 1.0); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = clickPct; } } } } }
             if (const auto* mb = ev->getIf<sf::Event::MouseButtonPressed>()) { if (mb->button == sf::Mouse::Button::Left) { sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window)); bool overTimeline = (timeSlider.isDragging || (m.y > layout.winH - 40)); bool inFreqScaleZone = (m.y >= TOP_BAR_H + layout.specH - 10 && m.y <= TOP_BAR_H + layout.specH + 20 && m.x < layout.specW); double offsetFromCenter = (tunePct - 0.5); float visualCenterX = (0.5 + (offsetFromCenter * currentZoom)) * layout.specW; float bwPixels = (slBW->currentVal / (hwSampleRate / currentZoom)) * layout.specW; float leftEdge = visualCenterX - bwPixels / 2.0f; float rightEdge = visualCenterX + bwPixels / 2.0f; if (mode == Mode::USB) { leftEdge = visualCenterX; rightEdge = visualCenterX + bwPixels; } if (mode == Mode::LSB) { leftEdge = visualCenterX - bwPixels; rightEdge = visualCenterX; } bool hitEdge = (std::abs(m.x - leftEdge) < 6 || std::abs(m.x - rightEdge) < 6) && (m.y > TOP_BAR_H && m.y < TOP_BAR_H + layout.specH); if (hitEdge && !overAprs) { isDraggingBW = true; dragStartBW = slBW->currentVal; dragStartMouseX = m.x; } else if (inFreqScaleZone && !overTimeline && !overAprs) { isDraggingScale = true; lastDragX = m.x; } else if (!overTimeline && !overAprs && m.x < layout.specW && m.y > TOP_BAR_H && m.y < (TOP_BAR_H + layout.specH + layout.waterfallH)) { isSpectrumDragging = true; applySpectrumTuning(m.x); } } } else if (const auto* mr = ev->getIf<sf::Event::MouseButtonReleased>()) { if (mr->button == sf::Mouse::Button::Left) { isSpectrumDragging = false; isDraggingScale = false; isDraggingBW = false; } } else if (const auto* mm = ev->getIf<sf::Event::MouseMoved>()) { sf::Vector2f m = window.mapPixelToCoords(mm->position); double offsetFromCenter = (tunePct - 0.5); float visualCenterX = (0.5 + (offsetFromCenter * currentZoom)) * layout.specW; float bwPixels = (slBW->currentVal / (hwSampleRate / currentZoom)) * layout.specW; float leftEdge = visualCenterX - bwPixels / 2.0f; float rightEdge = visualCenterX + bwPixels / 2.0f; if (mode == Mode::USB) { leftEdge = visualCenterX; rightEdge = visualCenterX + bwPixels; } if (mode == Mode::LSB) { leftEdge = visualCenterX - bwPixels; rightEdge = visualCenterX; } bool hitEdge = (std::abs(m.x - leftEdge) < 6 || std::abs(m.x - rightEdge) < 6) && (m.y > TOP_BAR_H && m.y < TOP_BAR_H + layout.specH); if ((hitEdge || isDraggingBW) && cursorSizeH) window.setMouseCursor(*cursorSizeH); if (isDraggingBW) { float hzPerPx = (hwSampleRate / currentZoom) / layout.specW; float dist = std::abs(m.x - visualCenterX); float newBW = dist * hzPerPx * 2.0f; if (mode == Mode::USB || mode == Mode::LSB) newBW = dist * hzPerPx; newBW = std::clamp(newBW, slBW->minVal, slBW->maxVal); slBW->setValueSilent(newBW); slBW->onChange(newBW); } else if (isSpectrumDragging) applySpectrumTuning(m.x); if (isDraggingScale) { float dx = lastDragX - m.x; lastDragX = m.x; double hzPerPx = (hwSampleRate / currentZoom) / layout.specW; long long shift = (long long)(dx * hzPerPx); long long nextCenter = currentCenterFreq + shift; if (nextCenter < 0) nextCenter = 0; currentCenterFreq = nextCenter; { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.centerFreq = nextCenter; } if (debouncer.getElapsedTime().asMilliseconds() > TUNING_LATENCY_MS) { { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->setCenterFrequency(nextCenter); } debouncer.restart(); } } if (!overAprs && m.x >= 0 && m.x < layout.specW && m.y >= TOP_BAR_H && m.y < (TOP_BAR_H + layout.specH + layout.waterfallH)) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.mouseX_spectrum = m.x; sharedData.mouseY_spectrum = m.y - TOP_BAR_H; } else { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.mouseX_spectrum = -1.0f; } }
