@@ -7,6 +7,7 @@
 #include <iostream>
 #include <algorithm>
 #include <cstdlib> // dla getenv
+#include <vector>
 
 #ifdef _WIN32
     #include <direct.h>
@@ -100,6 +101,7 @@ public:
         return defaultVal;
     }
 
+    // PANCERNA FUNKCJA LOAD
     void load(std::string filename) {
         data.clear();
         std::ifstream file(filename);
@@ -107,23 +109,39 @@ public:
 
         std::string line;
         while (std::getline(file, line)) {
-            size_t colPos = line.find(':');
-            size_t q1 = line.find('"');
-            
-            if (colPos != std::string::npos && q1 != std::string::npos) {
-                size_t q2 = line.find('"', q1 + 1);
-                if (q2 != std::string::npos) {
-                    std::string key = line.substr(q1 + 1, q2 - q1 - 1);
-                    std::string valPart = line.substr(colPos + 1);
-                    
-                    valPart.erase(std::remove(valPart.begin(), valPart.end(), ','), valPart.end());
-                    valPart.erase(std::remove(valPart.begin(), valPart.end(), '"'), valPart.end());
-                    valPart.erase(std::remove(valPart.begin(), valPart.end(), ' '), valPart.end());
-                    valPart.erase(std::remove(valPart.begin(), valPart.end(), '\r'), valPart.end());
-                    valPart.erase(std::remove(valPart.begin(), valPart.end(), '\n'), valPart.end());
-                    
-                    data[key] = valPart;
+            try {
+                // Proste zabezpieczenie przed pustymi liniami
+                if (line.length() < 3) continue;
+
+                size_t colPos = line.find(':');
+                size_t q1 = line.find('"');
+                
+                if (colPos != std::string::npos && q1 != std::string::npos) {
+                    size_t q2 = line.find('"', q1 + 1);
+                    if (q2 != std::string::npos && q2 > q1) {
+                        std::string key = line.substr(q1 + 1, q2 - q1 - 1);
+                        
+                        // Zabezpieczenie przed wyjściem poza zakres przy pobieraniu wartości
+                        if (colPos + 1 < line.length()) {
+                            std::string valPart = line.substr(colPos + 1);
+                            
+                            // Czyszczenie śmieci JSONowych
+                            valPart.erase(std::remove(valPart.begin(), valPart.end(), ','), valPart.end());
+                            valPart.erase(std::remove(valPart.begin(), valPart.end(), '"'), valPart.end());
+                            valPart.erase(std::remove(valPart.begin(), valPart.end(), ' '), valPart.end());
+                            valPart.erase(std::remove(valPart.begin(), valPart.end(), '\r'), valPart.end());
+                            valPart.erase(std::remove(valPart.begin(), valPart.end(), '\n'), valPart.end());
+                            
+                            if (!key.empty()) {
+                                data[key] = valPart;
+                            }
+                        }
+                    }
                 }
+            } catch (...) {
+                // Jeśli jakakolwiek linia jest uszkodzona, ignorujemy ją i idziemy dalej
+                // zamiast wywalać program
+                std::cerr << "[Warning] Skipping corrupted line in settings.json" << std::endl;
             }
         }
     }
@@ -136,6 +154,8 @@ public:
         int count = 0;
         for (auto const& [key, val] : data) {
             file << "  \"" << key << "\": ";
+            
+            // Prosta heurystyka: czy to liczba/bool czy string?
             bool isNum = !val.empty() && (isdigit(val[0]) || val[0] == '-');
             bool isBool = (val == "true" || val == "false");
             
