@@ -14,7 +14,7 @@
 #include <ctime>
 #include <deque>
 #include <regex> 
-#include <cmath> // dla std::isnan, std::isinf
+#include <cmath> 
 
 #include "DSP.h"
 #include "AudioSink.h"
@@ -24,7 +24,7 @@
 #include "NativeDialogs.h"
 #include "IQSources.h"
 #include "APRS_Decoder.h"
-#include "Settings.h" // Obsługa JSON i ścieżek
+#include "Settings.h" 
 
 // --- CONSTANTS ---
 const int FFT_SIZE = 1024;
@@ -39,7 +39,6 @@ const std::vector<uint32_t> RTL_RATES_VAL = {1400000, 1800000, 2048000, 2400000,
 const std::vector<uint32_t> SDRPLAY_RATES_VAL = {2000000, 4000000, 6000000, 8000000, 10000000};
 const std::vector<std::string> STEP_NAMES = {"None", "1 kHz", "5 kHz", "6.25k", "10 kHz", "12.5k", "25 kHz", "100 kHz"};
 const std::vector<long long> STEP_VALUES = {0, 1000, 5000, 6250, 10000, 12500, 25000, 100000};
-
 const std::vector<std::string> THEME_NAMES = {"Orbit Original", "Neon (Pink/Blue)", "Matrix (Green)", "Grayscale", "Orbit Plus (Aurora)"};
 
 // --- GLOBAL PERSISTENT STATE ---
@@ -92,7 +91,7 @@ struct SharedData {
     std::mutex mtx; 
     double tunedFreqPercent = 0.5; double pendingSeekRequest = -1.0; double bandwidth = 12500.0; long long centerFreq = 0; 
     float volume = 0.5f; bool isMuted = false; 
-    float rfGain = -1.0f; // -1.0 = AGC, >=0 = Manual
+    float rfGain = -1.0f; 
     float squelchThreshold = -100.0f; bool stereoEnabled = false; Mode mode = Mode::NFM; bool isPlaying = false; 
     float minDb = -90.0f; 
     float maxDb = 0.0f; 
@@ -114,7 +113,7 @@ sf::Color getHeatmap(float v, int theme) {
         else if(v<0.75f) {r=static_cast<std::uint8_t>((v-0.5f)*4*255); g=255; b=static_cast<std::uint8_t>(255-r);}
         else {r=255; g=static_cast<std::uint8_t>((1.0f-v)*4*255);}
     }
-    else if (theme == 1) { // NEON (Pink/Blue)
+    else if (theme == 1) { // NEON
         if(v < 0.3f) { r=0; g=0; b=static_cast<std::uint8_t>(v * 3.33f * 255); }
         else if(v < 0.6f) { float t = (v - 0.3f) / 0.3f; r = static_cast<std::uint8_t>(t * 180); g = 0; b = 255; }
         else if(v < 0.85f) { float t = (v - 0.6f) / 0.25f; r = 180 + static_cast<std::uint8_t>(t * 75); g = 0; b = 255 - static_cast<std::uint8_t>(t * 100); }
@@ -175,41 +174,62 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
         parseAprsData(fullLog, shared.lastAprs); 
     };
 
-    double lastSampleRate = 0; std::vector<Complex> iqBuffer; std::vector<double> winFunc = makeWindow(FFT_SIZE); std::vector<double> localFftHistory(FFT_SIZE, -100.0); WavWriter recorder; 
+    double lastSampleRate = 0; 
+    std::vector<Complex> iqBuffer; 
+    std::vector<double> winFunc = makeWindow(FFT_SIZE); 
+    std::vector<double> localFftHistory(FFT_SIZE, -100.0); 
+    WavWriter recorder; 
     
+    // OPTIMIZATION: Waterfall Update Timer
+    sf::Clock waterfallTimer;
+
     while (running) {
         std::shared_ptr<IQSource> src = nullptr; { std::lock_guard<std::mutex> lock(sourceMtx); src = currentSource; }
         if (!src) { std::this_thread::sleep_for(std::chrono::milliseconds(20)); continue; }
 
-        double targetFreqPct, bw; float vol, rfGainReq; bool muted; Mode mode; bool play, aprsActive; float minDb, maxDb; bool doRecord; RecMode rMode; std::string rPath; float sqThr; bool stereo; double seekReq = -1.0; int themeID = 0;
-        { std::lock_guard<std::mutex> lock(shared.mtx); seekReq = shared.pendingSeekRequest; shared.pendingSeekRequest = -1.0; float rawPct = shared.tunedFreqPercent; if (std::isnan(rawPct) || std::isinf(rawPct)) rawPct = 0.5f; targetFreqPct = std::clamp(rawPct, 0.0f, 1.0f); bw = shared.bandwidth; vol = shared.volume; muted = shared.isMuted; rfGainReq = shared.rfGain; mode = shared.mode; play = shared.isPlaying; minDb = shared.minDb; maxDb = shared.maxDb; doRecord = shared.isRecording; rMode = shared.recMode; rPath = shared.recPath; aprsActive = shared.aprsEnabled; sqThr = shared.squelchThreshold; stereo = shared.stereoEnabled; themeID = shared.waterfallTheme; }
+        double targetFreqPct, bw; float vol; bool muted; Mode mode; bool play, aprsActive; float minDb, maxDb; bool doRecord; RecMode rMode; std::string rPath; float sqThr; bool stereo; double seekReq = -1.0; int themeID = 0;
+        { std::lock_guard<std::mutex> lock(shared.mtx); seekReq = shared.pendingSeekRequest; shared.pendingSeekRequest = -1.0; float rawPct = shared.tunedFreqPercent; if (std::isnan(rawPct) || std::isinf(rawPct)) rawPct = 0.5f; targetFreqPct = std::clamp(rawPct, 0.0f, 1.0f); bw = shared.bandwidth; vol = shared.volume; muted = shared.isMuted; mode = shared.mode; play = shared.isPlaying; minDb = shared.minDb; maxDb = shared.maxDb; doRecord = shared.isRecording; rMode = shared.recMode; rPath = shared.recPath; aprsActive = shared.aprsEnabled; sqThr = shared.squelchThreshold; stereo = shared.stereoEnabled; themeID = shared.waterfallTheme; }
         
         bool justSeeked = false; if (seekReq >= 0.0 && src->isSeekable()) { src->seek(seekReq); demod.clear(); audio.clear(); justSeeked = true; } 
         if (!play && !justSeeked) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
         
         if (doRecord && !recorder.active) { long long currentCenterHz; { std::lock_guard<std::mutex> l(shared.mtx); currentCenterHz = shared.centerFreq; } char timeBuf[32]; std::time_t now = std::time(nullptr); std::strftime(timeBuf, sizeof(timeBuf), "%Y%m%d_%H%M%S", std::localtime(&now)); std::string filename, freqLabel; if (rMode == RecMode::AUDIO) { double offset = (targetFreqPct - 0.5) * src->getSampleRate(); long long tunedHz = currentCenterHz + (long long)offset; freqLabel = "_" + std::to_string(tunedHz / 1000) + "kHz"; filename = (rPath.empty() ? "." : rPath) + "/rec_" + std::string(timeBuf) + freqLabel + "_audio.wav"; recorder.start(filename, (int)AUDIO_RATE, 2); } else { freqLabel = "_" + std::to_string(currentCenterHz) + "Hz"; filename = (rPath.empty() ? "." : rPath) + "/rec_" + std::string(timeBuf) + freqLabel + "_IQ.wav"; recorder.start(filename, (int)src->getSampleRate(), 2); } { std::lock_guard<std::mutex> l(shared.mtx); shared.recStatus = "REC: " + filename; } } else if (!doRecord && recorder.active) { recorder.stop(); { std::lock_guard<std::mutex> l(shared.mtx); shared.recStatus = "Saved."; } }
         
+        // Anti-stutter buffer check for file source
         if (play && !src->isHardware() && !justSeeked) { size_t safeLevel = 9600; while (audio.getBufferedCount() > safeLevel) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); if (!running) return; } }
+        
         double sr = src->getSampleRate(); if (sr != lastSampleRate) { demod = Demodulator(sr, AUDIO_RATE); lastSampleRate = sr; }
-        int chunkSize = (int)sr / 60; if (!play && justSeeked) chunkSize = FFT_SIZE * 2; if (chunkSize > 200000) chunkSize = 200000; if (iqBuffer.size() != chunkSize) iqBuffer.resize(chunkSize);
+        
+        // Larger chunks for high sample rates to reduce locking overhead
+        int chunkSize = (int)sr / 60; 
+        if (!play && justSeeked) chunkSize = FFT_SIZE * 2; 
+        // Cap chunk size to avoid memory spikes
+        if (chunkSize > 65536) chunkSize = 65536; 
+        
+        if (iqBuffer.size() != chunkSize) iqBuffer.resize(chunkSize);
         int readCount = src->read(iqBuffer.data(), chunkSize);
         
         if (readCount > 0) {
             if (recorder.active && rMode == RecMode::BASEBAND) { std::vector<float> rawFloat(readCount * 2); for(int i=0; i<readCount; i++) { rawFloat[i*2] = (float)iqBuffer[i].real(); rawFloat[i*2+1] = (float)iqBuffer[i].imag(); } recorder.write(rawFloat.data(), rawFloat.size()); }
+            
+            // FFT Processing
             std::vector<Complex> fftData(FFT_SIZE); for (size_t i = 0; i < FFT_SIZE && i < readCount; i++) fftData[i] = iqBuffer[i] * winFunc[i]; fft(fftData);
             int visualBin = (int)(targetFreqPct * FFT_SIZE); if (visualBin < 0) visualBin = 0; if (visualBin >= FFT_SIZE) visualBin = FFT_SIZE - 1;
             int shiftedIdx = (visualBin + FFT_SIZE / 2) % FFT_SIZE; float signalMag = std::abs(fftData[shiftedIdx]) / FFT_SIZE; int left = (shiftedIdx - 1 + FFT_SIZE) % FFT_SIZE; int right = (shiftedIdx + 1) % FFT_SIZE; signalMag += (std::abs(fftData[left]) + std::abs(fftData[right])) / FFT_SIZE * 0.5f; float rssiDb = 20.0f * std::log10(signalMag + 1e-12f);
+            
             if (play) { 
                 double freqOffset = (targetFreqPct - 0.5) * sr; 
                 if (mode == Mode::USB) freqOffset += bw / 2.0; 
                 if (mode == Mode::LSB) freqOffset -= bw / 2.0; 
+                
+                // Avoid copy if possible, but here we need a slice
                 std::vector<Complex> chunkToProcess(iqBuffer.begin(), iqBuffer.begin() + readCount); 
                 auto audioData = demod.process(chunkToProcess, freqOffset, bw, mode, stereo); 
+                
                 if (aprsActive) { std::vector<float> mono; mono.reserve(audioData.size()/2); for(size_t i=0; i<audioData.size(); i+=2) mono.push_back(audioData[i]); aprsDecoder.process(mono); } 
                 if (rssiDb < sqThr) std::fill(audioData.begin(), audioData.end(), 0.0f); 
                 float finalVol = muted ? 0.0f : vol; 
                 
-                // --- FIX 2: DSP AUDIO SANITIZER (Zapobiega "ciszy" przez NaN) ---
                 for (auto& s : audioData) {
                     if (std::isnan(s) || std::isinf(s)) s = 0.0f;
                     else s *= finalVol;
@@ -218,20 +238,42 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
                 audio.pushSamples(audioData); 
                 if (recorder.active && rMode == RecMode::AUDIO) recorder.write(audioData.data(), audioData.size()); 
             }
-            std::vector<uint8_t> tempRow(INTERNAL_WATERFALL_WIDTH * 4); for (int x = 0; x < INTERNAL_WATERFALL_WIDTH; x++) { int fftIdx = (int)((float)x / INTERNAL_WATERFALL_WIDTH * FFT_SIZE); int sIdx = (fftIdx + FFT_SIZE / 2) % FFT_SIZE; float rawMag = std::abs(fftData[sIdx]) / FFT_SIZE; float rawDb = 20 * std::log10(rawMag + 1e-12); float norm = (rawDb - minDb) / (maxDb - minDb); sf::Color c = getHeatmap(norm, themeID); int px = x * 4; tempRow[px] = c.r; tempRow[px + 1] = c.g; tempRow[px + 2] = c.b; tempRow[px + 3] = 255; }
-            float alpha = (play) ? 0.3f : 1.0f; for (int i = 0; i < FFT_SIZE; i++) { int idx = (i + FFT_SIZE / 2) % FFT_SIZE; float mag = std::abs(fftData[idx]) / FFT_SIZE; float db = 20 * std::log10(mag + 1e-12); localFftHistory[i] = localFftHistory[i] * (1.0f - alpha) + db * alpha; }
             
-            // --- FIX: TRY_LOCK TO PREVENT AUDIO STUTTER ---
-            // If UI holds the lock, skip waterfall update for this frame. Audio is priority.
-            { 
-                std::unique_lock<std::mutex> lock(shared.mtx, std::try_to_lock); 
-                if (lock.owns_lock()) {
-                    shared.fftSpectrum = localFftHistory; 
-                    shared.waterfallRow = tempRow; 
-                    shared.newWaterfallData = true; 
+            // --- OPTIMIZATION: WATERFALL THROTTLING ---
+            // Only update waterfall and FFT at 30 FPS (approx 33ms) to save CPU/Mutex/Bus
+            if (waterfallTimer.getElapsedTime().asMilliseconds() > 33) {
+                std::vector<uint8_t> tempRow(INTERNAL_WATERFALL_WIDTH * 4); 
+                for (int x = 0; x < INTERNAL_WATERFALL_WIDTH; x++) { 
+                    int fftIdx = (int)((float)x / INTERNAL_WATERFALL_WIDTH * FFT_SIZE); 
+                    int sIdx = (fftIdx + FFT_SIZE / 2) % FFT_SIZE; 
+                    float rawMag = std::abs(fftData[sIdx]) / FFT_SIZE; 
+                    float rawDb = 20 * std::log10(rawMag + 1e-12); 
+                    float norm = (rawDb - minDb) / (maxDb - minDb); 
+                    sf::Color c = getHeatmap(norm, themeID); 
+                    int px = x * 4; tempRow[px] = c.r; tempRow[px + 1] = c.g; tempRow[px + 2] = c.b; tempRow[px + 3] = 255; 
+                }
+                
+                float alpha = (play) ? 0.3f : 1.0f; 
+                for (int i = 0; i < FFT_SIZE; i++) { 
+                    int idx = (i + FFT_SIZE / 2) % FFT_SIZE; 
+                    float mag = std::abs(fftData[idx]) / FFT_SIZE; 
+                    float db = 20 * std::log10(mag + 1e-12); 
+                    localFftHistory[i] = localFftHistory[i] * (1.0f - alpha) + db * alpha; 
+                }
+
+                // TRY LOCK to avoid stalling audio
+                { 
+                    std::unique_lock<std::mutex> lock(shared.mtx, std::try_to_lock); 
+                    if (lock.owns_lock()) {
+                        shared.fftSpectrum = localFftHistory; 
+                        shared.waterfallRow = tempRow; 
+                        shared.newWaterfallData = true; 
+                        waterfallTimer.restart();
+                    }
                 }
             }
-        } else { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+
+        } else { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
     }
     if (recorder.active) recorder.stop();
 }
