@@ -49,8 +49,7 @@ public:
     double sampleRateIn;
     double sampleRateOut;
     
-    // OPTIMIZATION: Phase state as Complex number (Phasor) instead of just angle
-    // This avoids calling std::polar/sin/cos in the inner loop.
+    // Phasor state
     Complex currentPhasor = Complex(1.0, 0.0); 
     
     // Audio filter states
@@ -68,6 +67,8 @@ public:
     // Stereo PLL State
     double pllPhase = 0.0;
     double pllFreq = 19000.0 * 2.0 * PI;
+    
+    // FIX 1: Dynamic PLL parameters (calculated in constructor/process)
     double pllAlpha = 0.01;
     double pllBeta = 0.0001;
     
@@ -101,8 +102,22 @@ public:
     }
 
     Demodulator(double srIn, double srOut) : sampleRateIn(srIn), sampleRateOut(srOut) {
+        updatePLLParams();
+    }
+    
+    // Helper to scale PLL physics relative to sample rate
+    void updatePLLParams() {
         if (sampleRateIn > 0) {
             pllFreq = (19000.0 / sampleRateIn) * 2.0 * PI;
+            // Scale coefficients: Standard values tuned for ~2MSps
+            // Higher sample rate = smaller steps needed per sample to maintain same time constant
+            double scale = 2000000.0 / sampleRateIn; 
+            pllAlpha = 0.01 * scale;
+            pllBeta = 0.0001 * scale * scale; // Beta scales quadratically usually, or linearly depending on damping
+            
+            // Safety clamps for very high rates
+            if (pllAlpha < 0.00001) pllAlpha = 0.00001;
+            if (pllBeta < 0.0000001) pllBeta = 0.0000001;
         }
     }
 
@@ -110,7 +125,11 @@ public:
         std::vector<float> audioOut;
         if (rawIQ.empty()) return audioOut;
 
-        // Reserve memory to avoid reallocations
+        // Ensure params are up to date (if sample rate changed dynamically)
+        if (sampleRateIn != lastSampleRateCheck) {
+             updatePLLParams();
+        }
+
         size_t estimatedOut = (size_t)(rawIQ.size() * sampleRateOut / sampleRateIn) * 2 + 20;
         audioOut.reserve(estimatedOut);
 
@@ -147,8 +166,7 @@ public:
             }
         }
 
-        // OPTIMIZATION: NCO (Numerically Controlled Oscillator) setup
-        // Calculate the phase rotation step per sample ONCE.
+        // NCO setup
         double phaseStepAngle = -2.0 * PI * (freqOffset / sampleRateIn);
         Complex ncoStep = std::polar(1.0, phaseStepAngle);
 
@@ -161,15 +179,28 @@ public:
              pllPhase = 0.0;
         }
         
-        // Re-normalize phasor occasionally to prevent drift due to float precision
+        // Initial normalization for the block
         double mag = std::abs(currentPhasor);
         if (mag > 0.0001) currentPhasor /= mag;
         else currentPhasor = Complex(1.0, 0.0);
 
+        // FIX 3: Pre-calc PLL limits to prevent "popping"
+        double targetPll = (19000.0 / sampleRateIn) * 2.0 * PI;
+        double pllLimit = (1000.0 / sampleRateIn) * 2.0 * PI; // +/- 1kHz tolerance
+        double pllMin = targetPll - pllLimit;
+        double pllMax = targetPll + pllLimit;
+
         for (size_t i = 0; i < rawIQ.size(); i++) {
-            // A. Frequency Shift (Mixing) - FAST NCO
+            // A. Frequency Shift (Mixing)
             sample = rawIQ[i] * currentPhasor;
-            currentPhasor *= ncoStep; // Rotate phasor
+            currentPhasor *= ncoStep; 
+
+            // FIX 2: Periodic Re-normalization (Anti-Drift for high sample rates)
+            // Every 4096 samples, fix the vector length. Very cheap, fixes "swimming".
+            if ((i & 0xFFF) == 0) {
+                double m = std::abs(currentPhasor);
+                if (m > 0.0001) currentPhasor *= (1.0 / m); // Faster than division
+            }
 
             // B. IQ Low-Pass Filter
             iqLpfState += Complex(iqAlpha, 0) * (sample - iqLpfState);
@@ -190,13 +221,18 @@ public:
                     float pllError = mpxSignal * pilotRef;
                     
                     pllFreq += pllBeta * pllError;
+                    
+                    // FIX 3: PLL Clamp (Anti-Pop)
+                    if (pllFreq < pllMin) pllFreq = pllMin;
+                    if (pllFreq > pllMax) pllFreq = pllMax;
+
                     pllPhase += pllFreq + pllAlpha * pllError;
                     
                     if(pllPhase > 2.0*PI) pllPhase -= 2.0*PI;
                     else if(pllPhase < 0.0) pllPhase += 2.0*PI;
 
                     float carrier38k = std::sin(2.0 * pllPhase);
-                    float l_minus_r = mpxSignal * carrier38k * 2.0f; // Boost sideband
+                    float l_minus_r = mpxSignal * carrier38k * 2.0f;
 
                     left = (mpxSignal + l_minus_r);
                     right = (mpxSignal - l_minus_r);
@@ -272,7 +308,6 @@ public:
             }
         }
         
-        // No need to manually update currentPhase angle, the phasor holds the state.
         return audioOut;
     }
 };
