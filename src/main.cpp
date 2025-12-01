@@ -507,13 +507,13 @@ int main() {
         if (b) { 
             { std::lock_guard<std::mutex> l(sharedData.mtx); previousMode = sharedData.mode; } 
             btnNFM->setActive(true); btnAM->setActive(false); btnWFM->setActive(false); btnUSB->setActive(false); btnLSB->setActive(false); btnOFF->setActive(false); 
-            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.mode = Mode::NFM; sharedData.bandwidth = 12000; } 
+            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.mode = Mode::NFM; sharedData.bandwidth = 12500; } 
             
             // KEY FIX: Set limits to NFM range BEFORE setting the value
             // otherwise the old WFM limits (e.g. min 50k) will clamp 12k to 50k.
             slBW->setLimits(4000, 40000);
-            slBW->setValueSilent(12000); 
-            slBW->setText("Bandwidth: 12 kHz"); 
+            slBW->setValueSilent(12500); 
+            slBW->setText("Bandwidth: 12.5 kHz"); 
         } 
         else { 
             // Restore previous mode (setMode handles limits correctly)
