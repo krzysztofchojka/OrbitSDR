@@ -60,11 +60,6 @@ std::string truncatePath(std::string path, size_t maxLen) {
     return "..." + path.substr(path.length() - (maxLen - 3));
 }
 
-std::deque<std::string> loadLastLogLines(const std::string& filename, int count) {
-    std::deque<std::string> lines; std::ifstream file(filename); if (!file.is_open()) return lines;
-    std::string line; while (std::getline(file, line)) { if (!line.empty()) { lines.push_back(line); if (lines.size() > count) lines.pop_front(); } } return lines;
-}
-
 std::string wrapText(const std::string& str, const sf::Font& font, unsigned int charSize, float maxWidth) {
     std::string result; std::string currentLine; std::stringstream ss(str); std::string word;
     while (ss >> word) {
@@ -86,7 +81,76 @@ struct WavWriter {
 };
 
 enum class RecMode { AUDIO, BASEBAND };
-struct AprsLastPacket { std::string raw, src, dest, comment, coords; float course = -1.0f, speed = -1.0f; };
+
+// Extended APRS packet structure for History
+struct AprsLastPacket { 
+    std::string timestamp;
+    std::string raw, src, dest, comment, coords; 
+    float course = -1.0f, speed = -1.0f; 
+};
+
+// Helper to parse raw string into AprsLastPacket
+void parseAprsData(std::string raw, AprsLastPacket& pkt) {
+    // Extract timestamp if present at start (added by us)
+    if (raw.size() > 21 && raw[0] == '[' && raw[20] == ']') {
+        pkt.timestamp = raw.substr(0, 21);
+    } else {
+        pkt.timestamp = getTimestamp();
+    }
+
+    pkt.raw = raw; 
+    std::string content = raw; 
+    if (raw.size() > 0 && raw[0] == '[') { 
+        size_t cb = raw.find("] "); 
+        if (cb != std::string::npos) content = raw.substr(cb + 2); 
+    }
+    
+    size_t colon = content.find(':'); 
+    if (colon == std::string::npos) return; 
+    
+    std::string header = content.substr(0, colon); 
+    std::string body = content.substr(colon + 1);
+    size_t arrow = header.find('>'); 
+    
+    if (arrow != std::string::npos) { pkt.src = header.substr(0, arrow); pkt.dest = header.substr(arrow + 1); } 
+    else { pkt.src = header; pkt.dest = "?"; }
+    
+    pkt.comment = body; 
+    
+    std::regex coordRegex(R"((\d{4}\.\d{2})([NS]).(\d{5}\.\d{2})([EW]))"); 
+    std::smatch match; 
+    if (std::regex_search(body, match, coordRegex)) { 
+        float latVal = std::stof(match[1]) / 100.0f; 
+        float lonVal = std::stof(match[3]) / 100.0f; 
+        std::stringstream ss; ss << std::fixed << std::setprecision(2) << latVal << " " << match[2].str() << ", " << lonVal << " " << match[4].str(); 
+        pkt.coords = ss.str(); 
+    } else { 
+        pkt.coords = ""; 
+    }
+    
+    std::regex courseRegex(R"((\d{3})/(\d{3}))"); 
+    if (std::regex_search(body, match, courseRegex)) { 
+        try { pkt.course = std::stof(match[1]); pkt.speed = std::stof(match[2]); } catch(...) { pkt.course = -1; } 
+    } else { pkt.course = -1; }
+}
+
+std::deque<AprsLastPacket> loadLastLogLinesAsPackets(const std::string& filename, int count) {
+    std::deque<AprsLastPacket> packets; 
+    std::ifstream file(filename); 
+    if (!file.is_open()) return packets;
+    
+    std::string line; 
+    while (std::getline(file, line)) { 
+        if (!line.empty()) { 
+            AprsLastPacket pkt;
+            parseAprsData(line, pkt);
+            packets.push_back(pkt); 
+            if (packets.size() > count) packets.pop_front(); 
+        } 
+    } 
+    return packets;
+}
+
 struct SharedData { 
     std::mutex mtx; 
     double tunedFreqPercent = 0.5; double pendingSeekRequest = -1.0; double bandwidth = 12500.0; long long centerFreq = 0; 
@@ -95,7 +159,12 @@ struct SharedData {
     float squelchThreshold = -100.0f; bool stereoEnabled = false; Mode mode = Mode::NFM; bool isPlaying = false; 
     float minDb = -90.0f; 
     float maxDb = 0.0f; 
-    std::vector<double> fftSpectrum; std::vector<uint8_t> waterfallRow; bool newWaterfallData = false; std::string currentFilename = "None"; float mouseX_spectrum = -1.0f; float mouseY_spectrum = -1.0f; bool isRecording = false; RecMode recMode = RecMode::AUDIO; std::string recPath = ""; std::string recStatus = "Idle"; bool aprsEnabled = false; std::deque<std::string> aprsLog; AprsLastPacket lastAprs; 
+    std::vector<double> fftSpectrum; std::vector<uint8_t> waterfallRow; bool newWaterfallData = false; std::string currentFilename = "None"; float mouseX_spectrum = -1.0f; float mouseY_spectrum = -1.0f; bool isRecording = false; RecMode recMode = RecMode::AUDIO; std::string recPath = ""; std::string recStatus = "Idle"; bool aprsEnabled = false; 
+    
+    // APRS History as Objects now
+    std::deque<AprsLastPacket> aprsHistory; 
+    AprsLastPacket lastAprs; 
+    
     float zoomLevel = 1.0f; 
     int waterfallTheme = 0;
     SharedData() : fftSpectrum(FFT_SIZE, -100.0), waterfallRow(INTERNAL_WATERFALL_WIDTH * 4, 0) {} 
@@ -147,17 +216,9 @@ void drawGrid(sf::RenderWindow& window, const sf::Font& font, float x, float y, 
         float normPos = (float)((f - startFreq) / visibleSpan); float xPos = x + normPos * w;
         sf::RectangleShape line({1, h}); line.setPosition({xPos, y}); line.setFillColor(sf::Color(80, 80, 80, 100)); window.draw(line);
         std::string freqStr = formatHz((long long)f); if(freqStr.size() > 4) freqStr = freqStr.substr(0, freqStr.size()-4);
-        sf::Text l(font, freqStr, 20); l.setScale({0.5f, 0.5f});
+        sf::Text l(font, freqStr, 20); l.setScale({0.5f, 0.5f}); 
         sf::FloatRect b = l.getGlobalBounds(); l.setPosition({xPos - b.size.x/2, y + h - 15}); l.setFillColor(sf::Color(220, 220, 220, 200)); window.draw(l);
     }
-}
-
-void parseAprsData(std::string raw, AprsLastPacket& pkt) {
-    pkt.raw = raw; std::string content = raw; if (raw.size() > 0 && raw[0] == '[') { size_t cb = raw.find("] "); if (cb != std::string::npos) content = raw.substr(cb + 2); }
-    size_t colon = content.find(':'); if (colon == std::string::npos) return; std::string header = content.substr(0, colon); std::string body = content.substr(colon + 1);
-    size_t arrow = header.find('>'); if (arrow != std::string::npos) { pkt.src = header.substr(0, arrow); pkt.dest = header.substr(arrow + 1); } else { pkt.src = header; pkt.dest = "?"; }
-    pkt.comment = body; std::regex coordRegex(R"((\d{4}\.\d{2})([NS]).(\d{5}\.\d{2})([EW]))"); std::smatch match; if (std::regex_search(body, match, coordRegex)) { float latVal = std::stof(match[1]) / 100.0f; float lonVal = std::stof(match[3]) / 100.0f; std::stringstream ss; ss << std::fixed << std::setprecision(2) << latVal << " " << match[2].str() << ", " << lonVal << " " << match[4].str(); pkt.coords = ss.str(); } else { pkt.coords = ""; }
-    std::regex courseRegex(R"((\d{3})/(\d{3}))"); if (std::regex_search(body, match, courseRegex)) { try { pkt.course = std::stof(match[1]); pkt.speed = std::stof(match[2]); } catch(...) { pkt.course = -1; } } else { pkt.course = -1; }
 }
 
 void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio) {
@@ -166,12 +227,20 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
     aprsDecoder.onMessage = [&](std::string msg) { 
         std::string ts = getTimestamp(); 
         std::string fullLog = ts + " " + msg; 
+        
+        // Write to File
         std::ofstream logFile(getAprsLogFilePath(), std::ios::app); 
         if (logFile.is_open()) { logFile << fullLog << "\n"; logFile.close(); } 
+        
+        // Parse into Struct
+        AprsLastPacket pkt;
+        parseAprsData(fullLog, pkt);
+
+        // Update Shared
         std::lock_guard<std::mutex> l(shared.mtx); 
-        shared.aprsLog.push_back(fullLog); 
-        if (shared.aprsLog.size() > 500) shared.aprsLog.pop_front(); 
-        parseAprsData(fullLog, shared.lastAprs); 
+        shared.aprsHistory.push_back(pkt); 
+        if (shared.aprsHistory.size() > 500) shared.aprsHistory.pop_front(); 
+        shared.lastAprs = pkt;
     };
 
     double lastSampleRate = 0; 
@@ -302,7 +371,9 @@ int main() {
     AudioSink audio; std::vector<std::string> deviceNames; for (const auto& dev : audio.availableDevices) deviceNames.push_back(dev.name);
     audio.initDevice(0, (int)AUDIO_RATE); audio.start();
     
-    SharedData sharedData; sharedData.aprsLog = loadLastLogLines(getAprsLogFilePath(), 10);
+    SharedData sharedData; 
+    // Load existing log into AprsHistory objects
+    sharedData.aprsHistory = loadLastLogLinesAsPackets(getAprsLogFilePath(), 20);
     sharedData.centerFreq = savedFreq;
     
     std::atomic<bool> dspRunning {true}; std::thread dspThread(dspWorker, std::ref(dspRunning), std::ref(sharedData), std::ref(audio));
@@ -699,6 +770,15 @@ int main() {
     sf::Clock debouncer; sf::Clock interactionCooldown; bool isDraggingScale = false, isSpectrumDragging = false; bool isDraggingBW = false; float dragStartBW = 0.0f; float dragStartMouseX = 0.0f; float lastDragX = 0.0f; float aprsLogScrollOffset = 0.0f;
     auto applySpectrumTuning = [&](float mouseX) { bool isHw = false; double hwSampleRate = 2e6; { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) { isHw = currentSource->isHardware(); hwSampleRate = currentSource->getSampleRate(); } } float zoom = 1.0f; { std::lock_guard<std::mutex> l(sharedData.mtx); zoom = sharedData.zoomLevel; } double effectiveRate = hwSampleRate / zoom; double clickPct = mouseX / layout.specW; double offsetHz = (clickPct - 0.5) * effectiveRate; long long clickedFreq = currentCenterFreq + (long long)offsetHz; long long step = STEP_VALUES[ddSnap->selectedIndex]; if (step > 0) { clickedFreq = (long long)std::round((double)clickedFreq / step) * step; double newOffset = (double)(clickedFreq - currentCenterFreq); clickPct = 0.5 + (newOffset / effectiveRate); } if (stickyCenterMode && isHw) { pendingCenterFreq = clickedFreq; debouncer.restart(); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } freqVFO.setFrequency(clickedFreq); } else { { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5 + (offsetHz / hwSampleRate); } freqVFO.setFrequency(clickedFreq); } };
 
+    // --- APRS PREVIEW STATE ---
+    bool showAprsModal = false;
+    AprsLastPacket selectedAprsPacket;
+    SdrButton btnModalClose(80, 30, "Close", font);
+    SdrButton btnModalCopy(80, 30, "Copy", font);
+
+    btnModalClose.onClick = [&]() { showAprsModal = false; };
+    btnModalCopy.onClick = [&]() { sf::Clipboard::setString(selectedAprsPacket.raw); };
+
     while (window.isOpen()) {
         sf::Vector2u currSize = window.getSize(); if (currSize != lastSize && currSize.x > 0 && currSize.y > 0) { sf::FloatRect visibleArea({0.f, 0.f}, {(float)currSize.x, (float)currSize.y}); window.setView(sf::View(visibleArea)); updateLayout(currSize.x, currSize.y); lastSize = currSize; }
         bool isHw = false; double hwSampleRate = 2e6; double prog = 0.0; { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) { isHw = currentSource->isHardware(); hwSampleRate = currentSource->getSampleRate(); prog = currentSource->getProgress(); } }
@@ -721,6 +801,22 @@ int main() {
 
         while (const std::optional<sf::Event> ev = window.pollEvent()) {
             if (ev->is<sf::Event::Closed>()) window.close();
+            
+            // --- Modal Input Handling ---
+            if (showAprsModal) {
+                 btnModalClose.handleEvent(*ev, window);
+                 btnModalCopy.handleEvent(*ev, window);
+                 if (const auto* mb = ev->getIf<sf::Event::MouseButtonPressed>()) {
+                    // Close modal if clicked outside
+                    sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window));
+                    float mx = (layout.winW - 600) / 2; float my = (layout.winH - 400) / 2;
+                    // SFML 3.0 FIX: FloatRect constructor takes (position, size)
+                    sf::FloatRect modalRect({mx, my}, {600.f, 400.f});
+                    if (!modalRect.contains(m)) showAprsModal = false;
+                 }
+                 continue; // Block interaction with other elements
+            }
+
             volSlider.handleEvent(*ev, window); slZoom->handleEvent(*ev, window);
             if (!isHw) timeSlider.handleEvent(*ev, window);
             if (btnMute.isClicked(*ev, window)) { static bool m = false; m = !m; if(m) btnMute.setActive(true); else btnMute.setActive(false); std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.isMuted = m; }
@@ -741,10 +837,8 @@ int main() {
                     
                     if (targetVFO > maxF || targetVFO < minF) { 
                         // Hardware Retune Needed
-                        // FIX: Only restart debouncer if target actually changed to avoid constant resets
                         if (pendingCenterFreq != targetVFO) {
                              pendingCenterFreq = targetVFO; 
-                             // FIX: Optimistic update of local state to prevent "outside bandwidth" check failing on next frame
                              currentCenterFreq = targetVFO;
                              debouncer.restart(); 
                              { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.centerFreq = targetVFO; sharedData.tunedFreqPercent = 0.5; } 
@@ -758,12 +852,33 @@ int main() {
 
             bool overAprs = (aprsOn && window.mapPixelToCoords(sf::Mouse::getPosition(window)).y > (layout.winH - 200));
             if (const auto* scroll = ev->getIf<sf::Event::MouseWheelScrolled>()) { if (overAprs) { aprsLogScrollOffset += scroll->delta * 20.0f; if (aprsLogScrollOffset > 0.0f) aprsLogScrollOffset = 0.0f; } else { sf::Vector2f m = window.mapPixelToCoords(sf::Vector2i((int)scroll->position.x, (int)scroll->position.y)); if (m.y > TOP_BAR_H && m.x < layout.specW) { long long step = STEP_VALUES[ddSnap->selectedIndex]; if (step == 0) step = 100; long long current = freqVFO.getFrequency(); long long rawNext = current + (long long)(scroll->delta * step); if (step > 0) { long long remainder = rawNext % step; if (remainder > step / 2) rawNext += (step - remainder); else rawNext -= remainder; } if (rawNext < 0) rawNext = 0; freqVFO.setFrequency(rawNext); if (stickyCenterMode && isHw) { pendingCenterFreq = rawNext; debouncer.restart(); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } } else { double newOffset = (double)(rawNext - currentCenterFreq); double clickPct = 0.5 + (newOffset / hwSampleRate); clickPct = std::clamp(clickPct, 0.0, 1.0); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = clickPct; } } } } }
-            if (const auto* mb = ev->getIf<sf::Event::MouseButtonPressed>()) { if (mb->button == sf::Mouse::Button::Left) { sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window)); bool overTimeline = (timeSlider.isDragging || (m.y > layout.winH - 40)); bool inFreqScaleZone = (m.y >= TOP_BAR_H + layout.specH - 10 && m.y <= TOP_BAR_H + layout.specH + 20 && m.x < layout.specW); double offsetFromCenter = (tunePct - 0.5); float visualCenterX = (0.5 + (offsetFromCenter * currentZoom)) * layout.specW; float bwPixels = (slBW->currentVal / (hwSampleRate / currentZoom)) * layout.specW; float leftEdge = visualCenterX - bwPixels / 2.0f; float rightEdge = visualCenterX + bwPixels / 2.0f; if (mode == Mode::USB) { leftEdge = visualCenterX; rightEdge = visualCenterX + bwPixels; } if (mode == Mode::LSB) { leftEdge = visualCenterX - bwPixels; rightEdge = visualCenterX; } bool hitEdge = (std::abs(m.x - leftEdge) < 6 || std::abs(m.x - rightEdge) < 6) && (m.y > TOP_BAR_H && m.y < TOP_BAR_H + layout.specH); if (hitEdge && !overAprs) { isDraggingBW = true; dragStartBW = slBW->currentVal; dragStartMouseX = m.x; } else if (inFreqScaleZone && !overTimeline && !overAprs) { isDraggingScale = true; lastDragX = m.x; } else if (!overTimeline && !overAprs && m.x < layout.specW && m.y > TOP_BAR_H && m.y < (TOP_BAR_H + layout.specH + layout.waterfallH)) { isSpectrumDragging = true; applySpectrumTuning(m.x); } } } else if (const auto* mr = ev->getIf<sf::Event::MouseButtonReleased>()) { if (mr->button == sf::Mouse::Button::Left) { isSpectrumDragging = false; isDraggingScale = false; isDraggingBW = false; } } else if (const auto* mm = ev->getIf<sf::Event::MouseMoved>()) { sf::Vector2f m = window.mapPixelToCoords(mm->position); double offsetFromCenter = (tunePct - 0.5); float visualCenterX = (0.5 + (offsetFromCenter * currentZoom)) * layout.specW; float bwPixels = (slBW->currentVal / (hwSampleRate / currentZoom)) * layout.specW; float leftEdge = visualCenterX - bwPixels / 2.0f; float rightEdge = visualCenterX + bwPixels / 2.0f; if (mode == Mode::USB) { leftEdge = visualCenterX; rightEdge = visualCenterX + bwPixels; } if (mode == Mode::LSB) { leftEdge = visualCenterX - bwPixels; rightEdge = visualCenterX; } bool hitEdge = (std::abs(m.x - leftEdge) < 6 || std::abs(m.x - rightEdge) < 6) && (m.y > TOP_BAR_H && m.y < TOP_BAR_H + layout.specH); if ((hitEdge || isDraggingBW) && cursorSizeH) window.setMouseCursor(*cursorSizeH); if (isDraggingBW) { float hzPerPx = (hwSampleRate / currentZoom) / layout.specW; float dist = std::abs(m.x - visualCenterX); float newBW = dist * hzPerPx * 2.0f; if (mode == Mode::USB || mode == Mode::LSB) newBW = dist * hzPerPx; newBW = std::clamp(newBW, slBW->minVal, slBW->maxVal); slBW->setValueSilent(newBW); slBW->onChange(newBW); } else if (isSpectrumDragging) applySpectrumTuning(m.x); if (isDraggingScale) { float dx = lastDragX - m.x; lastDragX = m.x; double hzPerPx = (hwSampleRate / currentZoom) / layout.specW; long long shift = (long long)(dx * hzPerPx); long long nextCenter = currentCenterFreq + shift; if (nextCenter < 0) nextCenter = 0; currentCenterFreq = nextCenter; { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.centerFreq = nextCenter; } if (debouncer.getElapsedTime().asMilliseconds() > TUNING_LATENCY_MS) { { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->setCenterFrequency(nextCenter); } debouncer.restart(); } } if (!overAprs && m.x >= 0 && m.x < layout.specW && m.y >= TOP_BAR_H && m.y < (TOP_BAR_H + layout.specH + layout.waterfallH)) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.mouseX_spectrum = m.x; sharedData.mouseY_spectrum = m.y - TOP_BAR_H; } else { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.mouseX_spectrum = -1.0f; } }
+            if (const auto* mb = ev->getIf<sf::Event::MouseButtonPressed>()) { if (mb->button == sf::Mouse::Button::Left) { sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window)); 
+                
+                // --- CLICK HANDLING FOR APRS LOG ---
+                if (overAprs) {
+                    float logX = layout.specW - 300; 
+                    float overlayY = layout.winH - 200.0f;
+                    float listTopY = overlayY + 25.0f; 
+                    if (m.x > logX) {
+                        float relY = m.y - listTopY - aprsLogScrollOffset;
+                        int index = (int)(relY / 16.0f);
+                        std::lock_guard<std::mutex> l(sharedData.mtx);
+                        if (index >= 0 && index < sharedData.aprsHistory.size()) {
+                            selectedAprsPacket = sharedData.aprsHistory[index];
+                            showAprsModal = true;
+                        }
+                    }
+                }
+                
+                bool overTimeline = (timeSlider.isDragging || (m.y > layout.winH - 40)); bool inFreqScaleZone = (m.y >= TOP_BAR_H + layout.specH - 10 && m.y <= TOP_BAR_H + layout.specH + 20 && m.x < layout.specW); double offsetFromCenter = (tunePct - 0.5); float visualCenterX = (0.5 + (offsetFromCenter * currentZoom)) * layout.specW; float bwPixels = (slBW->currentVal / (hwSampleRate / currentZoom)) * layout.specW; float leftEdge = visualCenterX - bwPixels / 2.0f; float rightEdge = visualCenterX + bwPixels / 2.0f; if (mode == Mode::USB) { leftEdge = visualCenterX; rightEdge = visualCenterX + bwPixels; } if (mode == Mode::LSB) { leftEdge = visualCenterX - bwPixels; rightEdge = visualCenterX; } bool hitEdge = (std::abs(m.x - leftEdge) < 6 || std::abs(m.x - rightEdge) < 6) && (m.y > TOP_BAR_H && m.y < TOP_BAR_H + layout.specH); if (hitEdge && !overAprs) { isDraggingBW = true; dragStartBW = slBW->currentVal; dragStartMouseX = m.x; } else if (inFreqScaleZone && !overTimeline && !overAprs) { isDraggingScale = true; lastDragX = m.x; } else if (!overTimeline && !overAprs && m.x < layout.specW && m.y > TOP_BAR_H && m.y < (TOP_BAR_H + layout.specH + layout.waterfallH)) { isSpectrumDragging = true; applySpectrumTuning(m.x); } } } else if (const auto* mr = ev->getIf<sf::Event::MouseButtonReleased>()) { if (mr->button == sf::Mouse::Button::Left) { isSpectrumDragging = false; isDraggingScale = false; isDraggingBW = false; } } else if (const auto* mm = ev->getIf<sf::Event::MouseMoved>()) { sf::Vector2f m = window.mapPixelToCoords(mm->position); double offsetFromCenter = (tunePct - 0.5); float visualCenterX = (0.5 + (offsetFromCenter * currentZoom)) * layout.specW; float bwPixels = (slBW->currentVal / (hwSampleRate / currentZoom)) * layout.specW; float leftEdge = visualCenterX - bwPixels / 2.0f; float rightEdge = visualCenterX + bwPixels / 2.0f; if (mode == Mode::USB) { leftEdge = visualCenterX; rightEdge = visualCenterX + bwPixels; } if (mode == Mode::LSB) { leftEdge = visualCenterX - bwPixels; rightEdge = visualCenterX; } bool hitEdge = (std::abs(m.x - leftEdge) < 6 || std::abs(m.x - rightEdge) < 6) && (m.y > TOP_BAR_H && m.y < TOP_BAR_H + layout.specH); if ((hitEdge || isDraggingBW) && cursorSizeH) window.setMouseCursor(*cursorSizeH); if (isDraggingBW) { float hzPerPx = (hwSampleRate / currentZoom) / layout.specW; float dist = std::abs(m.x - visualCenterX); float newBW = dist * hzPerPx * 2.0f; if (mode == Mode::USB || mode == Mode::LSB) newBW = dist * hzPerPx; newBW = std::clamp(newBW, slBW->minVal, slBW->maxVal); slBW->setValueSilent(newBW); slBW->onChange(newBW); } else if (isSpectrumDragging) applySpectrumTuning(m.x); if (isDraggingScale) { float dx = lastDragX - m.x; lastDragX = m.x; double hzPerPx = (hwSampleRate / currentZoom) / layout.specW; long long shift = (long long)(dx * hzPerPx); long long nextCenter = currentCenterFreq + shift; if (nextCenter < 0) nextCenter = 0; currentCenterFreq = nextCenter; { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.centerFreq = nextCenter; } if (debouncer.getElapsedTime().asMilliseconds() > TUNING_LATENCY_MS) { { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->setCenterFrequency(nextCenter); } debouncer.restart(); } } if (!overAprs && m.x >= 0 && m.x < layout.specW && m.y >= TOP_BAR_H && m.y < (TOP_BAR_H + layout.specH + layout.waterfallH)) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.mouseX_spectrum = m.x; sharedData.mouseY_spectrum = m.y - TOP_BAR_H; } else { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.mouseX_spectrum = -1.0f; } }
             sidebar.handleEvent(*ev, window);
         }
         if (pendingCenterFreq != 0 && debouncer.getElapsedTime().asMilliseconds() > TUNING_LATENCY_MS) { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource && currentSource->isHardware()) { currentSource->setCenterFrequency(pendingCenterFreq); currentCenterFreq = pendingCenterFreq; } pendingCenterFreq = 0; }
         sidebar.update(window);
         bool showHand = false; sf::Vector2f mousePos = window.mapPixelToCoords(sf::Mouse::getPosition(window)); if (sidebar.isAnyWidgetHovered(window)) showHand = true; if (freqVFO.isHovered) showHand = true; if (mousePos.y >= TOP_BAR_H + layout.specH - 10 && mousePos.y <= TOP_BAR_H + layout.specH + 20 && mousePos.x < layout.specW) showHand = true; if (volSlider.isMouseOver(window) || timeSlider.isMouseOver(window)) showHand = true; if (btnPlay.isMouseOver(window) || btnMute.isMouseOver(window) || btnTuningMode.isMouseOver(window)) showHand = true; if (aprsOn && mousePos.y > (layout.winH - 200) && mousePos.x < layout.specW) showHand = true;
+        
+        if (showAprsModal) showHand = false; // Reset hand in modal mode if not over button
+
         if (isDraggingBW && cursorSizeH) { window.setMouseCursor(*cursorSizeH); } else if (showHand && cursorHand) { window.setMouseCursor(*cursorHand); } else if (cursorArrow) { window.setMouseCursor(*cursorArrow); }
 
         std::vector<double> spectrum; std::vector<uint8_t> row; bool newRow = false; { std::lock_guard<std::mutex> lock(sharedData.mtx); spectrum = sharedData.fftSpectrum; if (sharedData.newWaterfallData) { row = sharedData.waterfallRow; sharedData.newWaterfallData = false; newRow = true; } }
@@ -798,17 +913,106 @@ int main() {
         if (aprsOn) { 
             float aprsH = 200.0f; float overlayY = layout.winH - aprsH;
             sf::RectangleShape bg({layout.specW, aprsH}); bg.setPosition({0, overlayY}); bg.setFillColor(sf::Color(20, 20, 25, 240)); bg.setOutlineColor(sf::Color::White); bg.setOutlineThickness(1); window.draw(bg); 
-            AprsLastPacket pkt; std::deque<std::string> logs; { std::lock_guard<std::mutex> l(sharedData.mtx); pkt = sharedData.lastAprs; logs = sharedData.aprsLog; } 
+            AprsLastPacket pkt; std::deque<AprsLastPacket> logs; { std::lock_guard<std::mutex> l(sharedData.mtx); pkt = sharedData.lastAprs; logs = sharedData.aprsHistory; } 
             float compassX = 60.0f; float compassY = overlayY + 70.0f; float compassR = 40.0f;
             sf::CircleShape compass(compassR); compass.setOrigin({compassR, compassR}); compass.setPosition({compassX, compassY}); compass.setFillColor(sf::Color::Transparent); compass.setOutlineColor(sf::Color(100,100,100)); compass.setOutlineThickness(2); window.draw(compass);
             sf::Text dirT(font, "N", 24); dirT.setScale({0.5f, 0.5f});
             dirT.setFillColor(sf::Color::Yellow); dirT.setPosition({compassX - 4, compassY - compassR - 15}); window.draw(dirT); sf::RectangleShape northTick({2, 6}); northTick.setFillColor(sf::Color::Yellow); northTick.setPosition({compassX - 1, compassY - compassR}); window.draw(northTick);
             if (pkt.course >= 0) { sf::VertexArray arrow(sf::PrimitiveType::Lines, 2); float rad = (pkt.course - 90.0f) * (3.14159f / 180.0f); arrow[0].position = {compassX, compassY}; arrow[0].color = sf::Color::Red; arrow[1].position = {compassX + cos(rad)*compassR, compassY + sin(rad)*compassR}; arrow[1].color = sf::Color::Red; window.draw(arrow); sf::Text crsTxt(font, std::to_string((int)pkt.course) + " deg", 24); crsTxt.setScale({0.5f, 0.5f}); crsTxt.setPosition({compassX - 20, compassY + compassR + 5}); window.draw(crsTxt); }
             float textX = compassX + compassR + 40.0f; float curY = overlayY + 20.0f; sf::Text lblCall(font, pkt.src.empty() ? "-- WAITING --" : pkt.src, 64); lblCall.setScale({0.5f, 0.5f}); lblCall.setPosition({textX, curY}); lblCall.setFillColor(sf::Color::Green); lblCall.setStyle(sf::Text::Bold); window.draw(lblCall); if (!pkt.dest.empty()) { sf::Text lblDest(font, "> " + pkt.dest, 40); lblDest.setScale({0.5f, 0.5f}); lblDest.setPosition({textX + lblCall.getGlobalBounds().size.x + 15, curY + 12}); lblDest.setFillColor(sf::Color(200,200,200)); window.draw(lblDest); } curY += 40.0f; if (!pkt.coords.empty()) { sf::Text lblGPS(font, "GPS: " + pkt.coords, 36); lblGPS.setScale({0.5f, 0.5f}); lblGPS.setPosition({textX, curY}); lblGPS.setFillColor(sf::Color::Cyan); window.draw(lblGPS); curY += 25.0f; } if (!pkt.comment.empty()) { std::string wrappedMsg = wrapText(pkt.comment, font, 32, (layout.specW - 350.0f - textX) * 2.0f); sf::Text lblMsg(font, wrappedMsg, 32); lblMsg.setScale({0.5f, 0.5f}); lblMsg.setPosition({textX, curY}); lblMsg.setFillColor(sf::Color::Yellow); window.draw(lblMsg); }
-            float logX = layout.specW - 300; float logW = 300; sf::RectangleShape divLine({2, aprsH}); divLine.setPosition({logX, overlayY}); divLine.setFillColor(sf::Color::White); window.draw(divLine); sf::Text logTitle(font, "PACKET HISTORY", 24); logTitle.setScale({0.5f, 0.5f}); logTitle.setPosition({logX + 10, overlayY + 5}); logTitle.setFillColor(sf::Color(150,150,150)); window.draw(logTitle); float listTopY = overlayY + 25.0f; int i=0; for(const auto& log : logs) { float yPos = listTopY + aprsLogScrollOffset + (i*16.0f); if (yPos > listTopY - 10 && yPos < layout.winH - 5) { std::string lShort = log; if(lShort.length()>35) lShort=lShort.substr(0,32)+"..."; sf::Text l(font, lShort, 24); l.setScale({0.5f, 0.5f}); l.setPosition({logX + 10, yPos}); l.setFillColor(sf::Color(200,200,200)); window.draw(l); } i++; }
+            float logX = layout.specW - 300; float logW = 300; sf::RectangleShape divLine({2, aprsH}); divLine.setPosition({logX, overlayY}); divLine.setFillColor(sf::Color::White); window.draw(divLine); sf::Text logTitle(font, "PACKET HISTORY", 24); logTitle.setScale({0.5f, 0.5f}); logTitle.setPosition({logX + 10, overlayY + 5}); logTitle.setFillColor(sf::Color(150,150,150)); window.draw(logTitle); float listTopY = overlayY + 25.0f; int i=0; 
+            
+            // --- DRAW PACKET LIST ---
+            for(const auto& logPkt : logs) { 
+                float yPos = listTopY + aprsLogScrollOffset + (i*16.0f); 
+                if (yPos > listTopY - 10 && yPos < layout.winH - 5) { 
+                    // Hover Detection
+                    // SFML 3.0 FIX: FloatRect needs ({pos}, {size})
+                    sf::FloatRect rowRect({logX, yPos}, {logW, 16.0f});
+                    bool isHover = rowRect.contains(mousePos) && !showAprsModal;
+                    
+                    if (isHover) {
+                        sf::RectangleShape hl(sf::Vector2f(logW - 2, 16.0f));
+                        // SFML 3.0 FIX: setPosition needs vector
+                        hl.setPosition({logX + 1, yPos});
+                        hl.setFillColor(sf::Color(50, 50, 60));
+                        window.draw(hl);
+                    }
+
+                    std::string lShort = logPkt.timestamp + " " + logPkt.src + ">" + logPkt.dest; 
+                    if(lShort.length()>35) lShort=lShort.substr(0,32)+"..."; 
+                    sf::Text l(font, lShort, 24); l.setScale({0.5f, 0.5f}); l.setPosition({logX + 10, yPos}); 
+                    
+                    if (isHover) l.setFillColor(sf::Color::White);
+                    else l.setFillColor(sf::Color(200,200,200)); 
+                    
+                    window.draw(l); 
+                } 
+                i++; 
+            }
         }
 
         if (!isHw) timeSlider.draw(window); sidebar.draw(window); window.draw(topBar); freqVFO.draw(window); btnPlay.draw(window); if (isHw) btnTuningMode.draw(window); btnMute.draw(window); volSlider.draw(window);
+        
+        // --- DRAW APRS MODAL ---
+        if (showAprsModal) {
+            float mw = 600; float mh = 400;
+            float mx = (layout.winW - mw) / 2; float my = (layout.winH - mh) / 2;
+            
+            sf::RectangleShape modalBg({mw, mh});
+            // SFML 3.0 FIX: setPosition needs vector
+            modalBg.setPosition({mx, my});
+            modalBg.setFillColor(sf::Color(30, 30, 35));
+            modalBg.setOutlineThickness(2);
+            modalBg.setOutlineColor(Theme::Accent);
+            window.draw(modalBg);
+
+            sf::Text title(font, "Packet Details", 36); title.setScale({0.5f, 0.5f});
+            // SFML 3.0 FIX: setPosition needs vector
+            title.setPosition({mx + 20, my + 15}); title.setFillColor(Theme::Accent);
+            window.draw(title);
+
+            float cx = mx + 20; float cy = my + 60;
+            auto drawField = [&](std::string label, std::string val, sf::Color c = sf::Color::White) {
+                sf::Text l(font, label, 24); l.setScale({0.5f, 0.5f});
+                // SFML 3.0 FIX: setPosition needs vector
+                l.setPosition({cx, cy}); l.setFillColor(sf::Color(150,150,150));
+                window.draw(l);
+                
+                sf::Text v(font, val.empty() ? "N/A" : val, 24); v.setScale({0.5f, 0.5f});
+                // SFML 3.0 FIX: setPosition needs vector
+                v.setPosition({cx + 120, cy}); v.setFillColor(c);
+                window.draw(v);
+                cy += 30;
+            };
+
+            drawField("Time:", selectedAprsPacket.timestamp);
+            drawField("Source:", selectedAprsPacket.src, sf::Color::Green);
+            drawField("Dest:", selectedAprsPacket.dest);
+            drawField("Coords:", selectedAprsPacket.coords, sf::Color::Cyan);
+            
+            std::string crs = (selectedAprsPacket.course >= 0) ? std::to_string((int)selectedAprsPacket.course) + " deg" : "";
+            drawField("Course:", crs);
+            
+            sf::Text rawL(font, "Raw Packet:", 24); rawL.setScale({0.5f, 0.5f});
+            // SFML 3.0 FIX: setPosition needs vector
+            rawL.setPosition({cx, cy}); rawL.setFillColor(sf::Color(150,150,150)); window.draw(rawL);
+            cy += 20;
+            
+            std::string wrappedRaw = wrapText(selectedAprsPacket.raw, font, 24, mw - 40);
+            sf::Text rawV(font, wrappedRaw, 24); rawV.setScale({0.5f, 0.5f});
+            // SFML 3.0 FIX: setPosition needs vector
+            rawV.setPosition({cx, cy}); rawV.setFillColor(sf::Color::Yellow);
+            window.draw(rawV);
+
+            // Buttons
+            btnModalClose.setPosition(mx + mw - 100, my + mh - 50);
+            btnModalClose.draw(window);
+            
+            btnModalCopy.setPosition(mx + 20, my + mh - 50);
+            btnModalCopy.draw(window);
+        }
+
         window.display();
     }
 
