@@ -247,7 +247,7 @@ public:
     std::vector<uint32_t> getAvailableSampleRatesValues() override { return {0}; }
 };
 
-// --- RTL-SDR SOURCE (Bez zmian, skrócone dla czytelności) ---
+// --- RTL-SDR SOURCE (Bez zmian) ---
 class RtlSdrSource : public IQSource {
     rtlsdr_dev_t* dev = nullptr; std::thread worker; std::atomic<bool> running {false}; RingBuffer<Complex> ringBuffer;
     uint32_t sampleRate = 2048000; uint32_t centerFreq = 100000000; std::mutex hwMtx; std::vector<int> availableGains; 
@@ -348,26 +348,17 @@ public:
     std::vector<uint32_t> getAvailableSampleRatesValues() override { return {1400000, 1800000, 2048000, 2400000, 3200000}; }
 };
 
-// --- SDRPLAY SOURCE (Bez zmian, skrócone) ---
+// --- SDRPLAY SOURCE ---
 #ifdef ENABLE_SDRPLAY
-// ... (Kod SDRPlay identyczny jak w poprzedniej wersji, pominięty dla oszczędności miejsca) ...
-// Upewnij się, że zachowasz sekcję SDRPlay z poprzedniej odpowiedzi, jeśli jej używasz.
-// W tym bloku wklej kod klasy SdrPlaySource z poprzedniej odpowiedzi.
-// Tu daję minimalną zaślepkę żeby się kompilowało jeśli nie masz pełnego pliku
+
 #ifndef sdrplay_api_Update_None
     #define sdrplay_api_Update_None (sdrplay_api_ReasonForUpdateT)0
 #endif
-// ...
-#else
-class SdrPlaySource : public IQSource {
-public: 
-    static std::vector<SDRDeviceItem> getDeviceList() { return {}; }
-    bool open(std::string id, uint32_t r = 0) override { showPopup("Feature Not Available", "Run ./build.sh and enable SDRPlay."); return false; } void close() override {} void start() override {} void stop() override {} int read(Complex* b, int c) override { return 0; } double getSampleRate() override { return 2000000; } bool isHardware() override { return true; } 
-};
+// DEFINE TYPU EXTENSION DLA 4 ARGUMENTU
+#ifndef sdrplay_api_Update_Ext1_None
+    #define sdrplay_api_Update_Ext1_None (sdrplay_api_ReasonForUpdateExtension1T)0
 #endif
 
-// Przywrócenie pełnej definicji SDRPlay dla spójności
-#ifdef ENABLE_SDRPLAY
 class SdrPlaySource : public IQSource {
     bool isSelected = false; bool isInitialized = false; RingBuffer<Complex> ringBuffer; double sampleRate = 2000000.0; long long centerFreq = 100000000; std::mutex hwMtx;
     sdrplay_api_DeviceT currentDevice; sdrplay_api_DeviceParamsT *deviceParams = NULL; sdrplay_api_CallbackFnsT cbFns; std::atomic<bool> running {false};
@@ -454,22 +445,34 @@ public:
     int read(Complex* buffer, int count) override { return ringBuffer.pop(buffer, count); }
     double getSampleRate() override { return sampleRate; }
     bool isHardware() override { return true; }
-    void setCenterFrequency(long long hz) override { std::lock_guard<std::mutex> lock(hwMtx); centerFreq = hz; if (running && deviceParams) { deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)hz; sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Tuner_Frf, sdrplay_api_Update_None); } }
+    
+    // --- FIX: Używamy sdrplay_api_Update_Ext1_None jako 4. argumentu ---
+    void setCenterFrequency(long long hz) override { 
+        std::lock_guard<std::mutex> lock(hwMtx); 
+        centerFreq = hz; 
+        if (running && deviceParams) { 
+            deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)hz; 
+            sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Tuner_Frf, sdrplay_api_Update_Ext1_None); 
+        } 
+    }
+    
+    // --- FIX: Używamy sdrplay_api_Update_Ext1_None jako 4. argumentu ---
     void setGain(int db) override {
         std::lock_guard<std::mutex> lock(hwMtx); if (!running || !deviceParams) return;
         if (db == -1) { 
             if (deviceParams->rxChannelA->ctrlParams.agc.enable != sdrplay_api_AGC_50HZ) {
                 deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_50HZ; 
-                sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Ctrl_Agc, sdrplay_api_Update_None);
+                sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Ctrl_Agc, sdrplay_api_Update_Ext1_None);
             }
         } else { 
             deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_DISABLE; 
             int reduction = (50 - db); if (reduction < 0) reduction = 0; if (reduction > 59) reduction = 59;
             deviceParams->rxChannelA->tunerParams.gain.gRdB = reduction;
             deviceParams->rxChannelA->tunerParams.gain.LNAstate = 0;
-            sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, (sdrplay_api_ReasonForUpdateT)(sdrplay_api_Update_Ctrl_Agc | sdrplay_api_Update_Tuner_Gr), sdrplay_api_Update_None);
+            sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, (sdrplay_api_ReasonForUpdateT)(sdrplay_api_Update_Ctrl_Agc | sdrplay_api_Update_Tuner_Gr), sdrplay_api_Update_Ext1_None);
         }
     }
+    
     void setHardwareOption(std::string name, int value) override {
         std::lock_guard<std::mutex> lock(hwMtx); if (!running || !deviceParams) return;
         if (name == "antenna") {
@@ -477,6 +480,7 @@ public:
                 if (value == 0) deviceParams->devParams->rspDxParams.antennaSel = sdrplay_api_RspDx_ANTENNA_A; 
                 if (value == 1) deviceParams->devParams->rspDxParams.antennaSel = sdrplay_api_RspDx_ANTENNA_B; 
                 if (value == 2) deviceParams->devParams->rspDxParams.antennaSel = sdrplay_api_RspDx_ANTENNA_C; 
+                // Tu też 4 argument:
                 sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_None, sdrplay_api_Update_RspDx_AntennaControl);
             }
         }
@@ -485,4 +489,11 @@ public:
     std::vector<uint32_t> getAvailableSampleRatesValues() override { return {2000000, 4000000, 6000000, 8000000, 10000000}; }
 };
 std::atomic<int> SdrPlaySource::activeInstances{0};
+
+#else
+class SdrPlaySource : public IQSource {
+public: 
+    static std::vector<SDRDeviceItem> getDeviceList() { return {}; }
+    bool open(std::string id, uint32_t r = 0) override { showPopup("Feature Not Available", "Run ./build.sh and enable SDRPlay."); return false; } void close() override {} void start() override {} void stop() override {} int read(Complex* b, int c) override { return 0; } double getSampleRate() override { return 2000000; } bool isHardware() override { return true; } 
+};
 #endif

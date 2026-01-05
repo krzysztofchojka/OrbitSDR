@@ -7,7 +7,10 @@
 #include <cstdio>
 
 #ifdef _WIN32
-    #define NOMINMAX
+    // --- FIX: Sprawdź czy NOMINMAX już istnieje ---
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
     #include <windows.h>
     #include <commdlg.h>
     #include <shlobj.h> // Required for directory browsing
@@ -19,10 +22,10 @@ inline void showPopup(std::string title, std::string message) {
         MessageBoxA(NULL, message.c_str(), title.c_str(), MB_OK | MB_ICONINFORMATION);
     #elif __APPLE__
         std::string cmd = "osascript -e 'display dialog \"" + message + "\" with title \"" + title + "\" buttons {\"OK\"} default button \"OK\" with icon note'";
-        system(cmd.c_str());
+        int ret = system(cmd.c_str()); (void)ret;
     #elif __linux__
         std::string cmd = "zenity --info --title=\"" + title + "\" --text=\"" + message + "\"";
-        system(cmd.c_str());
+        int ret = system(cmd.c_str()); (void)ret;
     #endif
 }
 
