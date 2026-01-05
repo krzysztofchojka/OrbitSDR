@@ -17,8 +17,9 @@ public:
     std::mutex mutex;
     std::deque<float> sampleQueue;
     
-    // Increased buffer limit slightly for stability
-    const size_t MAX_BUFFER_SIZE = (size_t)(48000 * 2 * 0.20); 
+    // ZWIĘKSZONY BUFOR: 1 sekunda (48000 Hz * 2 kanały * 1.0s)
+    // To zapobiega "szarpaniu" przy odtwarzaniu plików, dając duży margines bezpieczeństwa.
+    const size_t MAX_BUFFER_SIZE = (size_t)(48000 * 2 * 1.0); 
     
     ma_context context;
     ma_device device;
@@ -64,7 +65,8 @@ public:
         config.dataCallback = data_callback;
         config.pUserData = this;
         
-        // OPTIMIZATION: Low latency profile
+        // Dla plików lepiej użyć profilu domyślnego (większa stabilność), 
+        // ale low_latency jest OK, jeśli mamy dobry flow control w main.cpp.
         config.performanceProfile = ma_performance_profile_low_latency;
         
         if (deviceIndex >= 0 && deviceIndex < (int)availableDevices.size()) {
@@ -83,6 +85,8 @@ public:
         std::lock_guard<std::mutex> lock(mutex);
         sampleQueue.insert(sampleQueue.end(), audioData.begin(), audioData.end());
 
+        // Jeśli bufor się przepełni (np. CPU generuje za szybko), usuwamy NAJSTARSZE próbki.
+        // To jest zabezpieczenie ostateczne, ale flow control w main.cpp powinien temu zapobiec.
         if (sampleQueue.size() > MAX_BUFFER_SIZE) {
             size_t toRemove = sampleQueue.size() - MAX_BUFFER_SIZE;
             if (toRemove % 2 != 0) toRemove++; 
@@ -114,6 +118,7 @@ private:
             out[i] = sink->sampleQueue.front();
             sink->sampleQueue.pop_front();
         }
+        // Wypełnij ciszą jeśli brak danych (underrun)
         for (size_t i = toRead; i < samplesNeeded; ++i) {
             out[i] = 0.0f;
         }

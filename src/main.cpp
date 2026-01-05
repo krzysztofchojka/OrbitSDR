@@ -227,16 +227,10 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
     aprsDecoder.onMessage = [&](std::string msg) { 
         std::string ts = getTimestamp(); 
         std::string fullLog = ts + " " + msg; 
-        
-        // Write to File
         std::ofstream logFile(getAprsLogFilePath(), std::ios::app); 
         if (logFile.is_open()) { logFile << fullLog << "\n"; logFile.close(); } 
-        
-        // Parse into Struct
         AprsLastPacket pkt;
         parseAprsData(fullLog, pkt);
-
-        // Update Shared
         std::lock_guard<std::mutex> l(shared.mtx); 
         shared.aprsHistory.push_back(pkt); 
         if (shared.aprsHistory.size() > 500) shared.aprsHistory.pop_front(); 
@@ -248,8 +242,6 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
     std::vector<double> winFunc = makeWindow(FFT_SIZE); 
     std::vector<double> localFftHistory(FFT_SIZE, -100.0); 
     WavWriter recorder; 
-    
-    // OPTIMIZATION: Waterfall Update Timer
     sf::Clock waterfallTimer;
 
     while (running) {
@@ -262,18 +254,29 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
         bool justSeeked = false; if (seekReq >= 0.0 && src->isSeekable()) { src->seek(seekReq); demod.clear(); audio.clear(); justSeeked = true; } 
         if (!play && !justSeeked) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
         
+        // --- RECORDER LOGIC ---
         if (doRecord && !recorder.active) { long long currentCenterHz; { std::lock_guard<std::mutex> l(shared.mtx); currentCenterHz = shared.centerFreq; } char timeBuf[32]; std::time_t now = std::time(nullptr); std::strftime(timeBuf, sizeof(timeBuf), "%Y%m%d_%H%M%S", std::localtime(&now)); std::string filename, freqLabel; if (rMode == RecMode::AUDIO) { double offset = (targetFreqPct - 0.5) * src->getSampleRate(); long long tunedHz = currentCenterHz + (long long)offset; freqLabel = "_" + std::to_string(tunedHz / 1000) + "kHz"; filename = (rPath.empty() ? "." : rPath) + "/rec_" + std::string(timeBuf) + freqLabel + "_audio.wav"; recorder.start(filename, (int)AUDIO_RATE, 2); } else { freqLabel = "_" + std::to_string(currentCenterHz) + "Hz"; filename = (rPath.empty() ? "." : rPath) + "/rec_" + std::string(timeBuf) + freqLabel + "_IQ.wav"; recorder.start(filename, (int)src->getSampleRate(), 2); } { std::lock_guard<std::mutex> l(shared.mtx); shared.recStatus = "REC: " + filename; } } else if (!doRecord && recorder.active) { recorder.stop(); { std::lock_guard<std::mutex> l(shared.mtx); shared.recStatus = "Saved."; } }
         
-        // Anti-stutter buffer check for file source
-        if (play && !src->isHardware() && !justSeeked) { size_t safeLevel = 9600; while (audio.getBufferedCount() > safeLevel) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); if (!running) return; } }
+        // --- FLOW CONTROL (THROTTLING) ---
+        // To jest krytyczne dla plików. Jeśli bufor jest pełny, czekamy.
+        // Używamy pętli WHILE, żeby zablokować przetwarzanie dopóki nie zwolni się miejsce.
+        // 24000 floatów (stereo) = 12000 ramek = 0.25s audio.
+        // Jeśli bufor ma > 0.25s danych, czekamy.
+        if (play && !src->isHardware() && !justSeeked) {
+             size_t safeLevel = 24000; 
+             while (audio.getBufferedCount() > safeLevel && running && shared.isPlaying) {
+                 // Sprawdzamy czy użytkownik nie wcisnął pauzy/stopu w trakcie czekania
+                 { std::lock_guard<std::mutex> l(shared.mtx); if (!shared.isPlaying) break; }
+                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
+             }
+        }
         
-        double sr = src->getSampleRate(); if (sr != lastSampleRate) { demod = Demodulator(sr, AUDIO_RATE); lastSampleRate = sr; }
+        double sr = src->getSampleRate(); 
+        if (sr != lastSampleRate) { demod = Demodulator(sr, AUDIO_RATE); lastSampleRate = sr; }
         
-        // Larger chunks for high sample rates to reduce locking overhead
-        int chunkSize = (int)sr / 60; 
-        if (!play && justSeeked) chunkSize = FFT_SIZE * 2; 
-        // Cap chunk size to avoid memory spikes
-        if (chunkSize > 65536) chunkSize = 65536; 
+        int chunkSize = (int)(sr / 60.0); 
+        if (chunkSize < 4096) chunkSize = 4096;
+        if (chunkSize > 131072) chunkSize = 131072;
         
         if (iqBuffer.size() != chunkSize) iqBuffer.resize(chunkSize);
         int readCount = src->read(iqBuffer.data(), chunkSize);
@@ -281,35 +284,31 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
         if (readCount > 0) {
             if (recorder.active && rMode == RecMode::BASEBAND) { std::vector<float> rawFloat(readCount * 2); for(int i=0; i<readCount; i++) { rawFloat[i*2] = (float)iqBuffer[i].real(); rawFloat[i*2+1] = (float)iqBuffer[i].imag(); } recorder.write(rawFloat.data(), rawFloat.size()); }
             
-            // FFT Processing
-            std::vector<Complex> fftData(FFT_SIZE); for (size_t i = 0; i < FFT_SIZE && i < readCount; i++) fftData[i] = iqBuffer[i] * winFunc[i]; fft(fftData);
+            std::vector<Complex> fftData(FFT_SIZE); 
+            int offset = 0; if (readCount > FFT_SIZE) offset = (readCount - FFT_SIZE) / 2;
+            for (size_t i = 0; i < FFT_SIZE && (i + offset) < readCount; i++) fftData[i] = iqBuffer[i + offset] * winFunc[i]; 
+            fft(fftData);
+            
             int visualBin = (int)(targetFreqPct * FFT_SIZE); if (visualBin < 0) visualBin = 0; if (visualBin >= FFT_SIZE) visualBin = FFT_SIZE - 1;
-            int shiftedIdx = (visualBin + FFT_SIZE / 2) % FFT_SIZE; float signalMag = std::abs(fftData[shiftedIdx]) / FFT_SIZE; int left = (shiftedIdx - 1 + FFT_SIZE) % FFT_SIZE; int right = (shiftedIdx + 1) % FFT_SIZE; signalMag += (std::abs(fftData[left]) + std::abs(fftData[right])) / FFT_SIZE * 0.5f; float rssiDb = 20.0f * std::log10(signalMag + 1e-12f);
+            int shiftedIdx = (visualBin + FFT_SIZE / 2) % FFT_SIZE; float signalMag = std::abs(fftData[shiftedIdx]) / FFT_SIZE; float rssiDb = 20.0f * std::log10(signalMag + 1e-12f);
             
             if (play) { 
                 double freqOffset = (targetFreqPct - 0.5) * sr; 
                 if (mode == Mode::USB) freqOffset += bw / 2.0; 
                 if (mode == Mode::LSB) freqOffset -= bw / 2.0; 
                 
-                // Avoid copy if possible, but here we need a slice
                 std::vector<Complex> chunkToProcess(iqBuffer.begin(), iqBuffer.begin() + readCount); 
                 auto audioData = demod.process(chunkToProcess, freqOffset, bw, mode, stereo); 
                 
                 if (aprsActive) { std::vector<float> mono; mono.reserve(audioData.size()/2); for(size_t i=0; i<audioData.size(); i+=2) mono.push_back(audioData[i]); aprsDecoder.process(mono); } 
                 if (rssiDb < sqThr) std::fill(audioData.begin(), audioData.end(), 0.0f); 
                 float finalVol = muted ? 0.0f : vol; 
-                
-                for (auto& s : audioData) {
-                    if (std::isnan(s) || std::isinf(s)) s = 0.0f;
-                    else s *= finalVol;
-                }
+                for (auto& s : audioData) { if (std::isnan(s) || std::isinf(s)) s = 0.0f; else s *= finalVol; }
                 
                 audio.pushSamples(audioData); 
                 if (recorder.active && rMode == RecMode::AUDIO) recorder.write(audioData.data(), audioData.size()); 
             }
             
-            // --- OPTIMIZATION: WATERFALL THROTTLING ---
-            // Only update waterfall and FFT at 30 FPS (approx 33ms) to save CPU/Mutex/Bus
             if (waterfallTimer.getElapsedTime().asMilliseconds() > 33) {
                 std::vector<uint8_t> tempRow(INTERNAL_WATERFALL_WIDTH * 4); 
                 for (int x = 0; x < INTERNAL_WATERFALL_WIDTH; x++) { 
@@ -321,7 +320,6 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
                     sf::Color c = getHeatmap(norm, themeID); 
                     int px = x * 4; tempRow[px] = c.r; tempRow[px + 1] = c.g; tempRow[px + 2] = c.b; tempRow[px + 3] = 255; 
                 }
-                
                 float alpha = (play) ? 0.3f : 1.0f; 
                 for (int i = 0; i < FFT_SIZE; i++) { 
                     int idx = (i + FFT_SIZE / 2) % FFT_SIZE; 
@@ -329,8 +327,6 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
                     float db = 20 * std::log10(mag + 1e-12); 
                     localFftHistory[i] = localFftHistory[i] * (1.0f - alpha) + db * alpha; 
                 }
-
-                // TRY LOCK to avoid stalling audio
                 { 
                     std::unique_lock<std::mutex> lock(shared.mtx, std::try_to_lock); 
                     if (lock.owns_lock()) {
@@ -341,7 +337,6 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
                     }
                 }
             }
-
         } else { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
     }
     if (recorder.active) recorder.stop();
