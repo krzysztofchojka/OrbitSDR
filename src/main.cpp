@@ -799,7 +799,7 @@ int main() {
         while (const std::optional<sf::Event> ev = window.pollEvent()) {
             if (ev->is<sf::Event::Closed>()) window.close();
             
-            // --- Modal Input Handling ---
+            // --- 1. MODAL (Highest Priority) ---
             if (showAprsModal) {
                  btnModalClose.handleEvent(*ev, window);
                  btnModalCopy.handleEvent(*ev, window);
@@ -807,21 +807,29 @@ int main() {
                     // Close modal if clicked outside
                     sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window));
                     float mx = (layout.winW - 600) / 2; float my = (layout.winH - 400) / 2;
-                    // SFML 3.0 FIX: FloatRect constructor takes (position, size)
                     sf::FloatRect modalRect({mx, my}, {600.f, 400.f});
                     if (!modalRect.contains(m)) showAprsModal = false;
                  }
-                 continue; // Block interaction with other elements
+                 continue; // Block everything else
             }
 
-            volSlider.handleEvent(*ev, window); slZoom->handleEvent(*ev, window);
-            if (!isHw) timeSlider.handleEvent(*ev, window);
-            if (btnMute.isClicked(*ev, window)) { static bool m = false; m = !m; if(m) btnMute.setActive(true); else btnMute.setActive(false); std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.isMuted = m; }
-            if (btnPlay.isClicked(*ev, window)) { bool s; { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.isPlaying = !sharedData.isPlaying; s = sharedData.isPlaying; } if (s) { btnPlay.setText("||"); btnPlay.setActive(true); audio.start(); { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->start(); } } else { btnPlay.setText(">"); btnPlay.setActive(false); audio.stop(); { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->stop(); } } }
-            if (isHw && btnTuningMode.isClicked(*ev, window)) { stickyCenterMode = !stickyCenterMode; if(stickyCenterMode) { btnTuningMode.setText("CTR"); btnTuningMode.setActive(true); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } pendingCenterFreq = freqVFO.getFrequency(); debouncer.restart(); } else { btnTuningMode.setText("FIX"); btnTuningMode.setActive(false); } }
+            // --- 2. SIDEBAR (High Priority & Blocking) ---
+            // Jeśli Sidebar obsłużył zdarzenie LUB kliknięto w jego tło -> blokujemy resztę UI
+            if (sidebar.handleEvent(*ev, window)) {
+                continue; 
+            }
+
+            // --- 3. TOP BAR UI ---
+            bool topBarHandled = false;
+            if (volSlider.handleEvent(*ev, window)) topBarHandled = true;
+            if (slZoom->handleEvent(*ev, window)) topBarHandled = true;
+            if (!isHw && timeSlider.handleEvent(*ev, window)) topBarHandled = true;
+            if (btnMute.isClicked(*ev, window)) { static bool m = false; m = !m; if(m) btnMute.setActive(true); else btnMute.setActive(false); std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.isMuted = m; topBarHandled = true; }
+            if (btnPlay.isClicked(*ev, window)) { bool s; { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.isPlaying = !sharedData.isPlaying; s = sharedData.isPlaying; } if (s) { btnPlay.setText("||"); btnPlay.setActive(true); audio.start(); { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->start(); } } else { btnPlay.setText(">"); btnPlay.setActive(false); audio.stop(); { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->stop(); } } topBarHandled = true; }
+            if (isHw && btnTuningMode.isClicked(*ev, window)) { stickyCenterMode = !stickyCenterMode; if(stickyCenterMode) { btnTuningMode.setText("CTR"); btnTuningMode.setActive(true); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } pendingCenterFreq = freqVFO.getFrequency(); debouncer.restart(); } else { btnTuningMode.setText("FIX"); btnTuningMode.setActive(false); } topBarHandled = true; }
             
-            // --- FIX FOR SCROLL VFO LOCKUP (Hardware not retuning) ---
             if (isHw && freqVFO.handleEvent(*ev)) { 
+                topBarHandled = true;
                 long long targetVFO = freqVFO.getFrequency(); 
                 if (stickyCenterMode) { 
                     pendingCenterFreq = targetVFO; 
@@ -833,7 +841,6 @@ int main() {
                     double maxF = (double)currentCenterFreq + halfBW; 
                     
                     if (targetVFO > maxF || targetVFO < minF) { 
-                        // Hardware Retune Needed
                         if (pendingCenterFreq != targetVFO) {
                              pendingCenterFreq = targetVFO; 
                              currentCenterFreq = targetVFO;
@@ -847,40 +854,151 @@ int main() {
                 } 
             }
 
+            if (topBarHandled) continue;
+
+            // --- 4. CONTENT (Spectrum, APRS List, Tuning) - Lowest Priority ---
+            
             bool overAprs = (aprsOn && window.mapPixelToCoords(sf::Mouse::getPosition(window)).y > (layout.winH - 200));
-            if (const auto* scroll = ev->getIf<sf::Event::MouseWheelScrolled>()) { if (overAprs) { aprsLogScrollOffset += scroll->delta * 20.0f; if (aprsLogScrollOffset > 0.0f) aprsLogScrollOffset = 0.0f; } else { sf::Vector2f m = window.mapPixelToCoords(sf::Vector2i((int)scroll->position.x, (int)scroll->position.y)); if (m.y > TOP_BAR_H && m.x < layout.specW) { long long step = STEP_VALUES[ddSnap->selectedIndex]; if (step == 0) step = 100; long long current = freqVFO.getFrequency(); long long rawNext = current + (long long)(scroll->delta * step); if (step > 0) { long long remainder = rawNext % step; if (remainder > step / 2) rawNext += (step - remainder); else rawNext -= remainder; } if (rawNext < 0) rawNext = 0; freqVFO.setFrequency(rawNext); if (stickyCenterMode && isHw) { pendingCenterFreq = rawNext; debouncer.restart(); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } } else { double newOffset = (double)(rawNext - currentCenterFreq); double clickPct = 0.5 + (newOffset / hwSampleRate); clickPct = std::clamp(clickPct, 0.0, 1.0); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = clickPct; } } } } }
-            if (const auto* mb = ev->getIf<sf::Event::MouseButtonPressed>()) { if (mb->button == sf::Mouse::Button::Left) { sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window)); 
-                
-                // --- CLICK HANDLING FOR APRS LOG ---
-                if (overAprs) {
-                    float logX = layout.specW - 300; 
-                    float overlayY = layout.winH - 200.0f;
-                    float listTopY = overlayY + 25.0f; 
-                    if (m.x > logX) {
-                        float relY = m.y - listTopY - aprsLogScrollOffset;
-                        int index = (int)(relY / 16.0f);
-                        std::lock_guard<std::mutex> l(sharedData.mtx);
-                        if (index >= 0 && index < sharedData.aprsHistory.size()) {
-                            selectedAprsPacket = sharedData.aprsHistory[index];
-                            showAprsModal = true;
+            
+            if (const auto* scroll = ev->getIf<sf::Event::MouseWheelScrolled>()) { 
+                if (overAprs) { 
+                    aprsLogScrollOffset += scroll->delta * 20.0f; 
+                    if (aprsLogScrollOffset > 0.0f) aprsLogScrollOffset = 0.0f; 
+                } else { 
+                    sf::Vector2f m = window.mapPixelToCoords(sf::Vector2i((int)scroll->position.x, (int)scroll->position.y)); 
+                    if (m.y > TOP_BAR_H && m.x < layout.specW) { 
+                        long long step = STEP_VALUES[ddSnap->selectedIndex]; 
+                        if (step == 0) step = 100; 
+                        long long current = freqVFO.getFrequency(); 
+                        long long rawNext = current + (long long)(scroll->delta * step); 
+                        if (step > 0) { 
+                            long long remainder = rawNext % step; 
+                            if (remainder > step / 2) rawNext += (step - remainder); else rawNext -= remainder; 
+                        } 
+                        if (rawNext < 0) rawNext = 0; 
+                        freqVFO.setFrequency(rawNext); 
+                        if (stickyCenterMode && isHw) { 
+                            pendingCenterFreq = rawNext; debouncer.restart(); 
+                            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } 
+                        } else { 
+                            double newOffset = (double)(rawNext - currentCenterFreq); 
+                            double clickPct = 0.5 + (newOffset / hwSampleRate); 
+                            clickPct = std::clamp(clickPct, 0.0, 1.0); 
+                            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = clickPct; } 
+                        } 
+                    } 
+                } 
+            }
+            if (const auto* mb = ev->getIf<sf::Event::MouseButtonPressed>()) { 
+                if (mb->button == sf::Mouse::Button::Left) { 
+                    sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window)); 
+                    
+                    // --- CLICK HANDLING FOR APRS LOG ---
+                    if (overAprs) {
+                        float logX = layout.specW - 300; 
+                        float overlayY = layout.winH - 200.0f;
+                        float listTopY = overlayY + 25.0f; 
+                        if (m.x > logX) {
+                            float relY = m.y - listTopY - aprsLogScrollOffset;
+                            int index = (int)(relY / 16.0f);
+                            std::lock_guard<std::mutex> l(sharedData.mtx);
+                            if (index >= 0 && index < sharedData.aprsHistory.size()) {
+                                selectedAprsPacket = sharedData.aprsHistory[index];
+                                showAprsModal = true;
+                            }
                         }
                     }
-                }
+                    
+                    bool overTimeline = (timeSlider.isDragging || (m.y > layout.winH - 40)); 
+                    bool inFreqScaleZone = (m.y >= TOP_BAR_H + layout.specH - 10 && m.y <= TOP_BAR_H + layout.specH + 20 && m.x < layout.specW); 
+                    
+                    // Obliczanie krawędzi pasma (BW)
+                    double offsetFromCenter = (tunePct - 0.5); 
+                    float visualCenterX = (0.5 + (offsetFromCenter * currentZoom)) * layout.specW; 
+                    float bwPixels = (slBW->currentVal / (hwSampleRate / currentZoom)) * layout.specW; 
+                    float leftEdge = visualCenterX - bwPixels / 2.0f; float rightEdge = visualCenterX + bwPixels / 2.0f; 
+                    if (mode == Mode::USB) { leftEdge = visualCenterX; rightEdge = visualCenterX + bwPixels; } 
+                    if (mode == Mode::LSB) { leftEdge = visualCenterX - bwPixels; rightEdge = visualCenterX; } 
+                    
+                    bool hitEdge = (std::abs(m.x - leftEdge) < 6 || std::abs(m.x - rightEdge) < 6) && (m.y > TOP_BAR_H && m.y < TOP_BAR_H + layout.specH); 
+                    
+                    if (hitEdge && !overAprs) { 
+                        isDraggingBW = true; dragStartBW = slBW->currentVal; dragStartMouseX = m.x; 
+                    } else if (inFreqScaleZone && !overTimeline && !overAprs) { 
+                        isDraggingScale = true; lastDragX = m.x; 
+                    } else if (!overTimeline && !overAprs && m.x < layout.specW && m.y > TOP_BAR_H && m.y < (TOP_BAR_H + layout.specH + layout.waterfallH)) { 
+                        isSpectrumDragging = true; applySpectrumTuning(m.x); 
+                    } 
+                } 
+            } else if (const auto* mr = ev->getIf<sf::Event::MouseButtonReleased>()) { 
+                if (mr->button == sf::Mouse::Button::Left) { isSpectrumDragging = false; isDraggingScale = false; isDraggingBW = false; } 
+            } else if (const auto* mm = ev->getIf<sf::Event::MouseMoved>()) { 
+                sf::Vector2f m = window.mapPixelToCoords(mm->position); 
+                double offsetFromCenter = (tunePct - 0.5); 
+                float visualCenterX = (0.5 + (offsetFromCenter * currentZoom)) * layout.specW; 
+                float bwPixels = (slBW->currentVal / (hwSampleRate / currentZoom)) * layout.specW; 
+                float leftEdge = visualCenterX - bwPixels / 2.0f; float rightEdge = visualCenterX + bwPixels / 2.0f; 
+                if (mode == Mode::USB) { leftEdge = visualCenterX; rightEdge = visualCenterX + bwPixels; } 
+                if (mode == Mode::LSB) { leftEdge = visualCenterX - bwPixels; rightEdge = visualCenterX; } 
+                bool hitEdge = (std::abs(m.x - leftEdge) < 6 || std::abs(m.x - rightEdge) < 6) && (m.y > TOP_BAR_H && m.y < TOP_BAR_H + layout.specH); 
                 
-                bool overTimeline = (timeSlider.isDragging || (m.y > layout.winH - 40)); bool inFreqScaleZone = (m.y >= TOP_BAR_H + layout.specH - 10 && m.y <= TOP_BAR_H + layout.specH + 20 && m.x < layout.specW); double offsetFromCenter = (tunePct - 0.5); float visualCenterX = (0.5 + (offsetFromCenter * currentZoom)) * layout.specW; float bwPixels = (slBW->currentVal / (hwSampleRate / currentZoom)) * layout.specW; float leftEdge = visualCenterX - bwPixels / 2.0f; float rightEdge = visualCenterX + bwPixels / 2.0f; if (mode == Mode::USB) { leftEdge = visualCenterX; rightEdge = visualCenterX + bwPixels; } if (mode == Mode::LSB) { leftEdge = visualCenterX - bwPixels; rightEdge = visualCenterX; } bool hitEdge = (std::abs(m.x - leftEdge) < 6 || std::abs(m.x - rightEdge) < 6) && (m.y > TOP_BAR_H && m.y < TOP_BAR_H + layout.specH); if (hitEdge && !overAprs) { isDraggingBW = true; dragStartBW = slBW->currentVal; dragStartMouseX = m.x; } else if (inFreqScaleZone && !overTimeline && !overAprs) { isDraggingScale = true; lastDragX = m.x; } else if (!overTimeline && !overAprs && m.x < layout.specW && m.y > TOP_BAR_H && m.y < (TOP_BAR_H + layout.specH + layout.waterfallH)) { isSpectrumDragging = true; applySpectrumTuning(m.x); } } } else if (const auto* mr = ev->getIf<sf::Event::MouseButtonReleased>()) { if (mr->button == sf::Mouse::Button::Left) { isSpectrumDragging = false; isDraggingScale = false; isDraggingBW = false; } } else if (const auto* mm = ev->getIf<sf::Event::MouseMoved>()) { sf::Vector2f m = window.mapPixelToCoords(mm->position); double offsetFromCenter = (tunePct - 0.5); float visualCenterX = (0.5 + (offsetFromCenter * currentZoom)) * layout.specW; float bwPixels = (slBW->currentVal / (hwSampleRate / currentZoom)) * layout.specW; float leftEdge = visualCenterX - bwPixels / 2.0f; float rightEdge = visualCenterX + bwPixels / 2.0f; if (mode == Mode::USB) { leftEdge = visualCenterX; rightEdge = visualCenterX + bwPixels; } if (mode == Mode::LSB) { leftEdge = visualCenterX - bwPixels; rightEdge = visualCenterX; } bool hitEdge = (std::abs(m.x - leftEdge) < 6 || std::abs(m.x - rightEdge) < 6) && (m.y > TOP_BAR_H && m.y < TOP_BAR_H + layout.specH); if ((hitEdge || isDraggingBW) && cursorSizeH) window.setMouseCursor(*cursorSizeH); if (isDraggingBW) { float hzPerPx = (hwSampleRate / currentZoom) / layout.specW; float dist = std::abs(m.x - visualCenterX); float newBW = dist * hzPerPx * 2.0f; if (mode == Mode::USB || mode == Mode::LSB) newBW = dist * hzPerPx; newBW = std::clamp(newBW, slBW->minVal, slBW->maxVal); slBW->setValueSilent(newBW); slBW->onChange(newBW); } else if (isSpectrumDragging) applySpectrumTuning(m.x); if (isDraggingScale) { float dx = lastDragX - m.x; lastDragX = m.x; double hzPerPx = (hwSampleRate / currentZoom) / layout.specW; long long shift = (long long)(dx * hzPerPx); long long nextCenter = currentCenterFreq + shift; if (nextCenter < 0) nextCenter = 0; currentCenterFreq = nextCenter; { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.centerFreq = nextCenter; } if (debouncer.getElapsedTime().asMilliseconds() > TUNING_LATENCY_MS) { { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->setCenterFrequency(nextCenter); } debouncer.restart(); } } if (!overAprs && m.x >= 0 && m.x < layout.specW && m.y >= TOP_BAR_H && m.y < (TOP_BAR_H + layout.specH + layout.waterfallH)) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.mouseX_spectrum = m.x; sharedData.mouseY_spectrum = m.y - TOP_BAR_H; } else { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.mouseX_spectrum = -1.0f; } }
+                if ((hitEdge || isDraggingBW) && cursorSizeH) window.setMouseCursor(*cursorSizeH); 
+                if (isDraggingBW) { 
+                    float hzPerPx = (hwSampleRate / currentZoom) / layout.specW; 
+                    float dist = std::abs(m.x - visualCenterX); 
+                    float newBW = dist * hzPerPx * 2.0f; 
+                    if (mode == Mode::USB || mode == Mode::LSB) newBW = dist * hzPerPx; 
+                    newBW = std::clamp(newBW, slBW->minVal, slBW->maxVal); 
+                    slBW->setValueSilent(newBW); slBW->onChange(newBW); 
+                } else if (isSpectrumDragging) applySpectrumTuning(m.x); 
+                
+                if (isDraggingScale) { 
+                    float dx = lastDragX - m.x; lastDragX = m.x; 
+                    double hzPerPx = (hwSampleRate / currentZoom) / layout.specW; 
+                    long long shift = (long long)(dx * hzPerPx); 
+                    long long nextCenter = currentCenterFreq + shift; 
+                    if (nextCenter < 0) nextCenter = 0; 
+                    currentCenterFreq = nextCenter; 
+                    { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.centerFreq = nextCenter; } 
+                    if (debouncer.getElapsedTime().asMilliseconds() > TUNING_LATENCY_MS) { 
+                        { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->setCenterFrequency(nextCenter); } 
+                        debouncer.restart(); 
+                    } 
+                } 
+                if (!overAprs && m.x >= 0 && m.x < layout.specW && m.y >= TOP_BAR_H && m.y < (TOP_BAR_H + layout.specH + layout.waterfallH)) { 
+                    std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.mouseX_spectrum = m.x; sharedData.mouseY_spectrum = m.y - TOP_BAR_H; 
+                } else { 
+                    std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.mouseX_spectrum = -1.0f; 
+                } 
+            }
             sidebar.handleEvent(*ev, window);
         }
         if (pendingCenterFreq != 0 && debouncer.getElapsedTime().asMilliseconds() > TUNING_LATENCY_MS) { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource && currentSource->isHardware()) { currentSource->setCenterFrequency(pendingCenterFreq); currentCenterFreq = pendingCenterFreq; } pendingCenterFreq = 0; }
         sidebar.update(window);
-        bool showHand = false; sf::Vector2f mousePos = window.mapPixelToCoords(sf::Mouse::getPosition(window)); if (sidebar.isAnyWidgetHovered(window)) showHand = true; if (freqVFO.isHovered) showHand = true; if (mousePos.y >= TOP_BAR_H + layout.specH - 10 && mousePos.y <= TOP_BAR_H + layout.specH + 20 && mousePos.x < layout.specW) showHand = true; if (volSlider.isMouseOver(window) || timeSlider.isMouseOver(window)) showHand = true; if (btnPlay.isMouseOver(window) || btnMute.isMouseOver(window) || btnTuningMode.isMouseOver(window)) showHand = true; if (aprsOn && mousePos.y > (layout.winH - 200) && mousePos.x < layout.specW) showHand = true;
         
-        if (showAprsModal) showHand = false; // Reset hand in modal mode if not over button
+        bool showHand = false; 
+        sf::Vector2f mousePos = window.mapPixelToCoords(sf::Mouse::getPosition(window)); 
+        
+        // --- CURSOR LOGIC ---
+        // Tylko jeśli Sidebar NIE przechwycił myszki (nie jest nad nim), sprawdzamy resztę
+        if (sidebar.isMouseOver(window)) {
+             if (sidebar.isAnyWidgetHovered(window)) showHand = true;
+        } else {
+             if (freqVFO.isHovered) showHand = true; 
+             if (mousePos.y >= TOP_BAR_H + layout.specH - 10 && mousePos.y <= TOP_BAR_H + layout.specH + 20 && mousePos.x < layout.specW) showHand = true; 
+             if (volSlider.isMouseOver(window) || timeSlider.isMouseOver(window)) showHand = true; 
+             if (btnPlay.isMouseOver(window) || btnMute.isMouseOver(window) || btnTuningMode.isMouseOver(window)) showHand = true; 
+             if (aprsOn && mousePos.y > (layout.winH - 200) && mousePos.x < layout.specW) showHand = true;
+        }
+
+        if (showAprsModal) showHand = false; 
 
         if (isDraggingBW && cursorSizeH) { window.setMouseCursor(*cursorSizeH); } else if (showHand && cursorHand) { window.setMouseCursor(*cursorHand); } else if (cursorArrow) { window.setMouseCursor(*cursorArrow); }
 
         std::vector<double> spectrum; std::vector<uint8_t> row; bool newRow = false; { std::lock_guard<std::mutex> lock(sharedData.mtx); spectrum = sharedData.fftSpectrum; if (sharedData.newWaterfallData) { row = sharedData.waterfallRow; sharedData.newWaterfallData = false; newRow = true; } }
         if (newRow) { std::copy_backward(waterfall.begin(), waterfall.end() - INTERNAL_WATERFALL_WIDTH * 4, waterfall.end()); std::copy(row.begin(), row.end(), waterfall.begin()); wTex.update(waterfall.data()); }
         
+        // --- DRAWING CODE (Bez zmian, tylko wklej resztę main.cpp tutaj) ---
         window.clear(sf::Color::Black); long long cf = 0; if (currentSource) cf = currentCenterFreq;
         drawGrid(window, font, 0, TOP_BAR_H, layout.specW, layout.specH, cf, hwSampleRate / currentZoom, slMinDb->currentVal, slMaxDb->currentVal);
         
