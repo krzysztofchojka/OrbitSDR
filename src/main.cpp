@@ -274,9 +274,11 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
         double sr = src->getSampleRate(); 
         if (sr != lastSampleRate) { demod = Demodulator(sr, AUDIO_RATE); lastSampleRate = sr; }
         
-        int chunkSize = (int)(sr / 60.0); 
-        if (chunkSize < 4096) chunkSize = 4096;
-        if (chunkSize > 131072) chunkSize = 131072;
+        int chunkSize = (int)(sr / 20.0); 
+        
+        // Safety clamps
+        if (chunkSize < 4096) chunkSize = 4096;      // Minimum dla wydajności FFT
+        if (chunkSize > 262144) chunkSize = 262144;  // Maximum dla pamięci
         
         if (iqBuffer.size() != chunkSize) iqBuffer.resize(chunkSize);
         int readCount = src->read(iqBuffer.data(), chunkSize);

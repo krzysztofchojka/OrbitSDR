@@ -67,15 +67,18 @@ public:
     // Stereo PLL State
     double pllPhase = 0.0;
     double pllFreq = 19000.0 * 2.0 * PI;
-    
-    // FIX 1: Dynamic PLL parameters (calculated in constructor/process)
     double pllAlpha = 0.01;
     double pllBeta = 0.0001;
     
-    // WFM Downsampling Buffers
+    // --- RESAMPLING STATE ---
     float wfmSumL = 0.0f;
     float wfmSumR = 0.0f;
     int wfmCount = 0;
+    double wfmResampleAcc = 0.0;
+
+    Complex nbSum = Complex(0,0);
+    int nbCount = 0;
+    double nbResampleAcc = 0.0;
 
     // Filters
     Biquad notchL, notchR;
@@ -90,7 +93,9 @@ public:
         wfmDcState = 0.0f;
         iqLpfState = Complex(0.0, 0.0);
         lastSample = Complex(1.0, 0.0);
-        wfmSumL = 0.0f; wfmSumR = 0.0f; wfmCount = 0;
+        
+        wfmSumL = 0.0f; wfmSumR = 0.0f; wfmCount = 0; wfmResampleAcc = 0.0;
+        nbSum = Complex(0,0); nbCount = 0; nbResampleAcc = 0.0;
         
         pllPhase = 0.0;
         if (sampleRateIn > 0) pllFreq = (19000.0 / sampleRateIn) * 2.0 * PI;
@@ -105,17 +110,13 @@ public:
         updatePLLParams();
     }
     
-    // Helper to scale PLL physics relative to sample rate
     void updatePLLParams() {
         if (sampleRateIn > 0) {
             pllFreq = (19000.0 / sampleRateIn) * 2.0 * PI;
-            // Scale coefficients: Standard values tuned for ~2MSps
-            // Higher sample rate = smaller steps needed per sample to maintain same time constant
             double scale = 2000000.0 / sampleRateIn; 
             pllAlpha = 0.01 * scale;
-            pllBeta = 0.0001 * scale * scale; // Beta scales quadratically usually, or linearly depending on damping
+            pllBeta = 0.0001 * scale * scale; 
             
-            // Safety clamps for very high rates
             if (pllAlpha < 0.00001) pllAlpha = 0.00001;
             if (pllBeta < 0.0000001) pllBeta = 0.0000001;
         }
@@ -125,7 +126,6 @@ public:
         std::vector<float> audioOut;
         if (rawIQ.empty()) return audioOut;
 
-        // Ensure params are up to date (if sample rate changed dynamically)
         if (sampleRateIn != lastSampleRateCheck) {
              updatePLLParams();
         }
@@ -133,8 +133,8 @@ public:
         size_t estimatedOut = (size_t)(rawIQ.size() * sampleRateOut / sampleRateIn) * 2 + 20;
         audioOut.reserve(estimatedOut);
 
-        int decimation = static_cast<int>(sampleRateIn / sampleRateOut);
-        if (decimation < 1) decimation = 1;
+        double resampleRatio = sampleRateIn / sampleRateOut;
+        if (resampleRatio < 1.0) resampleRatio = 1.0;
 
         // 1. Calculate Filter Alphas
         float iqAlpha = 1.0f;
@@ -171,44 +171,35 @@ public:
         Complex ncoStep = std::polar(1.0, phaseStepAngle);
 
         Complex sample;
-        Complex sum(0, 0); 
-        int count = 0;
 
         if (!stereoEnabled) {
              pllFreq = (19000.0 / sampleRateIn) * 2.0 * PI;
              pllPhase = 0.0;
         }
         
-        // Initial normalization for the block
         double mag = std::abs(currentPhasor);
         if (mag > 0.0001) currentPhasor /= mag;
         else currentPhasor = Complex(1.0, 0.0);
 
-        // FIX 3: Pre-calc PLL limits to prevent "popping"
         double targetPll = (19000.0 / sampleRateIn) * 2.0 * PI;
-        double pllLimit = (1000.0 / sampleRateIn) * 2.0 * PI; // +/- 1kHz tolerance
+        double pllLimit = (1000.0 / sampleRateIn) * 2.0 * PI; 
         double pllMin = targetPll - pllLimit;
         double pllMax = targetPll + pllLimit;
 
         for (size_t i = 0; i < rawIQ.size(); i++) {
-            // A. Frequency Shift (Mixing)
             sample = rawIQ[i] * currentPhasor;
             currentPhasor *= ncoStep; 
 
-            // FIX 2: Periodic Re-normalization (Anti-Drift for high sample rates)
-            // Every 4096 samples, fix the vector length. Very cheap, fixes "swimming".
             if ((i & 0xFFF) == 0) {
                 double m = std::abs(currentPhasor);
-                if (m > 0.0001) currentPhasor *= (1.0 / m); // Faster than division
+                if (m > 0.0001) currentPhasor *= (1.0 / m); 
             }
 
-            // B. IQ Low-Pass Filter
             iqLpfState += Complex(iqAlpha, 0) * (sample - iqLpfState);
             Complex processedSample = iqLpfState; 
 
             // --- WFM PATH ---
             if (mode == Mode::WFM) {
-                // FM Demod
                 Complex phaseDiff = processedSample * std::conj(lastSample);
                 lastSample = processedSample; 
                 float mpxSignal = std::arg(phaseDiff);
@@ -222,7 +213,6 @@ public:
                     
                     pllFreq += pllBeta * pllError;
                     
-                    // FIX 3: PLL Clamp (Anti-Pop)
                     if (pllFreq < pllMin) pllFreq = pllMin;
                     if (pllFreq > pllMax) pllFreq = pllMax;
 
@@ -251,35 +241,44 @@ public:
                 wfmSumL += deemphStateL;
                 wfmSumR += deemphStateR;
                 wfmCount++;
-
-                if (wfmCount >= decimation) {
-                    float finalL = (wfmSumL / (float)wfmCount) * 4.0f; 
-                    float finalR = (wfmSumR / (float)wfmCount) * 4.0f; 
+                
+                wfmResampleAcc += 1.0;
+                if (wfmResampleAcc >= resampleRatio) {
+                    // FIX: Zmniejszono wzmocnienie z 4.0f na 1.5f, aby uniknąć przesterów
+                    float finalL = (wfmSumL / (float)wfmCount) * 1.5f; 
+                    float finalR = (wfmSumR / (float)wfmCount) * 1.5f; 
 
                     wfmDcState = 0.995f * wfmDcState + 0.005f * ((finalL + finalR) * 0.5f);
                     finalL -= wfmDcState; finalR -= wfmDcState;
-                    finalL = std::clamp(finalL, -0.9f, 0.9f);
-                    finalR = std::clamp(finalR, -0.9f, 0.9f);
+                    
+                    // FIX: Soft Limiter (tanh) zamiast hard clamp. Daje ładniejszy dźwięk przy przesterze.
+                    finalL = std::tanh(finalL);
+                    finalR = std::tanh(finalR);
 
                     audioOut.push_back(finalL); 
                     audioOut.push_back(finalR); 
                     
                     wfmSumL = 0.0f; wfmSumR = 0.0f; wfmCount = 0;
+                    wfmResampleAcc -= resampleRatio;
                 }
             }
             // --- NARROWBAND PATH ---
             else {
-                sum += processedSample;
-                count++;
+                nbSum += processedSample;
+                nbCount++;
 
-                if (count >= decimation) {
+                nbResampleAcc += 1.0;
+
+                if (nbResampleAcc >= resampleRatio) {
                     if (mode == Mode::OFF) {
                         audioOut.push_back(0.0f); audioOut.push_back(0.0f);
-                        sum = Complex(0, 0); count = 0; continue;
+                        nbSum = Complex(0, 0); nbCount = 0; nbResampleAcc -= resampleRatio;
+                        continue;
                     }
 
-                    Complex filtered = sum / (double)count;
-                    sum = Complex(0, 0); count = 0;
+                    Complex filtered = nbSum / (double)nbCount;
+                    nbSum = Complex(0, 0); nbCount = 0;
+                    nbResampleAcc -= resampleRatio;
 
                     float rawAudio = 0.0f;
 
