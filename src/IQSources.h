@@ -248,23 +248,30 @@ public:
 };
 
 // --- RTL-SDR SOURCE (Bez zmian) ---
+// --- RTL-SDR SOURCE (FIXED FOR V4: SYNC READ) ---
 class RtlSdrSource : public IQSource {
-    rtlsdr_dev_t* dev = nullptr; std::thread worker; std::atomic<bool> running {false}; RingBuffer<Complex> ringBuffer;
-    uint32_t sampleRate = 2048000; uint32_t centerFreq = 100000000; std::mutex hwMtx; std::vector<int> availableGains; 
+    rtlsdr_dev_t* dev = nullptr;
+    std::thread worker;
+    std::atomic<bool> running {false};
+    RingBuffer<Complex> ringBuffer;
+    uint32_t sampleRate = 2048000;
     
-    static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx) {
-        RtlSdrSource* self = (RtlSdrSource*)ctx; 
-        if (!self->running) return;
-        int samples = len / 2; 
-        std::vector<Complex> converted(samples);
-        const float inv = 1.0f / 127.5f;
-        for (int i = 0; i < samples; i++) { 
-            converted[i] = Complex((buf[i * 2] - 127.5) * inv, (buf[i * 2 + 1] - 127.5) * inv); 
-        }
-        self->ringBuffer.push(converted.data(), samples);
-    }
+    // Używamy atomic, aby UI mogło bezpiecznie ustawiać żądania,
+    // a worker je aplikował w bezpiecznym momencie.
+    std::atomic<long long> currentCenterFreq {100000000};
+    std::atomic<long long> pendingCenterFreq {0}; // 0 oznacza brak zmiany
+    
+    std::atomic<int> currentGain {-999};
+    std::atomic<int> pendingGain {-999}; // -999 oznacza brak zmiany
+    
+    std::mutex hwMtx; // Chroni tylko dostęp do wskaźnika 'dev' przy open/close
+    std::vector<int> availableGains;
+
+    // Bufor do odczytu z USB (wielokrotność 16k jest optymalna dla RTL)
+    static const int USB_BUFFER_SIZE = 16 * 16384; 
+
 public:
-    RtlSdrSource() : ringBuffer(8 * 1024 * 1024) {} 
+    RtlSdrSource() : ringBuffer(8 * 1024 * 1024) {}
     ~RtlSdrSource() { close(); }
 
     static std::vector<SDRDeviceItem> getDeviceList() {
@@ -280,66 +287,146 @@ public:
     }
 
     bool open(std::string id, uint32_t requestedRate = 0) override {
-        std::lock_guard<std::mutex> lock(hwMtx); 
+        std::lock_guard<std::mutex> lock(hwMtx);
         int dev_index = 0; try { dev_index = std::stoi(id); } catch(...) {}
+        
         if (rtlsdr_open(&dev, dev_index) < 0) return false;
         
         if (requestedRate > 0) sampleRate = requestedRate; else sampleRate = 2048000;
-        rtlsdr_set_sample_rate(dev, sampleRate); 
-        rtlsdr_set_center_freq(dev, centerFreq); 
+        
+        // --- FIX NA AGC ---
+        // Zamiast 0 (brak zmiany freq), ustawiamy aktualną, żeby worker ją wymusił
+        pendingCenterFreq = currentCenterFreq.load(); 
+        
+        // Zamiast -999 (brak zmiany gainu), ustawiamy -1 (AGC).
+        // To zmusi pętlę workera do jawnego wywołania rtlsdr_set_tuner_gain_mode(dev, 0)
+        // w pierwszym przebiegu pętli.
+        pendingGain = -1; 
+        
+        // Te wywołania bezpośrednie zostawiamy jako "fallback", ale to worker wykona właściwą robotę
+        rtlsdr_set_sample_rate(dev, sampleRate);
+        rtlsdr_set_center_freq(dev, currentCenterFreq);
         rtlsdr_set_tuner_gain_mode(dev, 0); 
         rtlsdr_reset_buffer(dev);
         
-        int count = rtlsdr_get_tuner_gains(dev, NULL); 
-        if (count > 0) { availableGains.resize(count); rtlsdr_get_tuner_gains(dev, availableGains.data()); }
+        int count = rtlsdr_get_tuner_gains(dev, NULL);
+        if (count > 0) { 
+            availableGains.resize(count); 
+            rtlsdr_get_tuner_gains(dev, availableGains.data()); 
+        }
         return true;
     }
 
-    void close() override { 
-        stop(); 
-        std::lock_guard<std::mutex> lock(hwMtx); 
-        if (dev) { 
-            rtlsdr_close(dev); 
-            dev = nullptr; 
-        } 
+    void close() override {
+        stop();
+        std::lock_guard<std::mutex> lock(hwMtx);
+        if (dev) {
+            rtlsdr_close(dev);
+            dev = nullptr;
+        }
     }
 
-    void start() override { 
-        if (running) return; 
-        running = true; 
-        if (dev) rtlsdr_reset_buffer(dev); 
-        worker = std::thread([this]() { rtlsdr_read_async(dev, rtlsdr_callback, this, 0, 0); }); 
+    // --- NEW WORKER LOOP (SYNC) ---
+    void workerLoop() {
+        std::vector<uint8_t> buffer(USB_BUFFER_SIZE);
+        const float inv = 1.0f / 127.5f;
+
+        while (running) {
+            // 1. Obsługa zmiany częstotliwości (Safe Tuning)
+            long long newFreq = pendingCenterFreq.exchange(0);
+            if (newFreq != 0) {
+                if (dev) rtlsdr_set_center_freq(dev, (uint32_t)newFreq);
+                currentCenterFreq = newFreq;
+            }
+
+            // 2. Obsługa zmiany wzmocnienia (Safe Gain)
+            int newGain = pendingGain.exchange(-999);
+            if (newGain != -999) {
+                if (dev) {
+                    if (newGain == -1) {
+                        rtlsdr_set_tuner_gain_mode(dev, 0); // Auto
+                    } else {
+                        rtlsdr_set_tuner_gain_mode(dev, 1); // Manual
+                        
+                        // Znajdź najbliższy dostępny gain
+                        int targetGain = newGain * 10;
+                        int bestGain = targetGain;
+                        int minDiff = 100000;
+                        for (int g : availableGains) {
+                            int diff = std::abs(g - targetGain);
+                            if (diff < minDiff) { minDiff = diff; bestGain = g; }
+                        }
+                        rtlsdr_set_tuner_gain(dev, bestGain);
+                    }
+                }
+                currentGain = newGain;
+            }
+
+            // 3. Odczyt synchroniczny (blokuje na chwilę, ale bezpiecznie)
+            int n_read = 0;
+            if (rtlsdr_read_sync(dev, buffer.data(), USB_BUFFER_SIZE, &n_read) < 0) {
+                // Błąd odczytu (np. urządzenie odłączone)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
+            if (n_read > 0) {
+                int samples = n_read / 2;
+                std::vector<Complex> converted(samples);
+                
+                // Konwersja 8-bit unsigned -> float complex
+                for (int i = 0; i < samples; i++) {
+                    converted[i] = Complex(
+                        (buffer[i * 2] - 127.5f) * inv, 
+                        (buffer[i * 2 + 1] - 127.5f) * inv
+                    );
+                }
+                ringBuffer.push(converted.data(), samples);
+            }
+        }
     }
 
-    void stop() override { 
-        if (running) { 
-            running = false; 
-            if (dev) rtlsdr_cancel_async(dev); 
-            if (worker.joinable()) worker.join(); 
-        } 
+    void start() override {
+        if (running) return;
+        running = true;
+        if (dev) rtlsdr_reset_buffer(dev);
+        worker = std::thread(&RtlSdrSource::workerLoop, this);
     }
 
-    int read(Complex* buffer, int count) override { return ringBuffer.pop(buffer, count); }
+    void stop() override {
+        if (running) {
+            running = false;
+            // W trybie sync thread sam wyjdzie z pętli po zakończeniu read_sync.
+            // rtlsdr_cancel_async nie jest potrzebne (i nie działa dla sync).
+            if (worker.joinable()) worker.join();
+        }
+    }
+
+    int read(Complex* buffer, int count) override { 
+        return ringBuffer.pop(buffer, count); 
+    }
+    
     double getSampleRate() override { return (double)sampleRate; }
     bool isHardware() override { return true; }
     
-    void setCenterFrequency(long long hz) override { 
-        std::lock_guard<std::mutex> lock(hwMtx); 
-        centerFreq = hz; 
-        if (dev && running) rtlsdr_set_center_freq(dev, centerFreq); 
+    // --- Safe Setters (tylko ustawiają flagi dla workera) ---
+    
+    void setCenterFrequency(long long hz) override {
+        // Nie wołamy rtlsdr_... bezpośrednio!
+        pendingCenterFreq = hz;
     }
     
-    void setGain(int db) override { 
-        std::lock_guard<std::mutex> lock(hwMtx); if (!dev || !running) return;
-        if (db == -1) { rtlsdr_set_tuner_gain_mode(dev, 0); } else {
-            rtlsdr_set_tuner_gain_mode(dev, 1); int targetGain = db * 10; int bestGain = 0; int minDiff = 100000;
-            if (!availableGains.empty()) { for (int g : availableGains) { int diff = std::abs(g - targetGain); if (diff < minDiff) { minDiff = diff; bestGain = g; } } } else { bestGain = targetGain; }
-            rtlsdr_set_tuner_gain(dev, bestGain); 
-        } 
+    void setGain(int db) override {
+        // Nie wołamy rtlsdr_... bezpośrednio!
+        pendingGain = db;
     }
     
     void setHardwareOption(std::string name, int value) override {
-        std::lock_guard<std::mutex> lock(hwMtx); if (!dev) return;
+        std::lock_guard<std::mutex> lock(hwMtx);
+        if (!dev) return;
+        // Te funkcje są rzadkie i zazwyczaj bezpieczniejsze, ale idealnie
+        // też powinny być w workerze. Dla uproszczenia zostawiamy tu,
+        // bo rzadko się je zmienia w trakcie pracy.
         if (name == "direct_sampling") { rtlsdr_set_direct_sampling(dev, value); }
         else if (name == "bias_t") { rtlsdr_set_bias_tee(dev, value); }
     }
