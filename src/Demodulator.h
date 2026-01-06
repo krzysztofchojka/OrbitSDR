@@ -80,6 +80,12 @@ public:
     int nbCount = 0;
     double nbResampleAcc = 0.0;
 
+    // --- AGC STATE ---
+    float agcPeak = 0.0f;     
+    float agcGain = 1.0f;     
+    // ZMIANA: static constexpr naprawia błąd operatora przypisania
+    static constexpr float AGC_TARGET = 0.6f; 
+
     // Filters
     Biquad notchL, notchR;
     Biquad cutoffL, cutoffR;
@@ -97,6 +103,10 @@ public:
         wfmSumL = 0.0f; wfmSumR = 0.0f; wfmCount = 0; wfmResampleAcc = 0.0;
         nbSum = Complex(0,0); nbCount = 0; nbResampleAcc = 0.0;
         
+        // Reset AGC
+        agcPeak = 0.0f;
+        agcGain = 1.0f;
+
         pllPhase = 0.0;
         if (sampleRateIn > 0) pllFreq = (19000.0 / sampleRateIn) * 2.0 * PI;
         
@@ -136,7 +146,6 @@ public:
         double resampleRatio = sampleRateIn / sampleRateOut;
         if (resampleRatio < 1.0) resampleRatio = 1.0;
 
-        // 1. Calculate Filter Alphas
         float iqAlpha = 1.0f;
         if (sampleRateIn > 0) {
             iqAlpha = 2.0f * (float)PI * (bandwidthHz / 2.0f) / (float)sampleRateIn;
@@ -166,7 +175,6 @@ public:
             }
         }
 
-        // NCO setup
         double phaseStepAngle = -2.0 * PI * (freqOffset / sampleRateIn);
         Complex ncoStep = std::polar(1.0, phaseStepAngle);
 
@@ -244,14 +252,13 @@ public:
                 
                 wfmResampleAcc += 1.0;
                 if (wfmResampleAcc >= resampleRatio) {
-                    // FIX: Zmniejszono wzmocnienie z 4.0f na 1.5f, aby uniknąć przesterów
+                    // Mniejsze wzmocnienie + soft clip dla WFM
                     float finalL = (wfmSumL / (float)wfmCount) * 1.5f; 
                     float finalR = (wfmSumR / (float)wfmCount) * 1.5f; 
 
                     wfmDcState = 0.995f * wfmDcState + 0.005f * ((finalL + finalR) * 0.5f);
                     finalL -= wfmDcState; finalR -= wfmDcState;
                     
-                    // FIX: Soft Limiter (tanh) zamiast hard clamp. Daje ładniejszy dźwięk przy przesterze.
                     finalL = std::tanh(finalL);
                     finalR = std::tanh(finalR);
 
@@ -262,11 +269,10 @@ public:
                     wfmResampleAcc -= resampleRatio;
                 }
             }
-            // --- NARROWBAND PATH ---
+            // --- NARROWBAND PATH (AM/NFM/SSB) WITH AGC ---
             else {
                 nbSum += processedSample;
                 nbCount++;
-
                 nbResampleAcc += 1.0;
 
                 if (nbResampleAcc >= resampleRatio) {
@@ -299,10 +305,29 @@ public:
                     
                     if (std::isnan(audioLpfState)) audioLpfState = 0.0f;
                     audioLpfState += audioAlpha * (rawAudio - audioLpfState);
-                    audioLpfState = std::clamp(audioLpfState, -1.0f, 1.0f);
+                    
+                    // --- AGC ---
+                    float absAudio = std::abs(audioLpfState);
+                    if (absAudio > agcPeak) {
+                        agcPeak = absAudio; 
+                    } else {
+                        agcPeak *= 0.9995f; 
+                    }
+                    
+                    if (agcPeak < 0.02f) agcPeak = 0.02f;
 
-                    audioOut.push_back(audioLpfState);
-                    audioOut.push_back(audioLpfState);
+                    float targetGain = AGC_TARGET / agcPeak;
+                    if (targetGain > 50.0f) targetGain = 50.0f;
+
+                    agcGain += (targetGain - agcGain) * 0.01f;
+
+                    float finalAudio = audioLpfState * agcGain;
+                    
+                    // Soft clip
+                    finalAudio = std::tanh(finalAudio);
+
+                    audioOut.push_back(finalAudio);
+                    audioOut.push_back(finalAudio);
                 }
             }
         }
