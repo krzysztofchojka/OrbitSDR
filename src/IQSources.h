@@ -582,7 +582,7 @@ public:
     static std::vector<SDRDeviceItem> getDeviceList() { return {}; }
     bool open(std::string id, uint32_t r = 0) override { showPopup("Feature Not Available", "Run ./build.sh and enable SDRPlay."); return false; } void close() override {} void start() override {} void stop() override {} int read(Complex* b, int c) override { return 0; } double getSampleRate() override { return 2000000; } bool isHardware() override { return true; } 
 };
-
+#endif
 // --- SOUND CARD / LINE-IN SOURCE ---
 class AudioCaptureSource : public IQSource {
     ma_context context;
@@ -689,4 +689,3 @@ public:
     std::vector<std::string> getAvailableSampleRatesText() override { return {"48.0 kHz"}; }
     std::vector<uint32_t> getAvailableSampleRatesValues() override { return {48000}; }
 };
-#endif
