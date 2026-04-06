@@ -4,8 +4,9 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <complex>
 
-enum class Mode { AM, NFM, WFM, LSB, USB, OFF };
+enum class Mode { AM, NFM, WFM, LSB, USB, RAW, OFF };
 
 // --- Universal Biquad Filter Structure ---
 struct Biquad {
@@ -81,9 +82,8 @@ public:
     double nbResampleAcc = 0.0;
 
     // --- AGC STATE ---
-    float agcPeak = 0.0f;     
-    float agcGain = 1.0f;     
-    // ZMIANA: static constexpr naprawia błąd operatora przypisania
+    float agcPeak = 0.0f;      
+    float agcGain = 1.0f;      
     static constexpr float AGC_TARGET = 0.6f; 
 
     // Filters
@@ -103,7 +103,6 @@ public:
         wfmSumL = 0.0f; wfmSumR = 0.0f; wfmCount = 0; wfmResampleAcc = 0.0;
         nbSum = Complex(0,0); nbCount = 0; nbResampleAcc = 0.0;
         
-        // Reset AGC
         agcPeak = 0.0f;
         agcGain = 1.0f;
 
@@ -138,6 +137,7 @@ public:
 
         if (sampleRateIn != lastSampleRateCheck) {
              updatePLLParams();
+             lastSampleRateCheck = sampleRateIn;
         }
 
         size_t estimatedOut = (size_t)(rawIQ.size() * sampleRateOut / sampleRateIn) * 2 + 20;
@@ -154,7 +154,7 @@ public:
 
         float audioAlpha = 0.0f; 
         if (sampleRateOut > 0) {
-            audioAlpha = 2.0f * (float)PI * 16000.0f / (float)sampleRateOut;
+            audioAlpha = 2.0f * (float)PI * 4000.0f / (float)sampleRateOut;
             if (audioAlpha > 1.0f) audioAlpha = 1.0f;
         }
         
@@ -163,23 +163,19 @@ public:
             deemphAlpha = 1.0f - std::exp(-1.0f / (sampleRateIn * 75e-6));
         }
 
-        // --- WFM Filter Config ---
-        if (mode == Mode::WFM && (sampleRateIn != lastSampleRateCheck || !filtersConfigured)) {
+        if (mode == Mode::WFM && !filtersConfigured) {
             if (sampleRateIn > 0) {
                 notchL.configureNotch(19000.0f, (float)sampleRateIn, 1.5f);
                 notchR.configureNotch(19000.0f, (float)sampleRateIn, 1.5f);
                 cutoffL.configureLowPass(15500.0f, (float)sampleRateIn, 0.707f);
                 cutoffR.configureLowPass(15500.0f, (float)sampleRateIn, 0.707f);
-                lastSampleRateCheck = sampleRateIn;
                 filtersConfigured = true;
             }
         }
 
         double phaseStepAngle = -2.0 * PI * (freqOffset / sampleRateIn);
         Complex ncoStep = std::polar(1.0, phaseStepAngle);
-
-        Complex sample;
-
+        
         if (!stereoEnabled) {
              pllFreq = (19000.0 / sampleRateIn) * 2.0 * PI;
              pllPhase = 0.0;
@@ -193,6 +189,9 @@ public:
         double pllLimit = (1000.0 / sampleRateIn) * 2.0 * PI; 
         double pllMin = targetPll - pllLimit;
         double pllMax = targetPll + pllLimit;
+
+        // Deklaracja zmiennej (FIX błędu kompilacji)
+        Complex sample; 
 
         for (size_t i = 0; i < rawIQ.size(); i++) {
             sample = rawIQ[i] * currentPhasor;
@@ -218,53 +217,35 @@ public:
                 if (stereoEnabled) {
                     float pilotRef = std::sin(pllPhase);
                     float pllError = mpxSignal * pilotRef;
-                    
                     pllFreq += pllBeta * pllError;
-                    
                     if (pllFreq < pllMin) pllFreq = pllMin;
                     if (pllFreq > pllMax) pllFreq = pllMax;
-
                     pllPhase += pllFreq + pllAlpha * pllError;
-                    
-                    if(pllPhase > 2.0*PI) pllPhase -= 2.0*PI;
-                    else if(pllPhase < 0.0) pllPhase += 2.0*PI;
-
+                    if(pllPhase > 2.0*PI) pllPhase -= 2.0*PI; else if(pllPhase < 0.0) pllPhase += 2.0*PI;
                     float carrier38k = std::sin(2.0 * pllPhase);
                     float l_minus_r = mpxSignal * carrier38k * 2.0f;
-
                     left = (mpxSignal + l_minus_r);
                     right = (mpxSignal - l_minus_r);
                 }
 
                 if (filtersConfigured) {
-                    left = notchL.process(left);
-                    right = notchR.process(right);
-                    left = cutoffL.process(left);
-                    right = cutoffR.process(right);
+                    left = notchL.process(left); right = notchR.process(right);
+                    left = cutoffL.process(left); right = cutoffR.process(right);
                 }
 
                 deemphStateL += deemphAlpha * (left - deemphStateL);
                 deemphStateR += deemphAlpha * (right - deemphStateR);
                 
-                wfmSumL += deemphStateL;
-                wfmSumR += deemphStateR;
-                wfmCount++;
+                wfmSumL += deemphStateL; wfmSumR += deemphStateR; wfmCount++;
                 
                 wfmResampleAcc += 1.0;
                 if (wfmResampleAcc >= resampleRatio) {
-                    // Mniejsze wzmocnienie + soft clip dla WFM
                     float finalL = (wfmSumL / (float)wfmCount) * 1.5f; 
                     float finalR = (wfmSumR / (float)wfmCount) * 1.5f; 
-
                     wfmDcState = 0.995f * wfmDcState + 0.005f * ((finalL + finalR) * 0.5f);
                     finalL -= wfmDcState; finalR -= wfmDcState;
-                    
-                    finalL = std::tanh(finalL);
-                    finalR = std::tanh(finalR);
-
-                    audioOut.push_back(finalL); 
-                    audioOut.push_back(finalR); 
-                    
+                    finalL = std::tanh(finalL); finalR = std::tanh(finalR);
+                    audioOut.push_back(finalL); audioOut.push_back(finalR); 
                     wfmSumL = 0.0f; wfmSumR = 0.0f; wfmCount = 0;
                     wfmResampleAcc -= resampleRatio;
                 }
@@ -296,42 +277,63 @@ public:
                     } 
                     else if (mode == Mode::NFM) {
                         Complex phaseDiff = filtered * std::conj(lastSample);
-                        rawAudio = std::arg(phaseDiff) * 0.15f; 
-                        lastSample = filtered; 
-                    }
-                    else if (mode == Mode::LSB || mode == Mode::USB) {
-                        rawAudio = filtered.real() * 2.0f;
+                        lastSample = filtered;
+                        float phaseDelta = std::arg(phaseDiff);
+
+                        // --- FIX AIS: Normalizacja sygnału ---
+                        if (bandwidthHz > 14000.0) {
+                            // 1. Normalizacja: -PI..PI zamieniamy na -1..1
+                            // To likwiduje "zieloną ścianę" w SDRangel
+                            float normalized = phaseDelta / (float)PI; 
+                            
+                            // 2. Wzmocnienie: GMSK jest ciche, wzmacniamy 5x, ale...
+                            normalized *= 5.0f;
+
+                            // 3. DC Blocker: Żeby sygnał nie "pływał"
+                            static float dataDc = 0.0f;
+                            dataDc = 0.99f * dataDc + 0.01f * normalized;
+                            rawAudio = normalized - dataDc;
+
+                            // 4. Hard Clamp: Bezpiecznik przed przesterem audio karty
+                            rawAudio = std::max(-1.0f, std::min(1.0f, rawAudio));
+
+                            audioLpfState = rawAudio;
+                        } else {
+                            // GŁOS:
+                            rawAudio = phaseDelta * 0.15f; 
+                            if (std::isnan(audioLpfState)) audioLpfState = 0.0f;
+                            audioLpfState += audioAlpha * (rawAudio - audioLpfState);
+                        }
+                    } else if (mode == Mode::LSB || mode == Mode::USB || mode == Mode::RAW) {
+                        rawAudio = filtered.real();
+                        if (mode != Mode::RAW) {
+                            rawAudio *= 2.0f; // Podbicie dla radia
+                            audioLpfState += audioAlpha * (rawAudio - audioLpfState); // Filtr audio (tnący wysokie tony)
+                        }
                     }
                     
-                    if (std::isnan(audioLpfState)) audioLpfState = 0.0f;
-                    audioLpfState += audioAlpha * (rawAudio - audioLpfState);
-                    
-                    // --- AGC ---
-                    float absAudio = std::abs(audioLpfState);
-                    if (absAudio > agcPeak) {
-                        agcPeak = absAudio; 
+                    float finalAudio;
+                    if (mode == Mode::NFM && bandwidthHz > 14000.0) {
+                        finalAudio = audioLpfState;
+                    } else if (mode == Mode::RAW) {
+                        finalAudio = rawAudio; // Czysty, nienaruszony sygnał prosto z karty!
                     } else {
-                        agcPeak *= 0.9995f; 
+                        // Standardowe AGC dla głosu
+                        float absAudio = std::abs(audioLpfState);
+                        if (absAudio > agcPeak) agcPeak = absAudio; else agcPeak *= 0.9995f;
+                        if (agcPeak < 0.02f) agcPeak = 0.02f;
+                        float targetGain = AGC_TARGET / agcPeak;
+                        if (targetGain > 50.0f) targetGain = 50.0f;
+                        agcGain += (targetGain - agcGain) * 0.01f;
+                        finalAudio = audioLpfState * agcGain;
+                        finalAudio = std::tanh(finalAudio);
                     }
-                    
-                    if (agcPeak < 0.02f) agcPeak = 0.02f;
-
-                    float targetGain = AGC_TARGET / agcPeak;
-                    if (targetGain > 50.0f) targetGain = 50.0f;
-
-                    agcGain += (targetGain - agcGain) * 0.01f;
-
-                    float finalAudio = audioLpfState * agcGain;
-                    
-                    // Soft clip
-                    finalAudio = std::tanh(finalAudio);
 
                     audioOut.push_back(finalAudio);
                     audioOut.push_back(finalAudio);
                 }
             }
         }
-        
         return audioOut;
     }
 };

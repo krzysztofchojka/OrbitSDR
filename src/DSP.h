@@ -38,3 +38,48 @@ inline std::vector<double> makeWindow(size_t size) {
     }
     return w;
 }
+
+// --- CHANNELIZER (Uniwersalne DDC) ---
+// Wyciąga wąski kanał z szerokiego pasma
+class Channelizer {
+    std::complex<double> ncoPhase = {1.0, 0.0};
+    std::complex<double> ncoStep = {1.0, 0.0};
+    std::complex<double> decimSum = {0.0, 0.0};
+    int decimCount = 0;
+    int decimFactor = 1;
+
+public:
+    void configure(double inputRate, double targetRate) {
+        decimFactor = (int)(inputRate / targetRate);
+        if (decimFactor < 1) decimFactor = 1;
+        decimSum = {0,0};
+        decimCount = 0;
+    }
+
+    void setCenter(double offsetHz, double sampleRate) {
+        double angle = -2.0 * PI * (offsetHz / sampleRate);
+        ncoStep = std::polar(1.0, angle);
+    }
+
+    // Zwraca true jeśli mamy nową próbkę wyjściową
+    inline bool process(const std::complex<double>& in, std::complex<float>& out) {
+        // 1. Mixer
+        std::complex<double> mixed = in * ncoPhase;
+        ncoPhase *= ncoStep;
+        
+        // Normalizacja wektora co jakiś czas
+        if (std::abs(ncoPhase.real()) > 2.0) ncoPhase /= std::abs(ncoPhase); 
+        
+        // 2. Decimator
+        decimSum += mixed;
+        decimCount++;
+
+        if (decimCount >= decimFactor) {
+            out = std::complex<float>((float)decimSum.real() / decimFactor, (float)decimSum.imag() / decimFactor);
+            decimSum = {0,0};
+            decimCount = 0;
+            return true;
+        }
+        return false;
+    }
+};

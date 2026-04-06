@@ -44,6 +44,10 @@ public:
     virtual bool isSeekable() { return false; } 
     virtual void seek(double percent) {}
     virtual double getProgress() { return 0.0; }
+
+    // --- NOWOŚĆ: Wykrywanie zapętlenia ---
+    // Zwraca true tylko raz, w momencie gdy plik wrócił na początek
+    virtual bool didLoop() { return false; }
 };
 
 // --- ROBUST FILE SOURCE (WAV Parser) ---
@@ -56,6 +60,9 @@ class FileSource : public IQSource {
     uint16_t channels = 2;
     uint64_t currentBytePos = 0; // Aktualna pozycja względem dataStart
     bool active = false;
+    
+    // Flaga zapętlenia
+    bool looped = false;
 
 public:
     bool open(std::string path, uint32_t requestedRate = 0) override {
@@ -153,6 +160,9 @@ public:
 
     int read(Complex* out, int count) override {
         if (!file.is_open()) return 0;
+        
+        // Reset flagi zapętlenia na początku odczytu
+        looped = false;
 
         // Oblicz ile bajtów czytać
         int bytesPerSampleTotal = (bitsPerSample / 8) * channels;
@@ -171,6 +181,8 @@ public:
             file.clear();
             file.seekg(dataStart);
             currentBytePos = 0;
+            // Ustaw flagę zapętlenia - main.cpp to odczyta i zresetuje dekoder
+            looped = true; 
         }
 
         // KONWERSJA DO FLOAT
@@ -217,6 +229,8 @@ public:
         return samplesRead;
     }
 
+    bool didLoop() override { return looped; }
+
     double getSampleRate() override { return (double)sampleRate; }
     bool isSeekable() override { return true; }
 
@@ -234,6 +248,9 @@ public:
         file.clear();
         file.seekg(dataStart + targetByte);
         currentBytePos = targetByte;
+        
+        // Przy manualnym seekowaniu też warto zasygnalizować reset
+        looped = true;
     }
 
     double getProgress() override {
@@ -247,8 +264,7 @@ public:
     std::vector<uint32_t> getAvailableSampleRatesValues() override { return {0}; }
 };
 
-// --- RTL-SDR SOURCE (Bez zmian) ---
-// --- RTL-SDR SOURCE (FIXED FOR V4: SYNC READ) ---
+// --- RTL-SDR SOURCE ---
 class RtlSdrSource : public IQSource {
     rtlsdr_dev_t* dev = nullptr;
     std::thread worker;
@@ -294,16 +310,13 @@ public:
         
         if (requestedRate > 0) sampleRate = requestedRate; else sampleRate = 2048000;
         
-        // --- FIX NA AGC ---
         // Zamiast 0 (brak zmiany freq), ustawiamy aktualną, żeby worker ją wymusił
         pendingCenterFreq = currentCenterFreq.load(); 
         
         // Zamiast -999 (brak zmiany gainu), ustawiamy -1 (AGC).
-        // To zmusi pętlę workera do jawnego wywołania rtlsdr_set_tuner_gain_mode(dev, 0)
-        // w pierwszym przebiegu pętli.
         pendingGain = -1; 
         
-        // Te wywołania bezpośrednie zostawiamy jako "fallback", ale to worker wykona właściwą robotę
+        // Te wywołania bezpośrednie zostawiamy jako "fallback"
         rtlsdr_set_sample_rate(dev, sampleRate);
         rtlsdr_set_center_freq(dev, currentCenterFreq);
         rtlsdr_set_tuner_gain_mode(dev, 0); 
@@ -326,7 +339,7 @@ public:
         }
     }
 
-    // --- NEW WORKER LOOP (SYNC) ---
+    // --- WORKER LOOP (SYNC) ---
     void workerLoop() {
         std::vector<uint8_t> buffer(USB_BUFFER_SIZE);
         const float inv = 1.0f / 127.5f;
@@ -365,7 +378,6 @@ public:
             // 3. Odczyt synchroniczny (blokuje na chwilę, ale bezpiecznie)
             int n_read = 0;
             if (rtlsdr_read_sync(dev, buffer.data(), USB_BUFFER_SIZE, &n_read) < 0) {
-                // Błąd odczytu (np. urządzenie odłączone)
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
@@ -396,8 +408,6 @@ public:
     void stop() override {
         if (running) {
             running = false;
-            // W trybie sync thread sam wyjdzie z pętli po zakończeniu read_sync.
-            // rtlsdr_cancel_async nie jest potrzebne (i nie działa dla sync).
             if (worker.joinable()) worker.join();
         }
     }
@@ -409,24 +419,17 @@ public:
     double getSampleRate() override { return (double)sampleRate; }
     bool isHardware() override { return true; }
     
-    // --- Safe Setters (tylko ustawiają flagi dla workera) ---
-    
     void setCenterFrequency(long long hz) override {
-        // Nie wołamy rtlsdr_... bezpośrednio!
         pendingCenterFreq = hz;
     }
     
     void setGain(int db) override {
-        // Nie wołamy rtlsdr_... bezpośrednio!
         pendingGain = db;
     }
     
     void setHardwareOption(std::string name, int value) override {
         std::lock_guard<std::mutex> lock(hwMtx);
         if (!dev) return;
-        // Te funkcje są rzadkie i zazwyczaj bezpieczniejsze, ale idealnie
-        // też powinny być w workerze. Dla uproszczenia zostawiamy tu,
-        // bo rzadko się je zmienia w trakcie pracy.
         if (name == "direct_sampling") { rtlsdr_set_direct_sampling(dev, value); }
         else if (name == "bias_t") { rtlsdr_set_bias_tee(dev, value); }
     }
@@ -441,7 +444,6 @@ public:
 #ifndef sdrplay_api_Update_None
     #define sdrplay_api_Update_None (sdrplay_api_ReasonForUpdateT)0
 #endif
-// DEFINE TYPU EXTENSION DLA 4 ARGUMENTU
 #ifndef sdrplay_api_Update_Ext1_None
     #define sdrplay_api_Update_Ext1_None (sdrplay_api_ReasonForUpdateExtension1T)0
 #endif
@@ -533,7 +535,6 @@ public:
     double getSampleRate() override { return sampleRate; }
     bool isHardware() override { return true; }
     
-    // --- FIX: Używamy sdrplay_api_Update_Ext1_None jako 4. argumentu ---
     void setCenterFrequency(long long hz) override { 
         std::lock_guard<std::mutex> lock(hwMtx); 
         centerFreq = hz; 
@@ -543,7 +544,6 @@ public:
         } 
     }
     
-    // --- FIX: Używamy sdrplay_api_Update_Ext1_None jako 4. argumentu ---
     void setGain(int db) override {
         std::lock_guard<std::mutex> lock(hwMtx); if (!running || !deviceParams) return;
         if (db == -1) { 
@@ -567,7 +567,6 @@ public:
                 if (value == 0) deviceParams->devParams->rspDxParams.antennaSel = sdrplay_api_RspDx_ANTENNA_A; 
                 if (value == 1) deviceParams->devParams->rspDxParams.antennaSel = sdrplay_api_RspDx_ANTENNA_B; 
                 if (value == 2) deviceParams->devParams->rspDxParams.antennaSel = sdrplay_api_RspDx_ANTENNA_C; 
-                // Tu też 4 argument:
                 sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_None, sdrplay_api_Update_RspDx_AntennaControl);
             }
         }
@@ -582,5 +581,112 @@ class SdrPlaySource : public IQSource {
 public: 
     static std::vector<SDRDeviceItem> getDeviceList() { return {}; }
     bool open(std::string id, uint32_t r = 0) override { showPopup("Feature Not Available", "Run ./build.sh and enable SDRPlay."); return false; } void close() override {} void start() override {} void stop() override {} int read(Complex* b, int c) override { return 0; } double getSampleRate() override { return 2000000; } bool isHardware() override { return true; } 
+};
+
+// --- SOUND CARD / LINE-IN SOURCE ---
+class AudioCaptureSource : public IQSource {
+    ma_context context;
+    ma_device device;
+    bool isInitialized = false;
+    RingBuffer<Complex> ringBuffer;
+    uint32_t sampleRate = 48000;
+    std::atomic<bool> running{false};
+
+    static void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
+        AudioCaptureSource* src = (AudioCaptureSource*)pDevice->pUserData;
+        if (!src->running) return;
+        
+        const float* in = (const float*)pInput;
+        std::vector<Complex> chunk(frameCount);
+        int channels = pDevice->capture.channels;
+        
+        for (ma_uint32 i = 0; i < frameCount; i++) {
+            // Miksowanie ewentualnego stereo do mono
+            float mono = (channels == 2) ? (in[i * 2] + in[i * 2 + 1]) * 0.5f : in[i];
+            
+            // Wkładamy sygnał audio w część rzeczywistą (I). Część urojona (Q) = 0
+            chunk[i] = Complex(mono, 0.0);
+        }
+        src->ringBuffer.push(chunk.data(), frameCount);
+    }
+
+public:
+    AudioCaptureSource() : ringBuffer(8 * 1024 * 1024) {
+        ma_context_init(NULL, 0, NULL, &context);
+    }
+    
+    ~AudioCaptureSource() { 
+        close(); 
+        ma_context_uninit(&context); 
+    }
+
+    static std::vector<SDRDeviceItem> getDeviceList() {
+        std::vector<SDRDeviceItem> list;
+        ma_context ctx;
+        if (ma_context_init(NULL, 0, NULL, &ctx) == MA_SUCCESS) {
+            ma_device_info* pPlaybackInfos;
+            ma_uint32 playbackCount;
+            ma_device_info* pCaptureInfos;
+            ma_uint32 captureCount;
+            
+            if (ma_context_get_devices(&ctx, &pPlaybackInfos, &playbackCount, &pCaptureInfos, &captureCount) == MA_SUCCESS) {
+                for (ma_uint32 i = 0; i < captureCount; i++) {
+                    SDRDeviceItem item;
+                    item.name = pCaptureInfos[i].name;
+                    item.id = std::to_string(i); // Zapisujemy indeks jako ID
+                    list.push_back(item);
+                }
+            }
+            ma_context_uninit(&ctx);
+        }
+        return list;
+    }
+
+    bool open(std::string id, uint32_t requestedRate = 0) override {
+        close();
+        sampleRate = (requestedRate > 0) ? requestedRate : 48000;
+
+        ma_device_config config = ma_device_config_init(ma_device_type_capture);
+        config.capture.format = ma_format_f32;
+        config.capture.channels = 2; // Zawsze bierzemy 2 kanały i robimy mix do mono ręcznie
+        config.sampleRate = sampleRate;
+        config.dataCallback = data_callback;
+        config.pUserData = this;
+
+        int devIdx = -1;
+        try { devIdx = std::stoi(id); } catch(...) {}
+
+        if (devIdx >= 0) {
+            ma_device_info* pPlaybackInfos;
+            ma_uint32 playbackCount;
+            ma_device_info* pCaptureInfos;
+            ma_uint32 captureCount;
+            if (ma_context_get_devices(&context, &pPlaybackInfos, &playbackCount, &pCaptureInfos, &captureCount) == MA_SUCCESS) {
+                if (devIdx < (int)captureCount) {
+                    config.capture.pDeviceID = &pCaptureInfos[devIdx].id;
+                }
+            }
+        }
+
+        if (ma_device_init(&context, &config, &device) != MA_SUCCESS) return false;
+        isInitialized = true;
+        return true;
+    }
+
+    void close() override {
+        stop();
+        if (isInitialized) {
+            ma_device_uninit(&device);
+            isInitialized = false;
+        }
+    }
+
+    void start() override { if (isInitialized && !running) { running = true; ma_device_start(&device); } }
+    void stop() override { if (isInitialized && running) { running = false; ma_device_stop(&device); } }
+    int read(Complex* buffer, int count) override { return ringBuffer.pop(buffer, count); }
+    double getSampleRate() override { return sampleRate; }
+    
+    std::vector<std::string> getAvailableSampleRatesText() override { return {"48.0 kHz"}; }
+    std::vector<uint32_t> getAvailableSampleRatesValues() override { return {48000}; }
 };
 #endif

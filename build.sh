@@ -53,7 +53,14 @@ FINAL_INCLUDES="$FINAL_INCLUDES $CXXFLAGS"
 FINAL_LIBS="$FINAL_LIBS $LDFLAGS"
 
 echo "Compiling binary..."
-$CXX -std=c++17 -O3 $SDR_FLAGS $FINAL_INCLUDES $SRC_DIR/main.cpp -o $OUT_FILE $FINAL_LIBS $EXTRAS
+# Znajdź wszystkie pliki .cpp w src/modules
+MODULE_SOURCES=$(find src/modules -name "*.cpp")
+
+echo "Compiling with modules: $MODULE_SOURCES"
+
+$CXX -std=c++17 -O3 $SDR_FLAGS $FINAL_INCLUDES \
+    $SRC_DIR/main.cpp $MODULE_SOURCES \
+    -o $OUT_FILE $FINAL_LIBS $EXTRAS
 
 if [ $? -ne 0 ]; then
     echo "COMPILATION FAILED."
@@ -130,6 +137,8 @@ if [ "$IS_MACOS" = true ]; then
     <string>APPL</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>OrbitSDR requires audio access to use Line-In and Sound Card sources.</string>
 </dict>
 </plist>
 EOF
@@ -137,13 +146,30 @@ EOF
     # Copy fonts if available
     if ls *.ttf >/dev/null 2>&1; then cp *.ttf "$APP_BUNDLE/Contents/MacOS/"; fi
 
-    # Signing
+    # Signing with Entitlements
     echo "Signing app..."
+
+    # Generowanie pliku Entitlements dla mikrofonu
+    cat > entitlements.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
     if [ -d "$APP_BUNDLE/Contents/Frameworks" ]; then
         codesign --force --sign - "$APP_BUNDLE/Contents/Frameworks/"* 2>/dev/null
     fi
-    codesign --force --deep --sign - "$APP_BUNDLE"
 
+    # Podpisanie aplikacji z uwzględnieniem Entitlements
+    codesign --force --deep --entitlements entitlements.plist --sign - "$APP_BUNDLE"
+
+    # Sprzątanie
+    rm entitlements.plist
     echo "Bundle created: $APP_BUNDLE"
 
 else

@@ -179,7 +179,9 @@ jobs:
             <string>1.0</string>
             <key>NSHighResolutionCapable</key>
             <true/>
-        </dict>
+            <key>NSMicrophoneUsageDescription</key>
+            <string>OrbitSDR requires audio access to use Line-In and Sound Card sources.</string>
+          </dict>
         </plist>
         EOF
 

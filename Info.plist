@@ -14,5 +14,7 @@
     <string>APPL</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>CFBundlePackageType</key>
+    <string>OrbitSDR requires audio access to use Line-In and Sound Card sources.</string>
 </dict>
 </plist>
