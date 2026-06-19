@@ -175,15 +175,15 @@ struct SharedData {
     float zoomLevel = 1.0f;
     int waterfallTheme = 0;
     
-    // --- NOWE POLA DLA INSPEKTORA ---
-    std::vector<double> inspectorSpectrum; // Widmo pasma podstawowego
-    std::vector<uint8_t> inspectorWaterfallRow; // Jeden wiersz waterfalla
+    // --- NEW FIELDS FOR INSPECTOR ---
+    std::vector<double> inspectorSpectrum; // Baseband spectrum
+    std::vector<uint8_t> inspectorWaterfallRow; // Single waterfall row
     bool newInspectorData = false;
     
     SharedData() : fftSpectrum(FFT_SIZE, -100.0), 
                    waterfallRow(INTERNAL_WATERFALL_WIDTH * 4, 0),
-                   inspectorSpectrum(FFT_SIZE/2, -100.0), // Mniejsze FFT dla inspektora wystarczy
-                   inspectorWaterfallRow(280 * 4, 0) {}   // Szerokość modułu w sidebarze
+                   inspectorSpectrum(FFT_SIZE/2, -100.0), // Smaller FFT is sufficient for the inspector
+                   inspectorWaterfallRow(280 * 4, 0) {}   // Sidebar module width
 };
 
 std::mutex sourceMtx; std::shared_ptr<IQSource> currentSource;
@@ -244,11 +244,11 @@ class InspectorDSP {
     std::vector<Complex> buffer;
     std::vector<double> windowFunc;
     
-    // Akumulator do decymacji (filtr Boxcar)
+    // Decimation accumulator (Boxcar filter)
     Complex decimSum = {0,0};
     int decimCount = 0;
     
-    const int INSPECTOR_FFT_SIZE = 512; // Mniejsze FFT dla małego okienka
+    const int INSPECTOR_FFT_SIZE = 512; // Smaller FFT for the small window
 
 public:
     InspectorDSP() {
@@ -257,28 +257,28 @@ public:
     }
 
     void process(const std::vector<Complex>& rawIQ, double sampleRate, double targetFreqOffset, double bandwidth, SharedData& shared) {
-        // 1. Oblicz Decimation Factor
-        // Chcemy, aby bandwidth zajmował większość widoku.
-        // Target Sample Rate = Bandwidth * 1.2 (margines)
+        // 1. Calculate Decimation Factor
+        // We want the bandwidth to occupy most of the view.
+        // Target Sample Rate = Bandwidth * 1.2 (margin)
         if (bandwidth < 100.0) bandwidth = 100.0;
         double targetRate = bandwidth * 1.2;
         int decimation = (int)(sampleRate / targetRate);
         if (decimation < 1) decimation = 1;
 
-        // 2. Skonfiguruj NCO (Mixer) do przesunięcia częstotliwości na 0 Hz
+        // 2. Configure NCO (Mixer) to shift frequency to 0 Hz
         double angle = -2.0 * PI * (targetFreqOffset / sampleRate);
         ncoStep = std::polar(1.0, angle);
 
-        // 3. Pętla przetwarzania (Mixer -> Decimator)
+        // 3. Processing loop (Mixer -> Decimator)
         for (const auto& s : rawIQ) {
             // A. Mixer (Frequency Shift)
             Complex mixed = s * ncoPhase;
             ncoPhase *= ncoStep;
             
-            // Normalizacja wektora fazy co jakiś czas
+            // Normalize phase vector periodically
             if (std::abs(ncoPhase.real()) > 2.0) ncoPhase /= std::abs(ncoPhase);
 
-            // B. Decymacja (Boxcar Filter - najprostszy anty-aliasing)
+            // B. Decimation (Boxcar Filter - simplest anti-aliasing)
             decimSum += mixed;
             decimCount++;
 
@@ -289,12 +289,12 @@ public:
 
                 buffer.push_back(outSample);
 
-                // C. Jeśli mamy dość próbek -> Rób FFT
+                // C. If we have enough samples -> Perform FFT
                 if (buffer.size() >= INSPECTOR_FFT_SIZE) {
                     performFFT(shared);
                     buffer.clear();
                     
-                    // Reset NCO aby uniknąć problemów numerycznych przy długim działaniu
+                    // Reset NCO to avoid numerical issues during long runs
                     double m = std::abs(ncoPhase);
                     ncoPhase /= m;
                 }
@@ -306,13 +306,13 @@ private:
     void performFFT(SharedData& shared) {
         std::vector<Complex> fftData = buffer;
         
-        // Okienkowanie
+        // Windowing
         for(size_t i=0; i<INSPECTOR_FFT_SIZE; i++) fftData[i] *= windowFunc[i];
         
         // FFT
         fft(fftData);
 
-        // Konwersja na dB i przesunięcie (fftshift)
+        // Conversion to dB and shift (fftshift)
         std::vector<double> spectrum(INSPECTOR_FFT_SIZE);
         for(size_t i=0; i<INSPECTOR_FFT_SIZE; i++) {
             int shiftIdx = (i + INSPECTOR_FFT_SIZE/2) % INSPECTOR_FFT_SIZE;
@@ -320,8 +320,8 @@ private:
             spectrum[i] = 20.0 * std::log10(mag + 1e-12);
         }
 
-        // Generowanie wiersza Waterfalla od razu tutaj (na wątku DSP)
-        // Szerokość obrazka w GUI to np. 280px
+        // Generate Waterfall row immediately here (on DSP thread)
+        // GUI image width is e.g. 280px
         int width = 280;
         std::vector<uint8_t> row(width * 4);
         
@@ -335,7 +335,7 @@ private:
         }
 
         for(int x=0; x<width; x++) {
-            // Proste mapowanie liniowe (nearest neighbor lub linear)
+            // Simple linear mapping (nearest neighbor or linear)
             int fftIdx = (x * INSPECTOR_FFT_SIZE) / width;
             if (fftIdx >= INSPECTOR_FFT_SIZE) fftIdx = INSPECTOR_FFT_SIZE - 1;
             
@@ -349,7 +349,7 @@ private:
             row[x*4+3] = 255;
         }
 
-        // Wypchnięcie do GUI
+        // Push to GUI
         {
             std::lock_guard<std::mutex> l(shared.mtx);
             shared.inspectorSpectrum = spectrum;
@@ -422,13 +422,13 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
         if (iqBuffer.size() != chunkSize) iqBuffer.resize(chunkSize);
         int readCount = src->read(iqBuffer.data(), chunkSize);
         if (src->didLoop()) {
-            demod.clear(); // Resetuj audio demodulator
+            demod.clear(); // Reset audio demodulator
             
-            // Resetuj moduł AIS
+            // Reset AIS module
             SDRModule* activeMod = nullptr;
             { std::lock_guard<std::mutex> l(shared.mtx); activeMod = shared.activeDecoder; }
             if (activeMod) {
-                // TU BYŁ BŁĄD Z 'font' - TERAZ UŻYWAMY 'reset()'
+                // THERE WAS A 'font' BUG HERE - NOW USING 'reset()'
                 activeMod->reset(); 
             }
         }
@@ -440,20 +440,20 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
             for (size_t i = 0; i < FFT_SIZE && (i + offset) < readCount; i++) fftData[i] = iqBuffer[i + offset] * winFunc[i];
             fft(fftData);
 
-            // --- NOWA SEKCJA INSPEKTORA ---
-            // 1. Oblicz offset częstotliwości (gdzie celujemy)
-            // tunedFreqPercent to 0.0-1.0 względem całego pasma
+            // --- NEW INSPECTOR SECTION ---
+            // 1. Calculate frequency offset (where we are tuning)
+            // tunedFreqPercent is 0.0-1.0 relative to the whole band
             double offsetFromCenter = (targetFreqPct - 0.5) * sr;
             
-            // Poprawka dla USB/LSB (środek pasma jest przesunięty)
+            // Correction for USB/LSB (band center is shifted)
             double inspectorTarget = offsetFromCenter;
             if (mode == Mode::USB) inspectorTarget += bw / 2.0;
             if (mode == Mode::LSB) inspectorTarget -= bw / 2.0;
 
-            // 2. Przekaż do Inspektora (przeskaluj IQBuffer do std::vector)
+            // 2. Pass to Inspector (scale IQBuffer to std::vector)
             std::vector<Complex> chunk(iqBuffer.begin(), iqBuffer.begin() + readCount);
             
-            // To wygeneruje nowe, dokładne FFT i wstawi do sharedData
+            // This generates a new, accurate FFT and inserts it into sharedData
             inspector.process(chunk, sr, inspectorTarget, bw, shared);
             
             // -----------------------------
@@ -472,7 +472,7 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
                     // targetFreqPct is 0.0 (left) to 1.0 (right) of the bandwidth
                     double centerOffset = (targetFreqPct - 0.5) * sr;
 
-                    // --- DODAJ TEN LOG TYMCZASOWO ---
+                    // --- ADD THIS LOG TEMPORARILY ---
                     static int logLimiter = 0;
                     if (logLimiter++ % 20 == 0) {
                         std::cout << "[MAIN DEBUG] Center Freq: " << shared.centerFreq 
@@ -626,7 +626,7 @@ int main() {
     // AIS Checkbox (New Module)
     auto chkAIS = std::make_shared<Checkbox>("Enable AIS (162.025)", font);
 
-    // ZMIEŃ INICJALIZACJĘ PRZYCISKÓW NA:
+    // CHANGE BUTTON INITIALIZATION TO:
     auto btnNFM = std::make_shared<SdrButton>(36, 25, "NFM", font);
     auto btnAM = std::make_shared<SdrButton>(36, 25, "AM", font);
     auto btnWFM = std::make_shared<SdrButton>(36, 25, "WFM", font);
@@ -755,7 +755,7 @@ int main() {
             success = audioIn->open(deviceID, targetRate);
             newSource = audioIn;
             
-            currentCenterFreq = 0; // Karta dźwiękowa nie ma VFO
+            currentCenterFreq = 0; // Sound card has no VFO
             freqVFO.setFrequency(currentCenterFreq);
             {
                 std::lock_guard<std::mutex> l(sharedData.mtx);
@@ -889,7 +889,7 @@ int main() {
                 previousMode = sharedData.mode;
             }
 
-            // Sprawdzamy, czy wybrane źródło to Line-In / Sound Card
+            // Check if selected source is Line-In / Sound Card
             bool isAudioIn = (currentSourceType == 3);
 
             btnNFM->setActive(!isAudioIn);
@@ -939,7 +939,7 @@ int main() {
             ptrAIS->enabled = true;
             previousMode = sharedData.mode;
 
-            // Sprawdzamy, czy wybrane źródło to Line-In / Sound Card
+            // Check if selected source is Line-In / Sound Card
             bool isAudioIn = (currentSourceType == 3);
 
             sharedData.mode = isAudioIn ? Mode::RAW : Mode::NFM;
@@ -1042,15 +1042,15 @@ int main() {
     // --- MINI WATERFALL ---
     const int MINI_W = 280;
     const int MINI_H = 120;
-    std::vector<uint8_t> miniWaterfall(MINI_W * MINI_H * 4, 0); // Czarny start
+    std::vector<uint8_t> miniWaterfall(MINI_W * MINI_H * 4, 0); // Black start
     sf::Texture miniTex; 
-    // Rzutowanie na void ucisza ostrzeżenie
+    // Casting to void silences the warning
 (void)miniTex.resize({(unsigned int)MINI_W, (unsigned int)MINI_H});
     sf::Sprite miniSpr(miniTex);
     
-    // Dodaj do sidebara
+    // Add to sidebar
     auto modInspector = sidebar.addModule("Signal Inspector");
-    auto spacer = std::make_shared<Spacer>(130.0f); // 120px (MINI_H) + 10px marginesu
+    auto spacer = std::make_shared<Spacer>(130.0f); // 120px (MINI_H) + 10px margin
     modInspector->addWidget(spacer);
 
     std::vector<std::uint8_t> waterfall(INTERNAL_WATERFALL_WIDTH * 2048 * 4, 0); sf::Texture wTex; if(!wTex.resize({INTERNAL_WATERFALL_WIDTH, 2048})) return 1; sf::Sprite wSpr(wTex); 
@@ -1188,54 +1188,53 @@ int main() {
             if (btnPlay.isClicked(*ev, window)) { bool s; { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.isPlaying = !sharedData.isPlaying; s = sharedData.isPlaying; } if (s) { btnPlay.setText("||"); btnPlay.setActive(true); audio.start(); { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->start(); } } else { btnPlay.setText(">"); btnPlay.setActive(false); audio.stop(); { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->stop(); } } topBarHandled = true; }
             if (isHw && btnTuningMode.isClicked(*ev, window)) { stickyCenterMode = !stickyCenterMode; if(stickyCenterMode) { btnTuningMode.setText("CTR"); btnTuningMode.setActive(true); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } pendingCenterFreq = freqVFO.getFrequency(); debouncer.restart(); } else { btnTuningMode.setText("FIX"); btnTuningMode.setActive(false); } topBarHandled = true; }
             
-            // Usunięto warunek "isHw &&" - teraz działa też dla plików
             if (freqVFO.handleEvent(*ev)) { 
                 topBarHandled = true;
                 long long targetVFO = freqVFO.getFrequency();
                 
-                // Obliczamy limity pasma (zależne od Sample Rate źródła)
+                // Calculate band limits (dependent on source Sample Rate)
                 double halfBW = hwSampleRate / 2.0;
                 double minF = (double)currentCenterFreq - halfBW;
                 double maxF = (double)currentCenterFreq + halfBW;
                 
-                // Zabezpieczenie pasma działa tylko dla plików lub programowego "Software Tuning"
+                // Band protection only works for files or "Software Tuning"
                 if (stickyCenterMode && isHw) {
                     pendingCenterFreq = targetVFO;
                     debouncer.restart();
                     { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; }
                 } else {
-                    // Tryb Software Tuning / Plik
+                    // Software Tuning / File mode
                     if (targetVFO > maxF || targetVFO < minF) {
                         if (isHw) {
-                            // Wyszliśmy poza ekran! Automatycznie przestrajamy sprzęt za myszką
+                            // We went off-screen! Automatically re-tune hardware following the mouse
                             pendingCenterFreq = targetVFO;
                             debouncer.restart();
                             { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; }
                         } else {
-                            // Dla odtwarzania z nagranego pliku WAV nie możemy przestroić sprzętu, więc tu ucinamy
+                            // For WAV file playback, we cannot re-tune hardware, so we clamp here
                             if (targetVFO > maxF) targetVFO = (long long)maxF;
                             if (targetVFO < minF) targetVFO = (long long)minF;
                             double newOffset = (double)(targetVFO - currentCenterFreq);
                             { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5 + (newOffset / hwSampleRate); }
                         }
                     } else {
-                        // Jesteśmy w granicach widocznego ekranu, przesuwamy tylko pasek
+                        // We are within the visible screen limits, just move the tuning bar
                         double newOffset = (double)(targetVFO - currentCenterFreq);
                         { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5 + (newOffset / hwSampleRate); }
                     }
                 }
                 
-                // Aktualizuj widget, jeśli musieliśmy przyciąć wartość
+                // Update widget if we had to clamp the value
                 if (targetVFO != freqVFO.getFrequency()) freqVFO.setFrequency(targetVFO);
 
                 if (stickyCenterMode && isHw) { 
-                    // Tryb sprzętowy (zmienia fizyczną częstotliwość radia)
+                    // Hardware mode (changes physical radio frequency)
                     pendingCenterFreq = targetVFO; 
                     debouncer.restart(); 
                     { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } 
                 } else { 
-                    // Tryb plikowy / Software Tuning
-                    // Obliczamy, w którym miejscu widma jest nowa częstotliwość (0.0 - 1.0)
+                    // File mode / Software Tuning
+                    // Calculate where the new frequency is in the spectrum (0.0 - 1.0)
                     double newOffset = (double)(targetVFO - currentCenterFreq);
                     double pct = 0.5 + (newOffset / hwSampleRate); 
                     
@@ -1301,7 +1300,7 @@ int main() {
                     bool overTimeline = (currentSourceType == 0) && (timeSlider.isDragging || (m.y > layout.winH - 40)); 
                     bool inFreqScaleZone = (m.y >= TOP_BAR_H + layout.specH - 10 && m.y <= TOP_BAR_H + layout.specH + 20 && m.x < layout.specW); 
                     
-                    // Obliczanie krawędzi pasma (BW)
+                    // Calculate band edges (BW)
                     double offsetFromCenter = (tunePct - 0.5); 
                     float visualCenterX = (0.5 + (offsetFromCenter * currentZoom)) * layout.specW; 
                     float bwPixels = (slBW->currentVal / (hwSampleRate / currentZoom)) * layout.specW; 
@@ -1383,7 +1382,7 @@ int main() {
 
         if (isDraggingBW && cursorSizeH) { window.setMouseCursor(*cursorSizeH); } else if (showHand && cursorHand) { window.setMouseCursor(*cursorHand); } else if (cursorArrow) { window.setMouseCursor(*cursorArrow); }
 
-        // --- AKTUALIZACJA INSPEKTORA (BEZPIECZNA PAMIĘCIOWO) ---
+        // --- INSPECTOR UPDATE (MEMORY SAFE) ---
         std::vector<uint8_t> newRow;
         bool hasData = false;
         {
@@ -1396,10 +1395,10 @@ int main() {
         }
 
         if (hasData) {
-            // FIX: Sprawdź czy rozmiar jest poprawny przed memcpy!
-            // Chroni przed crashem, jeśli wątek DSP wyśle dane o innym rozmiarze
+            // FIX: Check if size is correct before memcpy!
+            // Protects against crash if DSP thread sends data of a different size
             if (newRow.size() == MINI_W * 4) {
-                // Scroll w dół
+                // Scroll down
                 if (MINI_H > 1) {
                     std::memmove(
                         miniWaterfall.data() + MINI_W * 4, 
@@ -1407,7 +1406,7 @@ int main() {
                         (MINI_H - 1) * MINI_W * 4
                     );
                 }
-                // Wstaw nowy wiersz na górę
+                // Insert new row at the top
                 std::memcpy(miniWaterfall.data(), newRow.data(), MINI_W * 4);
                 miniTex.update(miniWaterfall.data());
             } else {
@@ -1550,16 +1549,16 @@ int main() {
             btnModalCopy.draw(window);
         }
 
-        // --- RYSOWANIE MINI WATERFALL W SIDEBARZE ---
+        // --- DRAW MINI WATERFALL IN SIDEBAR ---
         if (modInspector->isOpen) {
-            // Pobieramy pozycję modułu z nagłówka (Header)
-            float mx = modInspector->headerBg.getPosition().x + 10; // Margines lewy
-            float my = modInspector->headerBg.getPosition().y + 30; // Pod nagłówkiem
+            // Get module position from Header
+            float mx = modInspector->headerBg.getPosition().x + 10; // Left margin
+            float my = modInspector->headerBg.getPosition().y + 30; // Below header
             
-            // Ustaw pozycję sprite'a
+            // Set sprite position
             miniSpr.setPosition({(float)mx, (float)my});
             
-            // Ramka
+            // Border
             sf::RectangleShape border({(float)MINI_W + 2, (float)MINI_H + 2});
             border.setPosition({(float)mx - 1, (float)my - 1});
             border.setFillColor(sf::Color::Transparent);
@@ -1567,21 +1566,21 @@ int main() {
             border.setOutlineThickness(1);
             window.draw(border);
 
-            // Rysuj wodospad
+            // Draw waterfall
             window.draw(miniSpr);
 
-            // Linia środkowa (gdzie celuje demodulator)
+            // Center line (where demodulator is tuning)
             sf::RectangleShape centerLine({2.0f, (float)MINI_H});
             centerLine.setPosition({mx + MINI_W / 2.0f - 1.0f, my});
             centerLine.setFillColor(sf::Color(255, 0, 0, 150));
             window.draw(centerLine);
             
-            // Label informacyjny
+            // Information label
             sf::Text infoTxt(font, "Bandwidth Scope (" + std::to_string((int)slBW->currentVal) + " Hz)", 14);
-            infoTxt.setPosition({(float)mx, (float)my - 16}); // Nad wykresem? Albo pod?
+            infoTxt.setPosition({(float)mx, (float)my - 16}); // Above the graph? Or below?
             infoTxt.setScale({0.5f, 0.5f});
             infoTxt.setFillColor(sf::Color::Yellow);
-            // window.draw(infoTxt); // Opcjonalnie
+            // window.draw(infoTxt); // Optional
         }
 
         window.display();

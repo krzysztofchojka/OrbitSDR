@@ -190,7 +190,7 @@ public:
         double pllMin = targetPll - pllLimit;
         double pllMax = targetPll + pllLimit;
 
-        // Deklaracja zmiennej (FIX błędu kompilacji)
+        // Variable declaration (FIX for compilation error)
         Complex sample; 
 
         for (size_t i = 0; i < rawIQ.size(); i++) {
@@ -273,9 +273,9 @@ public:
                         static float dcBlock = 0.0f;
                         float mag = std::abs(filtered);
                         dcBlock = 0.995f * dcBlock + 0.005f * mag;
-                        rawAudio = (mag - dcBlock) * 6.0f; // Wstępne podbicie AM
+                        rawAudio = (mag - dcBlock) * 6.0f; // Initial AM boost
                         
-                        // DODANE: Przekazanie sygnału do filtra (a tym samym do systemu AGC!)
+                        // ADDED: Pass the signal to the filter (and thus to the AGC system!)
                         if (std::isnan(audioLpfState)) audioLpfState = 0.0f;
                         audioLpfState += audioAlpha * (rawAudio - audioLpfState);
                     }
@@ -284,26 +284,26 @@ public:
                         lastSample = filtered;
                         float phaseDelta = std::arg(phaseDiff);
 
-                        // --- FIX AIS: Normalizacja sygnału ---
+                        // --- FIX AIS: Signal normalization ---
                         if (bandwidthHz > 14000.0) {
-                            // 1. Normalizacja: -PI..PI zamieniamy na -1..1
-                            // To likwiduje "zieloną ścianę" w SDRangel
+                            // 1. Normalization: Map -PI..PI to -1..1
+                            // This eliminates the "green wall" in SDRangel
                             float normalized = phaseDelta / (float)PI; 
                             
-                            // 2. Wzmocnienie: GMSK jest ciche, wzmacniamy 5x, ale...
+                            // 2. Gain: GMSK is quiet, amplify 5x, but...
                             normalized *= 5.0f;
 
-                            // 3. DC Blocker: Żeby sygnał nie "pływał"
+                            // 3. DC Blocker: To prevent the signal from "drifting"
                             static float dataDc = 0.0f;
                             dataDc = 0.99f * dataDc + 0.01f * normalized;
                             rawAudio = normalized - dataDc;
 
-                            // 4. Hard Clamp: Bezpiecznik przed przesterem audio karty
+                            // 4. Hard Clamp: Safety measure against audio card clipping
                             rawAudio = std::max(-1.0f, std::min(1.0f, rawAudio));
 
                             audioLpfState = rawAudio;
                         } else {
-                            // GŁOS:
+                            // VOICE:
                             rawAudio = phaseDelta * 0.05f; 
                             if (std::isnan(audioLpfState)) audioLpfState = 0.0f;
                             audioLpfState += audioAlpha * (rawAudio - audioLpfState);
@@ -311,8 +311,8 @@ public:
                     } else if (mode == Mode::LSB || mode == Mode::USB || mode == Mode::RAW) {
                         rawAudio = filtered.real();
                         if (mode != Mode::RAW) {
-                            rawAudio *= 2.0f; // Podbicie dla radia
-                            audioLpfState += audioAlpha * (rawAudio - audioLpfState); // Filtr audio (tnący wysokie tony)
+                            rawAudio *= 2.0f; // Boost for radio
+                            audioLpfState += audioAlpha * (rawAudio - audioLpfState); // Audio filter (high cut)
                         }
                     }
                     
@@ -320,9 +320,9 @@ public:
                     if (mode == Mode::NFM && bandwidthHz > 14000.0) {
                         finalAudio = audioLpfState;
                     } else if (mode == Mode::RAW) {
-                        finalAudio = rawAudio; // Czysty, nienaruszony sygnał prosto z karty!
+                        finalAudio = rawAudio; // Pure, untouched signal straight from the card!
                     } else {
-                        // Standardowe AGC dla głosu
+                        // Standard AGC for voice
                         float absAudio = std::abs(audioLpfState);
                         if (absAudio > agcPeak) agcPeak = absAudio; else agcPeak *= 0.9995f;
                         if (agcPeak < 0.02f) agcPeak = 0.02f;

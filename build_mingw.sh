@@ -28,6 +28,9 @@ fi
 # -DENABLE_SDRPLAY       -> Enables SDRplay handling code in C++
 # -lsdrplay_api          -> Links with the .lib file (MinGW finds it thanks to the -L flag)
 # -lcomdlg32 -lole32     -> Required for file dialog windows on Windows
+windres resource.rc -O coff -o resource.res
+
+# Dodano 'resource.res \' poniżej
 g++ -std=c++17 -O3 \
     -DENABLE_SDRPLAY \
     -D_USE_MATH_DEFINES \
@@ -35,6 +38,7 @@ g++ -std=c++17 -O3 \
     -I"$SFML_PATH/include" \
     -I"$SDR_INC" \
     "$SRC_DIR/main.cpp" \
+    resource.res \
     -o "$OUT_FILE" \
     -L"$SFML_PATH/lib" \
     -L"$SDR_LIB" \

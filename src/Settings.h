@@ -6,7 +6,7 @@
 #include <sstream>
 #include <iostream>
 #include <algorithm>
-#include <cstdlib> // dla getenv
+#include <cstdlib> // for getenv
 #include <vector>
 
 #ifdef _WIN32
@@ -20,7 +20,7 @@
     const char PATH_SEP = '/';
 #endif
 
-// Funkcja zwracająca TYLKO katalog konfiguracyjny (bez nazwy pliku)
+// Returns ONLY the configuration directory path (without the filename)
 inline std::string getConfigDir() {
     std::string path;
     #ifdef _WIN32
@@ -33,17 +33,17 @@ inline std::string getConfigDir() {
         else path = "./";
     #endif
 
-    // Tworzymy katalog, jeśli nie istnieje
+    // Create directory if it does not exist
     MKDIR(path.c_str());
     return path;
 }
 
-// Funkcja zwracająca pełną ścieżkę do settings.json
+// Returns the full path to settings.json
 inline std::string getSettingsFilePath() {
     return getConfigDir() + PATH_SEP + "settings.json";
 }
 
-// Funkcja zwracająca pełną ścieżkę do aprs.log
+// Returns the full path to aprs.log
 inline std::string getAprsLogFilePath() {
     return getConfigDir() + PATH_SEP + "aprs.log";
 }
@@ -60,7 +60,7 @@ inline std::string getDefaultRecordingPath() {
         else path = "/tmp/OrbitSDR";
     #endif
 
-    // Upewnij się, że katalog istnieje
+    // Ensure the directory exists
     MKDIR(path.c_str());
     return path;
 }
@@ -101,7 +101,7 @@ public:
         return defaultVal;
     }
 
-    // PANCERNA FUNKCJA LOAD
+    // ROBUST LOAD FUNCTION
     void load(std::string filename) {
         data.clear();
         std::ifstream file(filename);
@@ -110,7 +110,7 @@ public:
         std::string line;
         while (std::getline(file, line)) {
             try {
-                // Proste zabezpieczenie przed pustymi liniami
+                // Simple safeguard against empty lines
                 if (line.length() < 3) continue;
 
                 size_t colPos = line.find(':');
@@ -121,11 +121,11 @@ public:
                     if (q2 != std::string::npos && q2 > q1) {
                         std::string key = line.substr(q1 + 1, q2 - q1 - 1);
                         
-                        // Zabezpieczenie przed wyjściem poza zakres przy pobieraniu wartości
+                        // Safeguard against out-of-bounds when retrieving value
                         if (colPos + 1 < line.length()) {
                             std::string valPart = line.substr(colPos + 1);
                             
-                            // Czyszczenie śmieci JSONowych
+                            // Stripping JSON formatting clutter
                             valPart.erase(std::remove(valPart.begin(), valPart.end(), ','), valPart.end());
                             valPart.erase(std::remove(valPart.begin(), valPart.end(), '"'), valPart.end());
                             valPart.erase(std::remove(valPart.begin(), valPart.end(), ' '), valPart.end());
@@ -139,8 +139,7 @@ public:
                     }
                 }
             } catch (...) {
-                // Jeśli jakakolwiek linia jest uszkodzona, ignorujemy ją i idziemy dalej
-                // zamiast wywalać program
+                // If any line is corrupted, ignore it and continue instead of crashing the program
                 std::cerr << "[Warning] Skipping corrupted line in settings.json" << std::endl;
             }
         }
@@ -155,7 +154,7 @@ public:
         for (auto const& [key, val] : data) {
             file << "  \"" << key << "\": ";
             
-            // Prosta heurystyka: czy to liczba/bool czy string?
+            // Simple heuristic: is it a number/bool or a string?
             bool isNum = !val.empty() && (isdigit(val[0]) || val[0] == '-');
             bool isBool = (val == "true" || val == "false");
             

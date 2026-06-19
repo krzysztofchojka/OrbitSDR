@@ -39,8 +39,8 @@ inline std::vector<double> makeWindow(size_t size) {
     return w;
 }
 
-// --- CHANNELIZER (Uniwersalne DDC) ---
-// Wyciąga wąski kanał z szerokiego pasma
+// --- CHANNELIZER (Universal DDC) ---
+// Extracts a narrow channel from a wide bandwidth
 class Channelizer {
     std::complex<double> ncoPhase = {1.0, 0.0};
     std::complex<double> ncoStep = {1.0, 0.0};
@@ -61,13 +61,13 @@ public:
         ncoStep = std::polar(1.0, angle);
     }
 
-    // Zwraca true jeśli mamy nową próbkę wyjściową
+    // Returns true if a new output sample is available
     inline bool process(const std::complex<double>& in, std::complex<float>& out) {
         // 1. Mixer
         std::complex<double> mixed = in * ncoPhase;
         ncoPhase *= ncoStep;
         
-        // Normalizacja wektora co jakiś czas
+        // Normalize the vector periodically
         if (std::abs(ncoPhase.real()) > 2.0) ncoPhase /= std::abs(ncoPhase); 
         
         // 2. Decimator

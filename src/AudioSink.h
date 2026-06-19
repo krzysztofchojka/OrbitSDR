@@ -17,8 +17,8 @@ public:
     std::mutex mutex;
     std::deque<float> sampleQueue;
     
-    // ZWIĘKSZONY BUFOR: 1 sekunda (48000 Hz * 2 kanały * 1.0s)
-    // To zapobiega "szarpaniu" przy odtwarzaniu plików, dając duży margines bezpieczeństwa.
+    // INCREASED BUFFER: 1 second (48000 Hz * 2 channels * 1.0s)
+    // Prevents playback stuttering by providing a safe buffer margin.
     const size_t MAX_BUFFER_SIZE = (size_t)(48000 * 2 * 1.0); 
     
     ma_context context;
@@ -41,7 +41,7 @@ public:
     void refreshDeviceList() {
         availableDevices.clear();
         
-        // Wrzucamy pozycję domyślną na sam początek listy z indeksem 0
+        // Push the default device to the beginning of the list at index 0
         DeviceInfo defaultDev;
         defaultDev.name = "System Default Output";
         availableDevices.push_back(defaultDev);
@@ -72,11 +72,11 @@ public:
         config.pUserData = this;
         config.performanceProfile = ma_performance_profile_low_latency;
 
-        // Jeżeli wybrano cokolwiek poniżej pozycji "System Default", pobieramy ID z miniaudio
+        // If any device below "System Default" is selected, fetch the ID from miniaudio
         if (deviceIndex > 0 && deviceIndex < (int)availableDevices.size()) {
             config.playback.pDeviceID = &availableDevices[deviceIndex].id;
         } else {
-            // Jeśli index to 0, dając NULL mówimy "Bierz to, co domyślne w systemie"
+            // If index is 0, passing NULL tells miniaudio to use the system default device
             config.playback.pDeviceID = NULL;
         }
 
@@ -92,8 +92,8 @@ public:
         std::lock_guard<std::mutex> lock(mutex);
         sampleQueue.insert(sampleQueue.end(), audioData.begin(), audioData.end());
 
-        // Jeśli bufor się przepełni (np. CPU generuje za szybko), usuwamy NAJSTARSZE próbki.
-        // To jest zabezpieczenie ostateczne, ale flow control w main.cpp powinien temu zapobiec.
+        // If the buffer overflows (e.g., CPU generates data too fast), drop the OLDEST samples.
+        // This is a last-resort fallback; flow control in main.cpp should prevent this.
         if (sampleQueue.size() > MAX_BUFFER_SIZE) {
             size_t toRemove = sampleQueue.size() - MAX_BUFFER_SIZE;
             if (toRemove % 2 != 0) toRemove++; 
@@ -125,7 +125,7 @@ private:
             out[i] = sink->sampleQueue.front();
             sink->sampleQueue.pop_front();
         }
-        // Wypełnij ciszą jeśli brak danych (underrun)
+        // Fill with silence if there is not enough data (underrun)
         for (size_t i = toRead; i < samplesNeeded; ++i) {
             out[i] = 0.0f;
         }

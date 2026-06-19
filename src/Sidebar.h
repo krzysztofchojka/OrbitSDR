@@ -5,7 +5,7 @@
 #include <memory>
 #include <string>
 
-// Moduł
+// Module
 class Module {
 public:
     std::string title; bool isOpen = true; std::vector<std::shared_ptr<Widget>> widgets;
@@ -28,11 +28,11 @@ public:
     void addWidget(std::shared_ptr<Widget> w) { widgets.push_back(w); }
     
     float getTotalHeight() const {
-        float h = 25.0f; // Wysokość samego nagłówka
+        float h = 25.0f; // Height of the header itself
         if (isOpen) {
-            h += 10.0f; // Margines górny (zamiast 5.0f)
+            h += 10.0f; // Top margin (increased from 5.0f)
             for (const auto& w : widgets) h += w->getHeight() + 5.0f;
-            h += 5.0f;  // Margines dolny
+            h += 5.0f;  // Bottom margin
         }
         return h;
     }
@@ -91,7 +91,7 @@ public:
             totalContentHeight += h + 5.0f;
         }
         
-        // Dodajemy stały bufor 60px! Dzięki temu zescrollujesz nieco niżej niż krawędź ostatniego widgetu.
+        // Add a fixed 60px buffer to allow scrolling slightly past the last widget's edge
         totalContentHeight += 60.0f;
 
         if (totalContentHeight > height) {
@@ -105,7 +105,7 @@ public:
         }
     }
     
-    // ZMIANA: Sprawdza czy myszka jest nad CAŁYM panelem sidebara, nie tylko nad widgetami
+    // CHANGE: Checks if the mouse is hovering over the ENTIRE sidebar panel, not just individual widgets
     bool isMouseOver(const sf::RenderWindow& win) const {
         sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
         return (m.x >= x && m.x <= x + width && m.y >= y && m.y <= y + height);
@@ -117,32 +117,32 @@ public:
         return false;
     }
 
-    // ZMIANA: Zwraca bool (true = zdarzenie obsłużone/przechwycone)
+    // CHANGE: Returns bool (true = event handled/captured)
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) {
-        // 1. Priorytet: Dropdowny (zawsze na wierzchu)
+        // 1. Priority: Dropdowns (always rendered on top)
         if (Dropdown::currentActive) { 
             for (auto& mod : modules) { 
                 if(mod->handleEvent(ev, win)) return true; 
             } 
-            // Jeśli kliknięto poza dropdownem, to też konsumujemy kliknięcie żeby go zamknąć
+            // If clicked outside the dropdown, consume the event anyway to close it
             return true; 
         }
 
         bool captured = false;
 
-        // 2. Scrollowanie Sidebara
+        // 2. Sidebar scrolling
         if (const auto* sc = ev.getIf<sf::Event::MouseWheelScrolled>()) {
             sf::Vector2f m = win.mapPixelToCoords(sf::Vector2i((int)sc->position.x, (int)sc->position.y));
             if (m.x > x && m.x < x + width) {
                 scrollOffset -= sc->delta * 30.0f; if (scrollOffset < 0) scrollOffset = 0; float maxS = std::max(0.0f, totalContentHeight - height); if (scrollOffset > maxS) scrollOffset = maxS; recalculateLayout();
-                return true; // Scroll nad sidebarem przechwycony
+                return true; // Scroll event captured over the sidebar
             }
         }
 
-        // 3. Kliknięcia i widgety
+        // 3. Clicks and widgets
         sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
-        // Jeśli mysz jest fizycznie nad sidebarem, uznajemy to za "przechwycenie" (captured = true)
-        // Zapobiega to klikaniu w spektrum/aprs "przez" sidebar.
+        // If the mouse is physically over the sidebar, treat the event as "captured".
+        // This prevents clicking elements like the spectrum/aprs "through" the sidebar background.
         if (m.x > x && m.x < x + width && m.y > y && m.y < y + height) {
             captured = true; 
             for (auto& mod : modules) { 

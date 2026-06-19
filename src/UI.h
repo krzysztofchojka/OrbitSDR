@@ -24,7 +24,7 @@ namespace Theme {
             Glow = sf::Color(0, 190, 255, 120);
         } 
         else if (index == 1) { // Neon (Pink/Purple)
-            // Zmieniono na Róż, żeby pasował do nowego wodospadu
+            // Changed to Pink to match the new waterfall colors
             Accent = sf::Color(255, 0, 150);     // Hot Pink
             AccentDim = sf::Color(150, 0, 80);   // Darker Pink
             Glow = sf::Color(255, 0, 255, 100);  // Purple Glow
@@ -71,6 +71,7 @@ public:
     bool isDragging = false, enabled = true;
     std::function<void(float)> onChange;
 
+// --- MODERN SLIDER (RETINA FIX V2 - NO ROUNDING ON MOVING PARTS) ---
     Slider(float w, float minV, float maxV, float startV, std::string n, const sf::Font& font) 
         : minVal(minV), maxVal(maxV), currentVal(startV), 
           label(font, n, 24), valueDisplay(font, "", 20) 
@@ -89,7 +90,7 @@ public:
         knob.setRadius(16.0f); 
         knob.setOrigin({16.0f, 16.0f}); 
         knob.setScale({0.5f, 0.5f});
-        knob.setPointCount(128); // Bardzo dużo punktów dla gładkości
+        knob.setPointCount(128); // Large number of points for smooth rendering
         knob.setOutlineThickness(4.0f); 
 
         knobInner.setRadius(6.0f); 
@@ -119,10 +120,10 @@ public:
     float getHeight() const override { return 40.0f; }
     void setWidth(float w) { trackBg.setSize({w * 2.0f, 8.0f}); updateHandlePos(); }
     void setPosition(float x, float y) override { 
-        // Statyczne elementy zaokrąglamy
+        // Round static layout elements
         x = std::round(x); y = std::round(y);
         label.setPosition({x, y});
-        float trackY = y + 22.0f; // Bez round tutaj, niech wpada w połówki
+        float trackY = y + 22.0f; // No rounding here to allow precise half-pixel placement
         trackBg.setPosition({x, trackY}); trackFill.setPosition({x, trackY});
         
         float valX = x + trackBg.getGlobalBounds().size.x - valueDisplay.getGlobalBounds().size.x;
@@ -136,9 +137,9 @@ public:
     void updateHandlePos() { 
         float p = (currentVal - minVal) / (maxVal - minVal); p = std::clamp(p, 0.0f, 1.0f);
         
-        // --- USUNIĘTE ZAOKRĄGLANIE (std::round) DLA PŁYNNOŚCI NA RETINA ---
-        // Na ekranach Retina 1.0f to 2.0 piksele fizyczne. 
-        // Wartości float (np. 10.5) są renderowane idealnie ostro.
+        // --- REMOVED ROUNDING (std::round) FOR SMOOTHNESS ON RETINA DISPLAYS ---
+        // On Retina screens, 1.0f coordinates map to 2.0 physical pixels. 
+        // Float values (e.g., 10.5) are rendered perfectly sharp without rounding.
         
         float width = trackBg.getGlobalBounds().size.x;
         float xPos = trackBg.getPosition().x + (p * width);
@@ -184,7 +185,7 @@ public:
         shape.setSize({w, h}); shape.setOutlineThickness(1); updateStyle();
     }
     void updateStyle() override {
-        if (!enabled) { shape.setFillColor(sf::Color(40, 40, 40)); shape.setOutlineColor(sf::Color(50, 50, 50)); label.setFillColor(sf::Color(100, 100, 100)); } 
+        if (!enabled) { shape.setFillColor(sf::Color(40, 40, 40)); shape.setOutlineColor(sf::Color(50, 50, 55)); label.setFillColor(sf::Color(100, 100, 100)); } 
         else { label.setFillColor(Theme::Text); if (active) { shape.setFillColor(Theme::AccentDim); shape.setOutlineColor(Theme::Accent); label.setFillColor(sf::Color::White); } else { shape.setFillColor(Theme::BgDark); shape.setOutlineColor(sf::Color(70, 70, 70)); } }
     }
     float getHeight() const override { return shape.getSize().y + 5.0f; }
@@ -307,7 +308,7 @@ public:
     long long frequency; const sf::Font& font; sf::Text text; sf::RectangleShape hoverRect; long long hoverPower = 0; bool isHovered = false, isTopHalf = true, enabled = true; float x, y;
     FrequencyDisplay(float _x, float _y, const sf::Font& f) : font(f), text(font), x(_x), y(_y) { frequency = 100000000; text.setCharacterSize(84); text.setScale({0.5f, 0.5f}); updateStyle(); text.setOutlineThickness(0); hoverRect.setFillColor(sf::Color(255, 255, 255, 30)); setPosition(_x, _y); }
     
-    // WYMUSZONY BIAŁY/SZARY - ignorujemy Theme::Accent
+    // ENFORCED WHITE/GRAY - ignores Theme::Accent
     void updateStyle() {
         text.setFillColor(sf::Color::White);
     }
@@ -330,7 +331,7 @@ public:
         float vt = text.getGlobalBounds().position.y;
         float vh = text.getGlobalBounds().size.y;
 
-        // Sprawdzamy każdy znak oddzielnie, co rozwiązuje problem ucinanego "wspólnego" hitboxa
+        // Check each character individually, which resolves the issue of clipped "shared" hitboxes
         for (int i = text.getString().getSize() - 1; i >= 0; i--) {
             char c = text.getString()[i];
             if (c == '.') continue;
@@ -339,7 +340,7 @@ public:
             float cw = text.findCharacterPos(i + 1).x - cp_pos.x;
             if (cw <= 0) cw = text.getCharacterSize() * 0.5f * 0.6f;
             
-            // Tworzymy dokładny hitbox dla pojedynczej cyfry z lekkim marginesem
+            // Create an exact bounding box for a single digit with a small margin
             sf::FloatRect cr({cp_pos.x, vt - 5.0f}, {cw, vh + 10.0f});
             
             if (cr.contains(m)) {
