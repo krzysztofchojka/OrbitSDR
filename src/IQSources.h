@@ -561,16 +561,70 @@ public:
     }
     
     void setHardwareOption(std::string name, int value) override {
-        std::lock_guard<std::mutex> lock(hwMtx); if (!running || !deviceParams) return;
-        if (name == "antenna") {
-             if (currentDevice.hwVer == SDRPLAY_RSPdx_ID) {
-                if (value == 0) deviceParams->devParams->rspDxParams.antennaSel = sdrplay_api_RspDx_ANTENNA_A; 
-                if (value == 1) deviceParams->devParams->rspDxParams.antennaSel = sdrplay_api_RspDx_ANTENNA_B; 
-                if (value == 2) deviceParams->devParams->rspDxParams.antennaSel = sdrplay_api_RspDx_ANTENNA_C; 
-                sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_None, sdrplay_api_Update_RspDx_AntennaControl);
-            }
+    std::lock_guard<std::mutex> lock(hwMtx);
+    
+    // Zabezpieczenie przed edycją niezainicjalizowanej struktury
+    if (!deviceParams) return;
+
+    if (name == "antenna") {
+        if (currentDevice.hwVer == SDRPLAY_RSPdx_ID || currentDevice.hwVer == SDRPLAY_RSPdxR2_ID) {
+            if (value == 0) deviceParams->devParams->rspDxParams.antennaSel = sdrplay_api_RspDx_ANTENNA_A;
+            else if (value == 1) deviceParams->devParams->rspDxParams.antennaSel = sdrplay_api_RspDx_ANTENNA_B;
+            else if (value == 2) deviceParams->devParams->rspDxParams.antennaSel = sdrplay_api_RspDx_ANTENNA_C;
+            
+            if (running) sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_None, sdrplay_api_Update_RspDx_AntennaControl);
+        }
+        else if (currentDevice.hwVer == SDRPLAY_RSP2_ID) {
+            if (value == 0) deviceParams->rxChannelA->rsp2TunerParams.antennaSel = sdrplay_api_Rsp2_ANTENNA_A;
+            else if (value == 1) deviceParams->rxChannelA->rsp2TunerParams.antennaSel = sdrplay_api_Rsp2_ANTENNA_B;
+            
+            if (running) sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Rsp2_AntennaControl, sdrplay_api_Update_Ext1_None);
         }
     }
+    else if (name == "bias_t") {
+        if (currentDevice.hwVer == SDRPLAY_RSP1A_ID || currentDevice.hwVer == SDRPLAY_RSP1B_ID) {
+            deviceParams->rxChannelA->rsp1aTunerParams.biasTEnable = value ? 1 : 0;
+            if (running) sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Rsp1a_BiasTControl, sdrplay_api_Update_Ext1_None);
+        }
+        else if (currentDevice.hwVer == SDRPLAY_RSP2_ID) {
+            deviceParams->rxChannelA->rsp2TunerParams.biasTEnable = value ? 1 : 0;
+            if (running) sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Rsp2_BiasTControl, sdrplay_api_Update_Ext1_None);
+        }
+        else if (currentDevice.hwVer == SDRPLAY_RSPduo_ID) {
+            deviceParams->rxChannelA->rspDuoTunerParams.biasTEnable = value ? 1 : 0;
+            if (running) sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_RspDuo_BiasTControl, sdrplay_api_Update_Ext1_None);
+        }
+        else if (currentDevice.hwVer == SDRPLAY_RSPdx_ID || currentDevice.hwVer == SDRPLAY_RSPdxR2_ID) {
+            deviceParams->devParams->rspDxParams.biasTEnable = value ? 1 : 0;
+            if (running) sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_None, sdrplay_api_Update_RspDx_BiasTControl);
+        }
+    }
+    else if (name == "fm_notch") {
+        if (currentDevice.hwVer == SDRPLAY_RSP1A_ID || currentDevice.hwVer == SDRPLAY_RSP1B_ID) {
+            deviceParams->devParams->rsp1aParams.rfNotchEnable = value ? 1 : 0;
+            if (running) sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Rsp1a_RfNotchControl, sdrplay_api_Update_Ext1_None);
+        }
+        else if (currentDevice.hwVer == SDRPLAY_RSP2_ID) {
+            deviceParams->rxChannelA->rsp2TunerParams.rfNotchEnable = value ? 1 : 0;
+            if (running) sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Rsp2_RfNotchControl, sdrplay_api_Update_Ext1_None);
+        }
+        else if (currentDevice.hwVer == SDRPLAY_RSPduo_ID) {
+            deviceParams->rxChannelA->rspDuoTunerParams.rfNotchEnable = value ? 1 : 0;
+            if (running) sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_RspDuo_RfNotchControl, sdrplay_api_Update_Ext1_None);
+        }
+        else if (currentDevice.hwVer == SDRPLAY_RSPdx_ID || currentDevice.hwVer == SDRPLAY_RSPdxR2_ID) {
+            deviceParams->devParams->rspDxParams.rfNotchEnable = value ? 1 : 0;
+            if (running) sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_None, sdrplay_api_Update_RspDx_RfNotchControl);
+        }
+    }
+    else if (name == "mw_notch") {
+        // Tylko RSPduo w API 3.x posiada zmapowany ten konkretny przełącznik w strukturze.
+        if (currentDevice.hwVer == SDRPLAY_RSPduo_ID) {
+            deviceParams->rxChannelA->rspDuoTunerParams.tuner1AmNotchEnable = value ? 1 : 0;
+            if (running) sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_RspDuo_Tuner1AmNotchControl, sdrplay_api_Update_Ext1_None);
+        }
+    }
+}
     std::vector<std::string> getAvailableSampleRatesText() override { return {"2.0 MSps", "4.0 MSps", "6.0 MSps", "8.0 MSps", "10.0 MSps"}; }
     std::vector<uint32_t> getAvailableSampleRatesValues() override { return {2000000, 4000000, 6000000, 8000000, 10000000}; }
 };

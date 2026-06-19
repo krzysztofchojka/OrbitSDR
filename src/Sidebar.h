@@ -27,10 +27,14 @@ public:
     
     void addWidget(std::shared_ptr<Widget> w) { widgets.push_back(w); }
     
-    float getTotalHeight() const { 
-        float h = 25.0f; 
-        if (isOpen) { h += 5.0f; for (const auto& w : widgets) h += w->getHeight() + 5.0f; h += 5.0f; } 
-        return h; 
+    float getTotalHeight() const {
+        float h = 25.0f; // Wysokość samego nagłówka
+        if (isOpen) {
+            h += 10.0f; // Margines górny (zamiast 5.0f)
+            for (const auto& w : widgets) h += w->getHeight() + 5.0f;
+            h += 5.0f;  // Margines dolny
+        }
+        return h;
     }
     
     void layout(float x, float y) {
@@ -78,9 +82,27 @@ public:
         for(auto& m : modules) m->updateStyle();
     }
     void recalculateLayout() {
-        totalContentHeight = 0; float cy = y - scrollOffset;
-        for (auto& m : modules) { m->layout(x, cy); float h = m->getTotalHeight(); cy += h + 3.0f; totalContentHeight += h + 3.0f; } 
-        if (totalContentHeight > height) { float th = (height / totalContentHeight) * height; if (th < 30) th = 30; sbThumb.setSize({10, th}); float ty = y + (scrollOffset / (totalContentHeight - height)) * (height - th); sbThumb.setPosition({x + width - 11, ty}); } else { scrollOffset = 0; }
+        totalContentHeight = 0;
+        float cy = y - scrollOffset;
+        for (auto& m : modules) {
+            m->layout(x, cy);
+            float h = m->getTotalHeight();
+            cy += h + 5.0f;
+            totalContentHeight += h + 5.0f;
+        }
+        
+        // Dodajemy stały bufor 60px! Dzięki temu zescrollujesz nieco niżej niż krawędź ostatniego widgetu.
+        totalContentHeight += 60.0f;
+
+        if (totalContentHeight > height) {
+            float th = (height / totalContentHeight) * height;
+            if (th < 30) th = 30;
+            sbThumb.setSize({10, th});
+            float ty = y + (scrollOffset / (totalContentHeight - height)) * (height - th);
+            sbThumb.setPosition({x + width - 11, ty});
+        } else {
+            scrollOffset = 0;
+        }
     }
     
     // ZMIANA: Sprawdza czy myszka jest nad CAŁYM panelem sidebara, nie tylko nad widgetami

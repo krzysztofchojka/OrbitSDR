@@ -316,9 +316,45 @@ public:
     void setFrequency(long long f) { frequency = f; } long long getFrequency() const { return frequency; } void setEnabled(bool e) { enabled = e; }
     std::string formatWithDots(long long freq) { std::string s = std::to_string(freq); while (s.length() < 10) s = "0" + s; std::string r = ""; int c = 0; for (int i = s.length() - 1; i >= 0; i--) { r = s[i] + r; c++; if (c % 3 == 0 && i > 0) r = "." + r; } return r; }
     void update(const sf::RenderWindow& win) {
-        text.setString(formatWithDots(frequency)); if (!enabled) { isHovered = false; return; }
-        sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win)); sf::FloatRect b = text.getGlobalBounds(); isHovered = false; hoverPower = 0; sf::FloatRect hb = b; hb.position.x -= 2; hb.size.x += 4; hb.position.y -= 2; hb.size.y += 4;
-        if (hb.contains(m)) { long long cp = 1; float vt = b.position.y; float vh = b.size.y; for (int i = text.getString().getSize() - 1; i >= 0; i--) { char c = text.getString()[i]; if (c == '.') continue; sf::Vector2f cp_pos = text.findCharacterPos(i); float cw = text.findCharacterPos(i + 1).x - cp_pos.x; if (cw <= 0) cw = text.getCharacterSize() * 0.5f * 0.6f; sf::FloatRect cr({cp_pos.x, vt - 2.0f}, {cw, vh + 4.0f}); if (cr.contains(m)) { isHovered = true; hoverPower = cp; float midY = cr.position.y + (cr.size.y / 2.0f); isTopHalf = (m.y < midY); hoverRect.setSize({cw, cr.size.y / 2.0f}); if (isTopHalf) hoverRect.setPosition(cr.position); else hoverRect.setPosition({cr.position.x, midY}); break; } cp *= 10; } }
+        text.setString(formatWithDots(frequency));
+        if (!enabled) {
+            isHovered = false;
+            return;
+        }
+        
+        sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
+        isHovered = false;
+        hoverPower = 0;
+
+        long long cp = 1;
+        float vt = text.getGlobalBounds().position.y;
+        float vh = text.getGlobalBounds().size.y;
+
+        // Sprawdzamy każdy znak oddzielnie, co rozwiązuje problem ucinanego "wspólnego" hitboxa
+        for (int i = text.getString().getSize() - 1; i >= 0; i--) {
+            char c = text.getString()[i];
+            if (c == '.') continue;
+            
+            sf::Vector2f cp_pos = text.findCharacterPos(i);
+            float cw = text.findCharacterPos(i + 1).x - cp_pos.x;
+            if (cw <= 0) cw = text.getCharacterSize() * 0.5f * 0.6f;
+            
+            // Tworzymy dokładny hitbox dla pojedynczej cyfry z lekkim marginesem
+            sf::FloatRect cr({cp_pos.x, vt - 5.0f}, {cw, vh + 10.0f});
+            
+            if (cr.contains(m)) {
+                isHovered = true;
+                hoverPower = cp;
+                float midY = cr.position.y + (cr.size.y / 2.0f);
+                isTopHalf = (m.y < midY);
+                hoverRect.setSize({cw, cr.size.y / 2.0f});
+                
+                if (isTopHalf) hoverRect.setPosition(cr.position);
+                else hoverRect.setPosition({cr.position.x, midY});
+                break;
+            }
+            cp *= 10;
+        }
     }
     bool handleEvent(const sf::Event& ev) { if (!enabled || !isHovered || hoverPower == 0) return false; if (const auto* mb = ev.getIf<sf::Event::MouseButtonPressed>()) { if (mb->button == sf::Mouse::Button::Left) { if (isTopHalf) frequency += hoverPower; else frequency -= hoverPower; if (frequency < 0) frequency = 0; return true; } } if (const auto* sc = ev.getIf<sf::Event::MouseWheelScrolled>()) { if (sc->wheel == sf::Mouse::Wheel::Vertical) { if (sc->delta > 0) frequency += hoverPower; else frequency -= hoverPower; if (frequency < 0) frequency = 0; return true; } } return false; }
     
@@ -337,4 +373,14 @@ public:
         } 
     }
     bool isMouseOver(const sf::RenderWindow& win) const { return isHovered; }
+};
+
+
+class Spacer : public Widget {
+    float h;
+public:
+    Spacer(float height) : h(height) {}
+    float getHeight() const override { return h; }
+    void setPosition(float x, float y) override {}
+    void draw(sf::RenderWindow& win) override {}
 };

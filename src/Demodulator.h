@@ -240,8 +240,8 @@ public:
                 
                 wfmResampleAcc += 1.0;
                 if (wfmResampleAcc >= resampleRatio) {
-                    float finalL = (wfmSumL / (float)wfmCount) * 1.5f; 
-                    float finalR = (wfmSumR / (float)wfmCount) * 1.5f; 
+                    float finalL = (wfmSumL / (float)wfmCount) * 1.6f;
+                    float finalR = (wfmSumR / (float)wfmCount) * 1.6f;
                     wfmDcState = 0.995f * wfmDcState + 0.005f * ((finalL + finalR) * 0.5f);
                     finalL -= wfmDcState; finalR -= wfmDcState;
                     finalL = std::tanh(finalL); finalR = std::tanh(finalR);
@@ -273,8 +273,12 @@ public:
                         static float dcBlock = 0.0f;
                         float mag = std::abs(filtered);
                         dcBlock = 0.995f * dcBlock + 0.005f * mag;
-                        rawAudio = mag - dcBlock;
-                    } 
+                        rawAudio = (mag - dcBlock) * 6.0f; // Wstępne podbicie AM
+                        
+                        // DODANE: Przekazanie sygnału do filtra (a tym samym do systemu AGC!)
+                        if (std::isnan(audioLpfState)) audioLpfState = 0.0f;
+                        audioLpfState += audioAlpha * (rawAudio - audioLpfState);
+                    }
                     else if (mode == Mode::NFM) {
                         Complex phaseDiff = filtered * std::conj(lastSample);
                         lastSample = filtered;
@@ -300,7 +304,7 @@ public:
                             audioLpfState = rawAudio;
                         } else {
                             // GŁOS:
-                            rawAudio = phaseDelta * 0.15f; 
+                            rawAudio = phaseDelta * 0.05f; 
                             if (std::isnan(audioLpfState)) audioLpfState = 0.0f;
                             audioLpfState += audioAlpha * (rawAudio - audioLpfState);
                         }

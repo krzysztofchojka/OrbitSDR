@@ -514,7 +514,10 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
 
                 if (rssiDb < sqThr) std::fill(audioData.begin(), audioData.end(), 0.0f);
                 float finalVol = muted ? 0.0f : vol;
-                for (auto& s : audioData) { if (std::isnan(s) || std::isinf(s)) s = 0.0f; else s *= finalVol; }
+            for (auto& s : audioData) {
+                if (std::isnan(s) || std::isinf(s)) s = 0.0f;
+                else s = std::clamp(s * finalVol, -1.0f, 1.0f);
+            }
                 
                 audio.pushSamples(audioData);
                 if (recorder.active && rMode == RecMode::AUDIO) recorder.write(audioData.data(), audioData.size());
@@ -610,7 +613,7 @@ int main() {
     
     SdrButton btnTuningMode(40, 40, "FIX", font); btnTuningMode.setColor(sf::Color(80, 80, 80)); bool stickyCenterMode = false;
     SdrButton btnPlay(40, 40, ">", font); btnPlay.setColor(sf::Color(116, 57, 57));
-    SdrButton btnMute(40, 40, "M", font); Slider volSlider(150, 0.0f, 1.0f, 0.5f, "Volume", font); Slider timeSlider(100, 0.0f, 1.0f, 0.0f, "Timeline", font);
+    SdrButton btnMute(40, 40, "M", font); Slider volSlider(150, 0.0f, 4.0f, 1.0f, "Volume", font); Slider timeSlider(100, 0.0f, 1.0f, 0.0f, "Timeline", font);
     Sidebar sidebar(SIDEBAR_W, font);
 
     // --- DECODERS SETUP IN SIDEBAR ---
@@ -623,7 +626,14 @@ int main() {
     // AIS Checkbox (New Module)
     auto chkAIS = std::make_shared<Checkbox>("Enable AIS (162.025)", font);
 
-    auto btnNFM = std::make_shared<SdrButton>(40, 25, "NFM", font); btnNFM->setActive(true); auto btnAM = std::make_shared<SdrButton>(40, 25, "AM", font); auto btnWFM = std::make_shared<SdrButton>(40, 25, "WFM", font); auto btnUSB = std::make_shared<SdrButton>(40, 25, "USB", font); auto btnLSB = std::make_shared<SdrButton>(40, 25, "LSB", font); auto btnRAW = std::make_shared<SdrButton>(45, 25, "RAW", font); auto btnOFF = std::make_shared<SdrButton>(40, 25, "OFF", font);
+    // ZMIEŃ INICJALIZACJĘ PRZYCISKÓW NA:
+    auto btnNFM = std::make_shared<SdrButton>(36, 25, "NFM", font);
+    auto btnAM = std::make_shared<SdrButton>(36, 25, "AM", font);
+    auto btnWFM = std::make_shared<SdrButton>(36, 25, "WFM", font);
+    auto btnUSB = std::make_shared<SdrButton>(36, 25, "USB", font);
+    auto btnLSB = std::make_shared<SdrButton>(36, 25, "LSB", font);
+    auto btnRAW = std::make_shared<SdrButton>(42, 25, "RAW", font);
+    auto btnOFF = std::make_shared<SdrButton>(36, 25, "OFF", font);
     auto rowModes = std::make_shared<RowContainer>(); rowModes->add(btnNFM); rowModes->add(btnAM); rowModes->add(btnWFM); rowModes->add(btnUSB); rowModes->add(btnLSB); rowModes->add(btnRAW); rowModes->add(btnOFF);
     auto slBW = std::make_shared<Slider>(SIDEBAR_W - 40, 1000.0f, 200000.0f, 12500.0f, "Bandwidth (Hz)", font); 
 
@@ -1040,7 +1050,7 @@ int main() {
     
     // Dodaj do sidebara
     auto modInspector = sidebar.addModule("Signal Inspector");
-    auto spacer = std::make_shared<Label>("\n\n\n\n\n\n", font); // Hack na wysokość
+    auto spacer = std::make_shared<Spacer>(130.0f); // 120px (MINI_H) + 10px marginesu
     modInspector->addWidget(spacer);
 
     std::vector<std::uint8_t> waterfall(INTERNAL_WATERFALL_WIDTH * 2048 * 4, 0); sf::Texture wTex; if(!wTex.resize({INTERNAL_WATERFALL_WIDTH, 2048})) return 1; sf::Sprite wSpr(wTex); 
@@ -1188,9 +1198,32 @@ int main() {
                 double minF = (double)currentCenterFreq - halfBW;
                 double maxF = (double)currentCenterFreq + halfBW;
                 
-                // Zabezpieczenie: nie pozwól wyjechać poza zakres nagranego pliku
-                if (targetVFO > maxF) targetVFO = (long long)maxF;
-                if (targetVFO < minF) targetVFO = (long long)minF;
+                // Zabezpieczenie pasma działa tylko dla plików lub programowego "Software Tuning"
+                if (stickyCenterMode && isHw) {
+                    pendingCenterFreq = targetVFO;
+                    debouncer.restart();
+                    { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; }
+                } else {
+                    // Tryb Software Tuning / Plik
+                    if (targetVFO > maxF || targetVFO < minF) {
+                        if (isHw) {
+                            // Wyszliśmy poza ekran! Automatycznie przestrajamy sprzęt za myszką
+                            pendingCenterFreq = targetVFO;
+                            debouncer.restart();
+                            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; }
+                        } else {
+                            // Dla odtwarzania z nagranego pliku WAV nie możemy przestroić sprzętu, więc tu ucinamy
+                            if (targetVFO > maxF) targetVFO = (long long)maxF;
+                            if (targetVFO < minF) targetVFO = (long long)minF;
+                            double newOffset = (double)(targetVFO - currentCenterFreq);
+                            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5 + (newOffset / hwSampleRate); }
+                        }
+                    } else {
+                        // Jesteśmy w granicach widocznego ekranu, przesuwamy tylko pasek
+                        double newOffset = (double)(targetVFO - currentCenterFreq);
+                        { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5 + (newOffset / hwSampleRate); }
+                    }
+                }
                 
                 // Aktualizuj widget, jeśli musieliśmy przyciąć wartość
                 if (targetVFO != freqVFO.getFrequency()) freqVFO.setFrequency(targetVFO);

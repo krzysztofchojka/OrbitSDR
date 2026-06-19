@@ -40,6 +40,12 @@ public:
 
     void refreshDeviceList() {
         availableDevices.clear();
+        
+        // Wrzucamy pozycję domyślną na sam początek listy z indeksem 0
+        DeviceInfo defaultDev;
+        defaultDev.name = "System Default Output";
+        availableDevices.push_back(defaultDev);
+        
         ma_device_info* pPlaybackDeviceInfos;
         ma_uint32 playbackDeviceCount;
         if (ma_context_get_devices(&context, &pPlaybackDeviceInfos, &playbackDeviceCount, NULL, NULL) == MA_SUCCESS) {
@@ -57,20 +63,21 @@ public:
             ma_device_uninit(&device);
             isInitialized = false;
         }
-
+        
         config = ma_device_config_init(ma_device_type_playback);
         config.playback.format = ma_format_f32;
-        config.playback.channels = 2; 
+        config.playback.channels = 2;
         config.sampleRate = sampleRate;
         config.dataCallback = data_callback;
         config.pUserData = this;
-        
-        // Dla plików lepiej użyć profilu domyślnego (większa stabilność), 
-        // ale low_latency jest OK, jeśli mamy dobry flow control w main.cpp.
         config.performanceProfile = ma_performance_profile_low_latency;
-        
-        if (deviceIndex >= 0 && deviceIndex < (int)availableDevices.size()) {
+
+        // Jeżeli wybrano cokolwiek poniżej pozycji "System Default", pobieramy ID z miniaudio
+        if (deviceIndex > 0 && deviceIndex < (int)availableDevices.size()) {
             config.playback.pDeviceID = &availableDevices[deviceIndex].id;
+        } else {
+            // Jeśli index to 0, dając NULL mówimy "Bierz to, co domyślne w systemie"
+            config.playback.pDeviceID = NULL;
         }
 
         if (ma_device_init(&context, &config, &device) != MA_SUCCESS) return false;
