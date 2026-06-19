@@ -981,7 +981,8 @@ int main() {
     auto originalAisToggle = chkAIS->onToggle;
     chkAIS->onToggle = [=](bool b) { originalAisToggle(b); aisUiRestore(b); };
     
-    modDecoders->addWidget(chkAIS);
+    // ==== DISABLED AIS ====
+    //modDecoders->addWidget(chkAIS);
 
     auto modDisp = sidebar.addModule("Display");
     auto slMinDb = std::make_shared<Slider>(SIDEBAR_W - 40, -120.0f, -20.0f, -90.0f, "Min dB", font); slMinDb->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.minDb = v; }; modDisp->addWidget(slMinDb);
