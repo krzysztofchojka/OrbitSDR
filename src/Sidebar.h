@@ -5,7 +5,7 @@
 #include <memory>
 #include <string>
 
-// Moduł
+// Module
 class Module {
 public:
     std::string title; bool isOpen = true; std::vector<std::shared_ptr<Widget>> widgets;
@@ -20,13 +20,21 @@ public:
         headerText.setStyle(sf::Text::Bold);
         headerText.setLetterSpacing(2);
     }
+
+    void updateStyle() {
+        for(auto& w : widgets) w->updateStyle();
+    }
     
     void addWidget(std::shared_ptr<Widget> w) { widgets.push_back(w); }
     
-    float getTotalHeight() const { 
-        float h = 25.0f; 
-        if (isOpen) { h += 5.0f; for (const auto& w : widgets) h += w->getHeight() + 5.0f; h += 5.0f; } 
-        return h; 
+    float getTotalHeight() const {
+        float h = 25.0f; // Height of the header itself
+        if (isOpen) {
+            h += 10.0f; // Top margin (increased from 5.0f)
+            for (const auto& w : widgets) h += w->getHeight() + 5.0f;
+            h += 5.0f;  // Bottom margin
+        }
+        return h;
     }
     
     void layout(float x, float y) {
@@ -70,31 +78,84 @@ public:
     std::shared_ptr<Module> addModule(std::string title) { auto m = std::make_shared<Module>(title, width - 20.0f, font); modules.push_back(m); return m; }
     
     void setGeometry(float _x, float _y, float _h) { x = _x; y = _y; height = _h; sbTrack.setPosition({x + width - 12, y}); sbTrack.setSize({12, height}); recalculateLayout(); }
-    
+    void updateStyle() {
+        for(auto& m : modules) m->updateStyle();
+    }
     void recalculateLayout() {
-        totalContentHeight = 0; float cy = y - scrollOffset;
-        for (auto& m : modules) { m->layout(x, cy); float h = m->getTotalHeight(); cy += h + 3.0f; totalContentHeight += h + 3.0f; } 
-        if (totalContentHeight > height) { float th = (height / totalContentHeight) * height; if (th < 30) th = 30; sbThumb.setSize({10, th}); float ty = y + (scrollOffset / (totalContentHeight - height)) * (height - th); sbThumb.setPosition({x + width - 11, ty}); } else { scrollOffset = 0; }
+        totalContentHeight = 0;
+        float cy = y - scrollOffset;
+        for (auto& m : modules) {
+            m->layout(x, cy);
+            float h = m->getTotalHeight();
+            cy += h + 5.0f;
+            totalContentHeight += h + 5.0f;
+        }
+        
+        // Add a fixed 60px buffer to allow scrolling slightly past the last widget's edge
+        totalContentHeight += 60.0f;
+
+        if (totalContentHeight > height) {
+            float th = (height / totalContentHeight) * height;
+            if (th < 30) th = 30;
+            sbThumb.setSize({10, th});
+            float ty = y + (scrollOffset / (totalContentHeight - height)) * (height - th);
+            sbThumb.setPosition({x + width - 11, ty});
+        } else {
+            scrollOffset = 0;
+        }
     }
     
-    bool isAnyWidgetHovered(const sf::RenderWindow& win) const {
+    // CHANGE: Checks if the mouse is hovering over the ENTIRE sidebar panel, not just individual widgets
+    bool isMouseOver(const sf::RenderWindow& win) const {
         sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
-        if (m.x < x || m.x > x + width) return false;
+        return (m.x >= x && m.x <= x + width && m.y >= y && m.y <= y + height);
+    }
+
+    bool isAnyWidgetHovered(const sf::RenderWindow& win) const {
+        if (!isMouseOver(win)) return false;
         for (const auto& m : modules) if(m->isMouseOver(win)) return true;
         return false;
     }
 
-    void handleEvent(const sf::Event& ev, const sf::RenderWindow& win) {
-        if (Dropdown::currentActive) { for (auto& mod : modules) { if(mod->handleEvent(ev, win)) break; } return; }
+    // CHANGE: Returns bool (true = event handled/captured)
+    bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) {
+        // 1. Priority: Dropdowns (always rendered on top)
+        if (Dropdown::currentActive) { 
+            for (auto& mod : modules) { 
+                if(mod->handleEvent(ev, win)) return true; 
+            } 
+            // If clicked outside the dropdown, consume the event anyway to close it
+            return true; 
+        }
+
+        bool captured = false;
+
+        // 2. Sidebar scrolling
         if (const auto* sc = ev.getIf<sf::Event::MouseWheelScrolled>()) {
             sf::Vector2f m = win.mapPixelToCoords(sf::Vector2i((int)sc->position.x, (int)sc->position.y));
             if (m.x > x && m.x < x + width) {
                 scrollOffset -= sc->delta * 30.0f; if (scrollOffset < 0) scrollOffset = 0; float maxS = std::max(0.0f, totalContentHeight - height); if (scrollOffset > maxS) scrollOffset = maxS; recalculateLayout();
+                return true; // Scroll event captured over the sidebar
             }
         }
+
+        // 3. Clicks and widgets
         sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
-        if (m.x > x && m.x < x + width) { for (auto& mod : modules) { if(mod->handleEvent(ev, win)) { recalculateLayout(); break; } } }
+        // If the mouse is physically over the sidebar, treat the event as "captured".
+        // This prevents clicking elements like the spectrum/aprs "through" the sidebar background.
+        if (m.x > x && m.x < x + width && m.y > y && m.y < y + height) {
+            captured = true; 
+            for (auto& mod : modules) { 
+                if(mod->handleEvent(ev, win)) { 
+                    recalculateLayout(); 
+                    return true; 
+                } 
+            }
+        }
+        
+        return captured;
     }
+
     void update(const sf::RenderWindow& win) { for(auto& m : modules) m->update(win); }
     
     void draw(sf::RenderWindow& win) {
