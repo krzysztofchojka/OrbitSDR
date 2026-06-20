@@ -3,38 +3,55 @@
 #include <vector>
 #include <complex>
 #include <cmath>
+#include <algorithm>
 
 using Complex = std::complex<double>;
 const double PI = 3.14159265358979323846;
 
-// Fast Fourier Transform (Recursive)
+// Fast Fourier Transform (Iterative, In-place)
+// NOTE: The size of vector 'a' must be a power of 2!
 inline void fft(std::vector<Complex>& a) {
     size_t n = a.size();
     if (n <= 1) return;
 
-    std::vector<Complex> even(n / 2);
-    std::vector<Complex> odd(n / 2);
-
-    for (size_t i = 0; i < n / 2; i++) { 
-        even[i] = a[2 * i]; 
-        odd[i] = a[2 * i + 1]; 
+    // Bit-reversal permutation
+    for (size_t i = 1, j = 0; i < n; i++) {
+        size_t bit = n >> 1;
+        for (; j & bit; bit >>= 1) {
+            j ^= bit;
+        }
+        j ^= bit;
+        if (i < j) {
+            std::swap(a[i], a[j]);
+        }
     }
 
-    fft(even); 
-    fft(odd);
-
-    for (size_t k = 0; k < n / 2; k++) {
-        Complex t = std::polar(1.0, -2.0 * PI * k / n) * odd[k];
-        a[k] = even[k] + t;
-        a[k + n / 2] = even[k] - t;
+    // Iterative FFT computation (Cooley-Tukey algorithm)
+    for (size_t len = 2; len <= n; len <<= 1) {
+        double angle = -2.0 * PI / len;
+        Complex wlen(std::cos(angle), std::sin(angle)); // Compute trigonometry only once per layer
+        
+        for (size_t i = 0; i < n; i += len) {
+            Complex w(1.0, 0.0);
+            for (size_t j = 0; j < len / 2; j++) {
+                Complex u = a[i + j];
+                Complex v = a[i + j + len / 2] * w;
+                a[i + j] = u + v;
+                a[i + j + len / 2] = u - v;
+                w *= wlen; // Complex multiplication is significantly faster than std::polar
+            }
+        }
     }
 }
 
 // Generate Hanning window
 inline std::vector<double> makeWindow(size_t size) {
     std::vector<double> w(size);
+    if (size == 0) return w;
+    
+    double phaseStep = 2.0 * PI / (double)(size - 1); // Precompute constant
     for (size_t i = 0; i < size; i++) {
-        w[i] = 0.5 * (1.0 - std::cos(2.0 * PI * i / (double)(size - 1)));
+        w[i] = 0.5 * (1.0 - std::cos(phaseStep * i));
     }
     return w;
 }
@@ -47,6 +64,7 @@ class Channelizer {
     std::complex<double> decimSum = {0.0, 0.0};
     int decimCount = 0;
     int decimFactor = 1;
+    int normCounter = 0;
 
 public:
     void configure(double inputRate, double targetRate) {
@@ -54,6 +72,7 @@ public:
         if (decimFactor < 1) decimFactor = 1;
         decimSum = {0,0};
         decimCount = 0;
+        normCounter = 0;
     }
 
     void setCenter(double offsetHz, double sampleRate) {
@@ -67,15 +86,25 @@ public:
         std::complex<double> mixed = in * ncoPhase;
         ncoPhase *= ncoStep;
         
-        // Normalize the vector periodically
-        if (std::abs(ncoPhase.real()) > 2.0) ncoPhase /= std::abs(ncoPhase); 
+        // Fast, low-cost NCO normalization to prevent floating-point drift.
+        // Performing this periodically (e.g., every 256 samples) drastically improves performance.
+        if (++normCounter >= 256) {
+            // Use Taylor expansion for fast normalization (1.5 - 0.5 * |z|^2)
+            // Avoids highly expensive std::abs() which performs a square root under the hood.
+            double mag2 = std::norm(ncoPhase); 
+            ncoPhase *= (1.5 - 0.5 * mag2);
+            normCounter = 0;
+        }
         
         // 2. Decimator
         decimSum += mixed;
         decimCount++;
 
         if (decimCount >= decimFactor) {
-            out = std::complex<float>((float)decimSum.real() / decimFactor, (float)decimSum.imag() / decimFactor);
+            // Multiplying by the reciprocal (1.0 / decimFactor) is faster than division,
+            // though the compiler usually optimizes this automatically for simple types.
+            float invDecim = 1.0f / decimFactor;
+            out = std::complex<float>((float)decimSum.real() * invDecim, (float)decimSum.imag() * invDecim);
             decimSum = {0,0};
             decimCount = 0;
             return true;

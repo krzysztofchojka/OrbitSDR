@@ -31,8 +31,8 @@
 #include "modules/AIS/AIS_Decoder.h"
 
 // --- CONSTANTS ---
-const int FFT_SIZE = 1024;
-const int INTERNAL_WATERFALL_WIDTH = 1024;
+const int FFT_SIZE = 2048;
+const int INTERNAL_WATERFALL_WIDTH = 2048;
 const double AUDIO_RATE = 48000.0;
 const int TOP_BAR_H = 60;
 const int SIDEBAR_W = 320;
@@ -981,8 +981,7 @@ int main() {
     auto originalAisToggle = chkAIS->onToggle;
     chkAIS->onToggle = [=](bool b) { originalAisToggle(b); aisUiRestore(b); };
     
-    // ==== DISABLED AIS ====
-    //modDecoders->addWidget(chkAIS);
+    modDecoders->addWidget(chkAIS);
 
     auto modDisp = sidebar.addModule("Display");
     auto slMinDb = std::make_shared<Slider>(SIDEBAR_W - 40, -120.0f, -20.0f, -90.0f, "Min dB", font); slMinDb->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.minDb = v; }; modDisp->addWidget(slMinDb);
@@ -1054,7 +1053,9 @@ int main() {
     auto spacer = std::make_shared<Spacer>(130.0f); // 120px (MINI_H) + 10px margin
     modInspector->addWidget(spacer);
 
-    std::vector<std::uint8_t> waterfall(INTERNAL_WATERFALL_WIDTH * 2048 * 4, 0); sf::Texture wTex; if(!wTex.resize({INTERNAL_WATERFALL_WIDTH, 2048})) return 1; sf::Sprite wSpr(wTex); 
+    std::vector<std::uint8_t> waterfall(INTERNAL_WATERFALL_WIDTH * 2048 * 4, 0); sf::Texture wTex; if(!wTex.resize({INTERNAL_WATERFALL_WIDTH, 2048})) return 1;
+    wTex.setSmooth(true);
+    sf::Sprite wSpr(wTex); 
     LayoutState layout; sf::Vector2u lastSize = window.getSize();
     auto updateLayout = [&](int w, int h) { layout.winW = (float)w; layout.winH = (float)h; layout.sidebarX = layout.winW - SIDEBAR_W; layout.specW = layout.sidebarX; layout.specH = 250.0f; layout.waterfallH = layout.winH - TOP_BAR_H - layout.specH; if (layout.waterfallH < 100) layout.waterfallH = 100; topBar.setSize({layout.winW, (float)TOP_BAR_H}); freqVFO.setPosition(20, 4); btnTuningMode.setPosition(370, 10); btnPlay.setPosition(320, 10); volSlider.setPosition(layout.winW - 170, 10); btnMute.setPosition(layout.winW - 220, 10); sidebar.setGeometry(layout.sidebarX, TOP_BAR_H, layout.winH - TOP_BAR_H); timeSlider.setPosition(20, layout.winH - 30); timeSlider.setWidth(layout.specW - 40); wSpr.setPosition({0, TOP_BAR_H + layout.specH}); float scaleX = layout.specW / (float)INTERNAL_WATERFALL_WIDTH; wSpr.setScale({scaleX, 1.0f}); wSpr.setTextureRect(sf::IntRect({0, 0}, {INTERNAL_WATERFALL_WIDTH, (int)layout.waterfallH})); };
     updateLayout(window.getSize().x, window.getSize().y);
