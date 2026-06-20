@@ -319,7 +319,8 @@ public:
         // Te wywołania bezpośrednie zostawiamy jako "fallback"
         rtlsdr_set_sample_rate(dev, sampleRate);
         rtlsdr_set_center_freq(dev, currentCenterFreq);
-        rtlsdr_set_tuner_gain_mode(dev, 0); 
+        rtlsdr_set_tuner_gain_mode(dev, 0);
+        rtlsdr_set_agc_mode(dev, 1);
         rtlsdr_reset_buffer(dev);
         
         int count = rtlsdr_get_tuner_gains(dev, NULL);
@@ -357,17 +358,24 @@ public:
             if (newGain != -999) {
                 if (dev) {
                     if (newGain == -1) {
-                        rtlsdr_set_tuner_gain_mode(dev, 0); // Auto
+                        // Włączenie AGC z powrotem
+                        rtlsdr_set_tuner_gain_mode(dev, 0); // 0 = Auto Tuner AGC
+                        rtlsdr_set_agc_mode(dev, 1);        // 1 = Włącz RTL AGC
                     } else {
-                        rtlsdr_set_tuner_gain_mode(dev, 1); // Manual
-                        
+                        // Wyłączenie AGC (przejście na tryb manualny)
+                        rtlsdr_set_tuner_gain_mode(dev, 1); // 1 = Manual Tuner
+                        rtlsdr_set_agc_mode(dev, 0);        // 0 = Wyłącz RTL AGC
+
                         // Znajdź najbliższy dostępny gain
                         int targetGain = newGain * 10;
                         int bestGain = targetGain;
                         int minDiff = 100000;
                         for (int g : availableGains) {
                             int diff = std::abs(g - targetGain);
-                            if (diff < minDiff) { minDiff = diff; bestGain = g; }
+                            if (diff < minDiff) {
+                                minDiff = diff;
+                                bestGain = g;
+                            }
                         }
                         rtlsdr_set_tuner_gain(dev, bestGain);
                     }

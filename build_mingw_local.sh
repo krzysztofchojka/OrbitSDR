@@ -11,7 +11,8 @@ pacman -S --needed --noconfirm \
     mingw-w64-ucrt-x86_64-rtl-sdr \
     mingw-w64-ucrt-x86_64-make \
     unzip \
-    curl
+    curl \
+    wget
 
 # 2. Download and prepare SFML 3.0 for MinGW
 if [ ! -d "sfml" ]; then
@@ -23,13 +24,13 @@ if [ ! -d "sfml" ]; then
     rm sfml.zip
 fi
 
-# --- NEW: Define and create the build directory ---
+# --- Define and create the build directory ---
 BUILD_DIR="build"
 mkdir -p "$BUILD_DIR"
 
 # 3. Path configuration
 SRC_DIR="src"
-OUT_FILE="$BUILD_DIR/orbitsdr.exe"  # Output binary will be placed in the build directory
+OUT_FILE="$BUILD_DIR/orbitsdr.exe"
 SFML_PATH="$(pwd)/sfml"
 SDR_INC="$(pwd)/deps/sdrplay/include"
 SDR_LIB="$(pwd)/deps/sdrplay/lib/windows"
@@ -67,10 +68,8 @@ echo "------------------------------------------"
 echo "Copying DLL files to /$BUILD_DIR folder..."
 echo "------------------------------------------"
 
-# Copy SFML DLLs
 cp "$SFML_PATH/bin/"*.dll "$BUILD_DIR/"
 
-# Copy SDRPlay DLL
 if [ -f "$SDR_LIB/sdrplay_api.dll" ]; then
     cp "$SDR_LIB/sdrplay_api.dll" "$BUILD_DIR/"
 else
@@ -78,12 +77,33 @@ else
     exit 1
 fi
 
-# Copy system dependencies (including rtl-sdr) directly to the build folder
+# Bezpieczne kopiowanie WSZYSTKICH systemowych DLLi (w tym libwinpthread-1.dll)
 echo "Searching for MinGW system DLL files..."
 for dll in $(ldd "$OUT_FILE" | grep "/ucrt64" | awk '{print $3}'); do
     echo "Copying to build: $(basename "$dll")"
     cp "$dll" "$BUILD_DIR/"
 done
+
+# 6. OVERRIDE: Download latest RTL-SDR drivers for V4 support
+echo "------------------------------------------"
+echo "Attempting to download latest RTL-SDR V4 drivers from Osmocom..."
+RTL_ZIP_URL="https://ftp.osmocom.org/binaries/windows/rtl-sdr/rtl-sdr-64bit-20260614.zip"
+RTL_ZIP_DIR="rtl-sdr-64bit-20260614"
+
+if curl -sSL -f -o rtlsdr_v4.zip "$RTL_ZIP_URL" || wget -q -O rtlsdr_v4.zip "$RTL_ZIP_URL"; then
+    echo "Download successful. Injecting ONLY librtlsdr.dll into $BUILD_DIR..."
+    unzip -q -o rtlsdr_v4.zip
+    
+    # Podmieniamy TYLKO jedną bibliotekę
+    cp "$RTL_ZIP_DIR/librtlsdr.dll" "$BUILD_DIR/"
+    
+    # Cleanup
+    rm -rf "$RTL_ZIP_DIR" rtlsdr_v4.zip
+    echo "librtlsdr.dll (V4 support) successfully applied."
+else
+    echo "WARNING: Could not download RTL-SDR V4 drivers. Falling back to older system DLL."
+    rm -f rtlsdr_v4.zip
+fi
 
 echo "------------------------------------------"
 echo "DONE! The complete application is located in the folder: /$BUILD_DIR"
