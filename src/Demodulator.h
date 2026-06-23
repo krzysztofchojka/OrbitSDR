@@ -148,7 +148,11 @@ public:
 
         float iqAlpha = 1.0f;
         if (sampleRateIn > 0) {
-            iqAlpha = 2.0f * (float)PI * (bandwidthHz / 2.0f) / (float)sampleRateIn;
+            // Dla modulacji jednowstęgowych (LSB, USB) filtr musi być 2x szerszy,
+            // ponieważ całe pasmo znajduje się tylko po jednej stronie 0 Hz.
+            float filterBw = (mode == Mode::LSB || mode == Mode::USB) ? bandwidthHz : (bandwidthHz / 2.0f);
+            
+            iqAlpha = 2.0f * (float)PI * filterBw / (float)sampleRateIn;
             if (iqAlpha > 1.0f) iqAlpha = 1.0f;
         }
 
