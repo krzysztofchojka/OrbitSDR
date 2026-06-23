@@ -31,8 +31,9 @@
 #include "modules/AIS/AIS_Decoder.h"
 
 // --- CONSTANTS ---
-const int FFT_SIZE = 2048;
-const int INTERNAL_WATERFALL_WIDTH = 2048;
+const int FFT_SIZE = 8192; // Ogromna rozdzielczość FFT w tle
+const int INTERNAL_WATERFALL_WIDTH = 2048; // Zawsze ostre, wycięte piksele dla GUI
+const int WATERFALL_HEIGHT_PX = 1024;
 const double AUDIO_RATE = 48000.0;
 const int TOP_BAR_H = 60;
 const int SIDEBAR_W = 320;
@@ -157,6 +158,7 @@ std::deque<AprsLastPacket> loadLastLogLinesAsPackets(const std::string& filename
 struct SharedData {
     std::mutex mtx;
     double tunedFreqPercent = 0.5; double pendingSeekRequest = -1.0; double bandwidth = 12500.0; long long centerFreq = 0;
+    double viewCenterPct = 0.5; // ODKLEJONY ŚRODEK EKRANU OD TUNERA!
     float volume = 0.5f; bool isMuted = false;
     float rfGain = -1.0f;
     float squelchThreshold = -100.0f; bool stereoEnabled = false; Mode mode = Mode::NFM; bool isPlaying = false;
@@ -180,10 +182,10 @@ struct SharedData {
     std::vector<uint8_t> inspectorWaterfallRow; // Single waterfall row
     bool newInspectorData = false;
     
-    SharedData() : fftSpectrum(FFT_SIZE, -100.0), 
+    SharedData() : fftSpectrum(INTERNAL_WATERFALL_WIDTH, -100.0), 
                    waterfallRow(INTERNAL_WATERFALL_WIDTH * 4, 0),
-                   inspectorSpectrum(FFT_SIZE/2, -100.0), // Smaller FFT is sufficient for the inspector
-                   inspectorWaterfallRow(280 * 4, 0) {}   // Sidebar module width
+                   inspectorSpectrum(FFT_SIZE/2, -100.0),
+                   inspectorWaterfallRow(280 * 4, 0) {} 
 };
 
 std::mutex sourceMtx; std::shared_ptr<IQSource> currentSource;
@@ -215,25 +217,29 @@ sf::Color getHeatmap(float v, int theme) {
 
 std::string formatHz(long long hz) { std::stringstream ss; ss << std::fixed << std::setprecision(3) << (hz / 1000000.0) << " MHz"; return ss.str(); }
 
-void drawGrid(sf::RenderWindow& window, const sf::Font& font, float x, float y, float w, float h, long long cf, double visibleSpan, float minDb, float maxDb) {
+void drawGrid(sf::RenderWindow& window, const sf::Font& font, float x, float y, float w, float h, long long cf, double hwSampleRate, double viewStartPct, double viewEndPct, float minDb, float maxDb) {
     float dbStep = 20.0f;
     for (float db = 0; db >= -140; db -= dbStep) {
         if (db > maxDb || db < minDb) continue;
         float norm = (db - minDb) / (maxDb - minDb); float yPos = y + h - (norm * h);
-        sf::RectangleShape line({w, 1}); line.setPosition({x, yPos}); line.setFillColor(sf::Color(80, 80, 80, 100)); window.draw(line);
-        sf::Text l(font, std::to_string((int)db), 20); l.setScale({0.5f, 0.5f});
-        l.setPosition({x+2, yPos-12}); l.setFillColor(sf::Color(200, 200, 200, 150)); window.draw(l);
+        sf::RectangleShape line({w, 1}); line.setPosition(sf::Vector2f(x, yPos)); line.setFillColor(sf::Color(80, 80, 80, 100)); window.draw(line);
+        sf::Text l(font, std::to_string((int)db), 20); l.setScale(sf::Vector2f(0.5f, 0.5f));
+        l.setPosition(sf::Vector2f(x+2, yPos-12)); l.setFillColor(sf::Color(200, 200, 200, 150)); window.draw(l);
     }
-    double startFreq = (double)cf - visibleSpan / 2.0; double endFreq = (double)cf + visibleSpan / 2.0;
+    
+    double startFreq = (double)cf + (viewStartPct - 0.5) * hwSampleRate;
+    double endFreq = (double)cf + (viewEndPct - 0.5) * hwSampleRate;
+    double visibleSpan = endFreq - startFreq;
+    
     double stepHz = 200000.0;
     if (visibleSpan < 1000000) stepHz = 100000.0; if (visibleSpan < 500000) stepHz = 50000.0; if (visibleSpan < 200000) stepHz = 25000.0; if (visibleSpan > 5000000) stepHz = 500000.0; if (visibleSpan > 10000000) stepHz = 1000000.0;
     long long firstLineFreq = (long long)(ceil(startFreq / stepHz) * stepHz);
     for (double f = (double)firstLineFreq; f < endFreq; f += stepHz) {
         float normPos = (float)((f - startFreq) / visibleSpan); float xPos = x + normPos * w;
-        sf::RectangleShape line({1, h}); line.setPosition({xPos, y}); line.setFillColor(sf::Color(80, 80, 80, 100)); window.draw(line);
+        sf::RectangleShape line({1, h}); line.setPosition(sf::Vector2f(xPos, y)); line.setFillColor(sf::Color(80, 80, 80, 100)); window.draw(line);
         std::string freqStr = formatHz((long long)f); if(freqStr.size() > 4) freqStr = freqStr.substr(0, freqStr.size()-4);
-        sf::Text l(font, freqStr, 20); l.setScale({0.5f, 0.5f});
-        sf::FloatRect b = l.getGlobalBounds(); l.setPosition({xPos - b.size.x/2, y + h - 15}); l.setFillColor(sf::Color(220, 220, 220, 200)); window.draw(l);
+        sf::Text l(font, freqStr, 20); l.setScale(sf::Vector2f(0.5f, 0.5f));
+        sf::FloatRect b = l.getGlobalBounds(); l.setPosition(sf::Vector2f(xPos - b.size.x/2, y + h - 15)); l.setFillColor(sf::Color(220, 220, 220, 200)); window.draw(l);
     }
 }
 
@@ -257,28 +263,20 @@ public:
     }
 
     void process(const std::vector<Complex>& rawIQ, double sampleRate, double targetFreqOffset, double bandwidth, SharedData& shared) {
-        // 1. Calculate Decimation Factor
-        // We want the bandwidth to occupy most of the view.
-        // Target Sample Rate = Bandwidth * 1.2 (margin)
         if (bandwidth < 100.0) bandwidth = 100.0;
         double targetRate = bandwidth * 1.2;
         int decimation = (int)(sampleRate / targetRate);
         if (decimation < 1) decimation = 1;
 
-        // 2. Configure NCO (Mixer) to shift frequency to 0 Hz
         double angle = -2.0 * PI * (targetFreqOffset / sampleRate);
         ncoStep = std::polar(1.0, angle);
 
-        // 3. Processing loop (Mixer -> Decimator)
         for (const auto& s : rawIQ) {
-            // A. Mixer (Frequency Shift)
             Complex mixed = s * ncoPhase;
             ncoPhase *= ncoStep;
             
-            // Normalize phase vector periodically
             if (std::abs(ncoPhase.real()) > 2.0) ncoPhase /= std::abs(ncoPhase);
 
-            // B. Decimation (Boxcar Filter - simplest anti-aliasing)
             decimSum += mixed;
             decimCount++;
 
@@ -286,15 +284,12 @@ public:
                 Complex outSample = decimSum / (double)decimCount;
                 decimSum = {0,0};
                 decimCount = 0;
-
                 buffer.push_back(outSample);
 
-                // C. If we have enough samples -> Perform FFT
                 if (buffer.size() >= INSPECTOR_FFT_SIZE) {
                     performFFT(shared);
                     buffer.clear();
                     
-                    // Reset NCO to avoid numerical issues during long runs
                     double m = std::abs(ncoPhase);
                     ncoPhase /= m;
                 }
@@ -305,14 +300,9 @@ public:
 private:
     void performFFT(SharedData& shared) {
         std::vector<Complex> fftData = buffer;
-        
-        // Windowing
         for(size_t i=0; i<INSPECTOR_FFT_SIZE; i++) fftData[i] *= windowFunc[i];
-        
-        // FFT
         fft(fftData);
 
-        // Conversion to dB and shift (fftshift)
         std::vector<double> spectrum(INSPECTOR_FFT_SIZE);
         for(size_t i=0; i<INSPECTOR_FFT_SIZE; i++) {
             int shiftIdx = (i + INSPECTOR_FFT_SIZE/2) % INSPECTOR_FFT_SIZE;
@@ -320,8 +310,6 @@ private:
             spectrum[i] = 20.0 * std::log10(mag + 1e-12);
         }
 
-        // Generate Waterfall row immediately here (on DSP thread)
-        // GUI image width is e.g. 280px
         int width = 280;
         std::vector<uint8_t> row(width * 4);
         
@@ -335,7 +323,6 @@ private:
         }
 
         for(int x=0; x<width; x++) {
-            // Simple linear mapping (nearest neighbor or linear)
             int fftIdx = (x * INSPECTOR_FFT_SIZE) / width;
             if (fftIdx >= INSPECTOR_FFT_SIZE) fftIdx = INSPECTOR_FFT_SIZE - 1;
             
@@ -349,7 +336,6 @@ private:
             row[x*4+3] = 255;
         }
 
-        // Push to GUI
         {
             std::lock_guard<std::mutex> l(shared.mtx);
             shared.inspectorSpectrum = spectrum;
@@ -380,7 +366,10 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
     double lastSampleRate = 0;
     std::vector<Complex> iqBuffer;
     std::vector<double> winFunc = makeWindow(FFT_SIZE);
-    std::vector<double> localFftHistory(FFT_SIZE, -100.0);
+    std::vector<double> localFftHistory(INTERNAL_WATERFALL_WIDTH, -100.0); // Zawsze 2048 px
+    std::vector<Complex> fftBuffer(FFT_SIZE, {0,0});
+    int fftBufferIdx = 0;
+    float smoothedRssi = -100.0f; // Wygładzanie Squelcha
     WavWriter recorder;
     sf::Clock waterfallTimer;
 
@@ -388,11 +377,12 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
         std::shared_ptr<IQSource> src = nullptr; { std::lock_guard<std::mutex> lock(sourceMtx); src = currentSource; }
         if (!src) { std::this_thread::sleep_for(std::chrono::milliseconds(20)); continue; }
 
-        double targetFreqPct, bw; float vol; bool muted; Mode mode; bool play, aprsActive; float minDb, maxDb; bool doRecord; RecMode rMode; std::string rPath; float sqThr; bool stereo; double seekReq = -1.0; int themeID = 0;
+        double targetFreqPct, bw; float vol; bool muted; Mode mode; bool play, aprsActive; float minDb, maxDb; bool doRecord; RecMode rMode; std::string rPath; float sqThr; bool stereo; double seekReq = -1.0; int themeID = 0; float currentZoom = 1.0f;
+        double viewCenter = 0.5;
         
         SDRModule* activeModule = nullptr;
 
-        { std::lock_guard<std::mutex> lock(shared.mtx); seekReq = shared.pendingSeekRequest; shared.pendingSeekRequest = -1.0; float rawPct = shared.tunedFreqPercent; if (std::isnan(rawPct) || std::isinf(rawPct)) rawPct = 0.5f; targetFreqPct = std::clamp(rawPct, 0.0f, 1.0f); bw = shared.bandwidth; vol = shared.volume; muted = shared.isMuted; mode = shared.mode; play = shared.isPlaying; minDb = shared.minDb; maxDb = shared.maxDb; doRecord = shared.isRecording; rMode = shared.recMode; rPath = shared.recPath; aprsActive = shared.aprsEnabled; sqThr = shared.squelchThreshold; stereo = shared.stereoEnabled; themeID = shared.waterfallTheme; 
+        { std::lock_guard<std::mutex> lock(shared.mtx); seekReq = shared.pendingSeekRequest; shared.pendingSeekRequest = -1.0; float rawPct = shared.tunedFreqPercent; if (std::isnan(rawPct) || std::isinf(rawPct)) rawPct = 0.5f; targetFreqPct = std::clamp(rawPct, 0.0f, 1.0f); bw = shared.bandwidth; vol = shared.volume; muted = shared.isMuted; mode = shared.mode; play = shared.isPlaying; minDb = shared.minDb; maxDb = shared.maxDb; doRecord = shared.isRecording; rMode = shared.recMode; rPath = shared.recPath; aprsActive = shared.aprsEnabled; sqThr = shared.squelchThreshold; stereo = shared.stereoEnabled; themeID = shared.waterfallTheme; currentZoom = shared.zoomLevel; viewCenter = shared.viewCenterPct;
           activeModule = shared.activeDecoder;
         }
         
@@ -428,123 +418,109 @@ void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio)
             SDRModule* activeMod = nullptr;
             { std::lock_guard<std::mutex> l(shared.mtx); activeMod = shared.activeDecoder; }
             if (activeMod) {
-                // THERE WAS A 'font' BUG HERE - NOW USING 'reset()'
                 activeMod->reset(); 
             }
         }
         if (readCount > 0) {
-            if (recorder.active && rMode == RecMode::BASEBAND) { std::vector<float> rawFloat(readCount * 2); for(int i=0; i<readCount; i++) { rawFloat[i*2] = (float)iqBuffer[i].real(); rawFloat[i*2+1] = (float)iqBuffer[i].imag(); } recorder.write(rawFloat.data(), rawFloat.size()); }
-            
-            std::vector<Complex> fftData(FFT_SIZE);
-            int offset = 0; if (readCount > FFT_SIZE) offset = (readCount - FFT_SIZE) / 2;
-            for (size_t i = 0; i < FFT_SIZE && (i + offset) < readCount; i++) fftData[i] = iqBuffer[i + offset] * winFunc[i];
-            fft(fftData);
-
-            // --- NEW INSPECTOR SECTION ---
-            // 1. Calculate frequency offset (where we are tuning)
-            // tunedFreqPercent is 0.0-1.0 relative to the whole band
-            double offsetFromCenter = (targetFreqPct - 0.5) * sr;
-            
-            // Correction for USB/LSB (band center is shifted)
-            double inspectorTarget = offsetFromCenter;
-            if (mode == Mode::USB) inspectorTarget += bw / 2.0;
-            if (mode == Mode::LSB) inspectorTarget -= bw / 2.0;
-
-            // 2. Pass to Inspector (scale IQBuffer to std::vector)
-            std::vector<Complex> chunk(iqBuffer.begin(), iqBuffer.begin() + readCount);
-            
-            // This generates a new, accurate FFT and inserts it into sharedData
-            inspector.process(chunk, sr, inspectorTarget, bw, shared);
-            
-            // -----------------------------
-            
-            // --- INTEGRATION MODULE AIS ---
-            SDRModule* activeMod = nullptr;
-            { 
-                std::lock_guard<std::mutex> l(shared.mtx); 
-                activeMod = shared.activeDecoder; 
+            if (recorder.active && rMode == RecMode::BASEBAND) { 
+                std::vector<float> rawFloat(readCount * 2); for(int i=0; i<readCount; i++) { rawFloat[i*2] = (float)iqBuffer[i].real(); rawFloat[i*2+1] = (float)iqBuffer[i].imag(); } recorder.write(rawFloat.data(), rawFloat.size()); 
             }
 
-            if (activeMod && activeMod->enabled) {
-                // Ensure we are working with IQ data, not audio
-                if (sr > 200000.0) { 
-                    // Calculate the offset from Center Frequency to the tuned VFO
-                    // targetFreqPct is 0.0 (left) to 1.0 (right) of the bandwidth
-                    double centerOffset = (targetFreqPct - 0.5) * sr;
-
-                    // --- ADD THIS LOG TEMPORARILY ---
-                    static int logLimiter = 0;
-                    if (logLimiter++ % 20 == 0) {
-                        std::cout << "[MAIN DEBUG] Center Freq: " << shared.centerFreq 
-                                  << " | Offset: " << centerOffset 
-                                  << " | Target Freq: " << (shared.centerFreq + centerOffset) << std::endl;
-                    }
-                    // -------------------------------
-                    
-                    // Create vector from RingBuffer array
-                    std::vector<Complex> chunk(iqBuffer.begin(), iqBuffer.begin() + readCount);
-                    
-                    // PASS THE OFFSET!
-                    activeMod->processIQ(chunk, sr, centerOffset);
-                }
+            // Stale gromadzimy próbki do asynchronicznego FFT, bez spowalniania audio!
+            for(int i = 0; i < readCount; i++) {
+                fftBuffer[fftBufferIdx] = iqBuffer[i];
+                fftBufferIdx = (fftBufferIdx + 1) % FFT_SIZE;
             }
-            // ----------------------------
-            
-            int visualBin = (int)(targetFreqPct * FFT_SIZE); if (visualBin < 0) visualBin = 0; if (visualBin >= FFT_SIZE) visualBin = FFT_SIZE - 1;
-            int shiftedIdx = (visualBin + FFT_SIZE / 2) % FFT_SIZE; float signalMag = std::abs(fftData[shiftedIdx]) / FFT_SIZE; float rssiDb = 20.0f * std::log10(signalMag + 1e-12f);
-            
+
+            // Wspólne obliczenia dla Inspectora i Audio
+            double freqOffset = (targetFreqPct - 0.5) * sr;
+            if (mode == Mode::USB) freqOffset += bw / 2.0;
+            if (mode == Mode::LSB) freqOffset -= bw / 2.0;
+            std::vector<Complex> chunkToProcess(iqBuffer.begin(), iqBuffer.begin() + readCount);
+
+            // --- SIGNAL INSPECTOR UPDATE ---
+            inspector.process(chunkToProcess, sr, freqOffset, bw, shared);
+
+            // --- DEMODULACJA AUDIO (Działa niezależnie od FFT!) ---
             if (play) {
-                double freqOffset = (targetFreqPct - 0.5) * sr;
-                if (mode == Mode::USB) freqOffset += bw / 2.0;
-                if (mode == Mode::LSB) freqOffset -= bw / 2.0;
-                
-                std::vector<Complex> chunkToProcess(iqBuffer.begin(), iqBuffer.begin() + readCount);
                 auto audioData = demod.process(chunkToProcess, freqOffset, bw, mode, stereo);
                 
-                // Legacy APRS
                 if (aprsActive) { std::vector<float> mono; mono.reserve(audioData.size()/2); for(size_t i=0; i<audioData.size(); i+=2) mono.push_back(audioData[i]); aprsDecoder.process(mono); }
                 
-                // New Modular Decoder (AIS, etc.)
                 if (activeModule && activeModule->enabled) {
-                    std::vector<float> mono;
-                    mono.reserve(audioData.size()/2);
+                    std::vector<float> mono; mono.reserve(audioData.size()/2);
                     for(size_t i=0; i<audioData.size(); i+=2) mono.push_back(audioData[i]);
                     activeModule->processAudio(mono);
                 }
 
-                if (rssiDb < sqThr) std::fill(audioData.begin(), audioData.end(), 0.0f);
+                // Squelch: Zastosowanie wygładzonego RSSI i pominięcie jeśli suwak na maksa w lewo
+                if (sqThr > -99.0f) {
+                    if (smoothedRssi < sqThr) std::fill(audioData.begin(), audioData.end(), 0.0f);
+                }
+
                 float finalVol = muted ? 0.0f : vol;
-            for (auto& s : audioData) {
-                if (std::isnan(s) || std::isinf(s)) s = 0.0f;
-                else s = std::clamp(s * finalVol, -1.0f, 1.0f);
-            }
+                for (auto& s : audioData) {
+                    if (std::isnan(s) || std::isinf(s)) s = 0.0f;
+                    else s = std::clamp(s * finalVol, -1.0f, 1.0f);
+                }
                 
                 audio.pushSamples(audioData);
                 if (recorder.active && rMode == RecMode::AUDIO) recorder.write(audioData.data(), audioData.size());
             }
             
+            // --- KRYSTALICZNY WODOSPAD I ZOOM (Tylko 30 FPS, żeby oszczędzić CPU/GPU) ---
             if (waterfallTimer.getElapsedTime().asMilliseconds() > 33) {
-                std::vector<uint8_t> tempRow(INTERNAL_WATERFALL_WIDTH * 4);
-                for (int x = 0; x < INTERNAL_WATERFALL_WIDTH; x++) {
-                    int fftIdx = (int)((float)x / INTERNAL_WATERFALL_WIDTH * FFT_SIZE);
-                    int sIdx = (fftIdx + FFT_SIZE / 2) % FFT_SIZE;
-                    float rawMag = std::abs(fftData[sIdx]) / FFT_SIZE;
-                    float rawDb = 20 * std::log10(rawMag + 1e-12);
-                    float norm = (rawDb - minDb) / (maxDb - minDb);
-                    sf::Color c = getHeatmap(norm, themeID);
-                    int px = x * 4; tempRow[px] = c.r; tempRow[px + 1] = c.g; tempRow[px + 2] = c.b; tempRow[px + 3] = 255;
-                }
+                std::vector<Complex> fftData(FFT_SIZE);
+                for(int i=0; i<FFT_SIZE; i++) fftData[i] = fftBuffer[(fftBufferIdx + i) % FFT_SIZE] * winFunc[i];
+                fft(fftData);
+
+                // Obliczanie granic widoku na podstawie procentowej pozycji CENTRUM EKRANU
+                double visibleFraction = 1.0 / currentZoom;
+                double viewStartPct = viewCenter - visibleFraction / 2.0;
+                double viewEndPct = viewCenter + visibleFraction / 2.0;
+
+                // Blokada przed wyjściem okna za krawędzie ekranu (Clamp)
+                if (viewStartPct < 0.0) { viewStartPct = 0.0; viewEndPct = visibleFraction; viewCenter = viewStartPct + visibleFraction/2.0; }
+                if (viewEndPct > 1.0) { viewEndPct = 1.0; viewStartPct = 1.0 - visibleFraction; viewCenter = viewStartPct + visibleFraction/2.0; }
+
+                int viewStartBin = (int)(viewStartPct * FFT_SIZE);
+                int viewEndBin = (int)(viewEndPct * FFT_SIZE);
+                int visibleBins = viewEndBin - viewStartBin;
+
                 float alpha = (play) ? 0.3f : 1.0f;
-                for (int i = 0; i < FFT_SIZE; i++) {
-                    int idx = (i + FFT_SIZE / 2) % FFT_SIZE;
-                    float mag = std::abs(fftData[idx]) / FFT_SIZE;
-                    float db = 20 * std::log10(mag + 1e-12);
-                    localFftHistory[i] = localFftHistory[i] * (1.0f - alpha) + db * alpha;
+                std::vector<uint8_t> tempRow(INTERNAL_WATERFALL_WIDTH * 4);
+                
+                for (int x = 0; x < INTERNAL_WATERFALL_WIDTH; x++) {
+                    // Ekstrakcja tylko "widzialnej" części ogromnego FFT i mapowanie na stałe 2048 pikseli (razor sharp)
+                    float binFloat = viewStartBin + (float)x / INTERNAL_WATERFALL_WIDTH * visibleBins;
+                    int bIdx = std::clamp((int)binFloat, 0, FFT_SIZE - 1);
+                    
+                    int shiftedIdx = (bIdx + FFT_SIZE / 2) % FFT_SIZE;
+                    float mag = std::abs(fftData[shiftedIdx]) / FFT_SIZE;
+                    float db = 20.0f * std::log10(mag + 1e-12f);
+                    
+                    localFftHistory[x] = localFftHistory[x] * (1.0f - alpha) + db * alpha;
+                    float norm = (localFftHistory[x] - minDb) / (maxDb - minDb);
+                    sf::Color c = getHeatmap(norm, themeID);
+                    
+                    int px = x * 4;
+                    tempRow[px] = c.r; tempRow[px + 1] = c.g; tempRow[px + 2] = c.b; tempRow[px + 3] = 255;
                 }
+
+                // Aktualizacja gładkiego RSSI dla Squelcha bezpośrednio z binów tunera
+                int tunerBin = std::clamp((int)(targetFreqPct * FFT_SIZE), 0, FFT_SIZE - 1);
+                int shiftedTuner = (tunerBin + FFT_SIZE / 2) % FFT_SIZE;
+                float tMag = std::abs(fftData[shiftedTuner]) / FFT_SIZE;
+                smoothedRssi = smoothedRssi * 0.8f + (20.0f * std::log10(tMag + 1e-12f)) * 0.2f;
+
                 {
                     std::unique_lock<std::mutex> lock(shared.mtx, std::try_to_lock);
                     if (lock.owns_lock()) {
-                        shared.fftSpectrum = localFftHistory;
+                        // Kopiujemy tylko widoczne na ekranie piksele
+                        std::vector<double> visibleSpectrum(INTERNAL_WATERFALL_WIDTH);
+                        for(int i=0; i<INTERNAL_WATERFALL_WIDTH; i++) visibleSpectrum[i] = localFftHistory[i];
+                        
+                        shared.fftSpectrum = visibleSpectrum;
                         shared.waterfallRow = tempRow;
                         shared.newWaterfallData = true;
                         waterfallTimer.restart();
@@ -599,7 +575,7 @@ int main() {
     
     // Create AIS Module
     auto aisMod = std::make_unique<AISDecoder>();
-    ModuleContext ctx = { (float)AUDIO_RATE, font }; // Assuming 'font' is available later, but for structure we init here
+    ModuleContext ctx = { (float)AUDIO_RATE, font }; 
     aisMod->init(ctx);
     modules.push_back(std::move(aisMod));
     AISDecoder* ptrAIS = (AISDecoder*)modules[0].get(); // Keep ptr for GUI toggle
@@ -626,7 +602,6 @@ int main() {
     // AIS Checkbox (New Module)
     auto chkAIS = std::make_shared<Checkbox>("Enable AIS (162.025)", font);
 
-    // CHANGE BUTTON INITIALIZATION TO:
     auto btnNFM = std::make_shared<SdrButton>(36, 25, "NFM", font);
     auto btnAM = std::make_shared<SdrButton>(36, 25, "AM", font);
     auto btnWFM = std::make_shared<SdrButton>(36, 25, "WFM", font);
@@ -717,12 +692,11 @@ int main() {
             
             if (currentCenterFreq < 1000000) { 
                 currentCenterFreq = 97800000;
-                std::cout << "[INFO] Correcting hardware freq from <1MHz to 97.8MHz" << std::endl;
             }
 
             freqVFO.setFrequency(currentCenterFreq); 
             newSource->setCenterFrequency(currentCenterFreq); 
-            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; sharedData.centerFreq = currentCenterFreq; }
+            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; sharedData.viewCenterPct = 0.5; sharedData.centerFreq = currentCenterFreq; }
             
             slGain->setLimits(0.0f, 49.6f); slGain->setText("RF Gain: AGC");
             newSource->setHardwareOption("direct_sampling", hwState.directSampling);
@@ -734,12 +708,11 @@ int main() {
             
             if (currentCenterFreq < 1000000) { 
                 currentCenterFreq = 97800000;
-                std::cout << "[INFO] Correcting hardware freq from <1MHz to 97.8MHz" << std::endl;
             }
 
             freqVFO.setFrequency(currentCenterFreq); 
             newSource->setCenterFrequency(currentCenterFreq); 
-            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; sharedData.centerFreq = currentCenterFreq; }
+            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; sharedData.viewCenterPct = 0.5; sharedData.centerFreq = currentCenterFreq; }
             
             slGain->setLimits(0.0f, 50.0f); chkAgc->checked = true; slGain->setEnabled(false); sharedData.rfGain = -1.0f; 
             newSource->setHardwareOption("antenna", hwState.antennaIndex);
@@ -755,11 +728,12 @@ int main() {
             success = audioIn->open(deviceID, targetRate);
             newSource = audioIn;
             
-            currentCenterFreq = 0; // Sound card has no VFO
+            currentCenterFreq = 0; 
             freqVFO.setFrequency(currentCenterFreq);
             {
                 std::lock_guard<std::mutex> l(sharedData.mtx);
                 sharedData.tunedFreqPercent = 0.5;
+                sharedData.viewCenterPct = 0.5;
                 sharedData.centerFreq = 0;
             }
             slGain->setEnabled(false);
@@ -877,7 +851,6 @@ int main() {
         { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.aprsEnabled = b; } 
         rowModes->setEnabled(!b); 
         
-        // Disable AIS if APRS enabled
         if(b && chkAIS->checked) {
              chkAIS->checked = false; 
              { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.activeDecoder = nullptr; ptrAIS->enabled = false; }
@@ -889,7 +862,6 @@ int main() {
                 previousMode = sharedData.mode;
             }
 
-            // Check if selected source is Line-In / Sound Card
             bool isAudioIn = (currentSourceType == 3);
 
             btnNFM->setActive(!isAudioIn);
@@ -916,7 +888,6 @@ int main() {
                 slBW->setText("Bandwidth: 12.5 kHz");
             }
         } else { 
-            // Restore previous mode
             if(previousMode == Mode::NFM) setMode(Mode::NFM, btnNFM.get()); else if(previousMode == Mode::AM) setMode(Mode::AM, btnAM.get()); else if(previousMode == Mode::WFM) setMode(Mode::WFM, btnWFM.get()); else if (previousMode == Mode::RAW) setMode(Mode::RAW, btnRAW.get()); else if(previousMode == Mode::USB) setMode(Mode::USB, btnUSB.get()); else if(previousMode == Mode::LSB) setMode(Mode::LSB, btnLSB.get()); else setMode(Mode::OFF, btnOFF.get()); 
         } 
     }; 
@@ -925,13 +896,10 @@ int main() {
     // --- AIS TOGGLE ---
     chkAIS->onToggle = [&](bool b) {
         std::lock_guard<std::mutex> l(sharedData.mtx);
-        
-        // Disable APRS if AIS enabled
         if(b && chkAprs->checked) {
             chkAprs->checked = false;
             sharedData.aprsEnabled = false;
         }
-        
         rowModes->setEnabled(!b);
 
         if (b) {
@@ -939,7 +907,6 @@ int main() {
             ptrAIS->enabled = true;
             previousMode = sharedData.mode;
 
-            // Check if selected source is Line-In / Sound Card
             bool isAudioIn = (currentSourceType == 3);
 
             sharedData.mode = isAudioIn ? Mode::RAW : Mode::NFM;
@@ -965,19 +932,13 @@ int main() {
         } else {
             sharedData.activeDecoder = nullptr;
             ptrAIS->enabled = false;
-            // Restore previous mode logic (duplicated from APRS restore, can be refactored but inline is fine here)
-            // Note: Mutex is already locked
         }
     };
-    // If AIS turned off, we need to restore UI outside lock or handle carefully.
-    // Let's simplify: restore only if button click finished.
-    // The lambda above handles internal state. UI restore below:
     auto aisUiRestore = [&](bool b) {
         if(!b) {
              if(previousMode == Mode::NFM) setMode(Mode::NFM, btnNFM.get()); else if(previousMode == Mode::AM) setMode(Mode::AM, btnAM.get()); else if(previousMode == Mode::WFM) setMode(Mode::WFM, btnWFM.get()); else if (previousMode == Mode::RAW) setMode(Mode::RAW, btnRAW.get()); else if(previousMode == Mode::USB) setMode(Mode::USB, btnUSB.get()); else if(previousMode == Mode::LSB) setMode(Mode::LSB, btnLSB.get()); else setMode(Mode::OFF, btnOFF.get()); 
         }
     };
-    // Wrap the toggle to include UI restore
     auto originalAisToggle = chkAIS->onToggle;
     chkAIS->onToggle = [=](bool b) { originalAisToggle(b); aisUiRestore(b); };
     
@@ -986,7 +947,27 @@ int main() {
     auto modDisp = sidebar.addModule("Display");
     auto slMinDb = std::make_shared<Slider>(SIDEBAR_W - 40, -120.0f, -20.0f, -90.0f, "Min dB", font); slMinDb->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.minDb = v; }; modDisp->addWidget(slMinDb);
     auto slMaxDb = std::make_shared<Slider>(SIDEBAR_W - 40, -40.0f, 40.0f, 0.0f, "Max dB", font); slMaxDb->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.maxDb = v; }; modDisp->addWidget(slMaxDb);
-    auto slZoom = std::make_shared<Slider>(SIDEBAR_W - 40, 1.0f, 8.0f, 1.0f, "Zoom", font); slZoom->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.zoomLevel = v; }; modDisp->addWidget(slZoom);
+    
+    // ZMIANA: Zzoomuj mądrze (utrzymując celownik tunera na tym samym miejscu ekranu)
+    auto slZoom = std::make_shared<Slider>(SIDEBAR_W - 40, 1.0f, 8.0f, 1.0f, "Zoom", font); 
+    slZoom->onChange = [&](float v) { 
+        std::lock_guard<std::mutex> l(sharedData.mtx); 
+        double oldZoom = sharedData.zoomLevel;
+        double oldVisibleFraction = 1.0 / oldZoom;
+        double oldViewStart = sharedData.viewCenterPct - oldVisibleFraction / 2.0;
+        double tunerOffsetFromStart = sharedData.tunedFreqPercent - oldViewStart;
+        double tunerPosRatio = tunerOffsetFromStart / oldVisibleFraction; 
+        
+        sharedData.zoomLevel = v; 
+        double newVisibleFraction = 1.0 / v;
+        double newViewStart = sharedData.tunedFreqPercent - (tunerPosRatio * newVisibleFraction);
+        sharedData.viewCenterPct = newViewStart + newVisibleFraction / 2.0;
+        
+        if (sharedData.viewCenterPct - newVisibleFraction/2.0 < 0.0) sharedData.viewCenterPct = newVisibleFraction/2.0;
+        if (sharedData.viewCenterPct + newVisibleFraction/2.0 > 1.0) sharedData.viewCenterPct = 1.0 - newVisibleFraction/2.0;
+    }; 
+    modDisp->addWidget(slZoom);
+    
     auto ddTheme = std::make_shared<Dropdown>(SIDEBAR_W - 40, 25.0f, font); ddTheme->setOptions(THEME_NAMES); ddTheme->setSelection(0); 
     ddTheme->onChange = [&](int idx) { 
         std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.waterfallTheme = idx; Theme::setTheme(idx); 
@@ -1042,18 +1023,18 @@ int main() {
     // --- MINI WATERFALL ---
     const int MINI_W = 280;
     const int MINI_H = 120;
-    std::vector<uint8_t> miniWaterfall(MINI_W * MINI_H * 4, 0); // Black start
+    std::vector<uint8_t> miniWaterfall(MINI_W * MINI_H * 4, 0); 
     sf::Texture miniTex; 
-    // Casting to void silences the warning
-(void)miniTex.resize({(unsigned int)MINI_W, (unsigned int)MINI_H});
+    (void)miniTex.resize({(unsigned int)MINI_W, (unsigned int)MINI_H});
     sf::Sprite miniSpr(miniTex);
     
-    // Add to sidebar
     auto modInspector = sidebar.addModule("Signal Inspector");
-    auto spacer = std::make_shared<Spacer>(130.0f); // 120px (MINI_H) + 10px margin
+    auto spacer = std::make_shared<Spacer>(130.0f); 
     modInspector->addWidget(spacer);
 
-    std::vector<std::uint8_t> waterfall(INTERNAL_WATERFALL_WIDTH * 2048 * 4, 0); sf::Texture wTex; if(!wTex.resize({INTERNAL_WATERFALL_WIDTH, 2048})) return 1;
+    std::vector<std::uint8_t> waterfall(INTERNAL_WATERFALL_WIDTH * WATERFALL_HEIGHT_PX * 4, 0);
+    sf::Texture wTex;
+    if(!wTex.resize({INTERNAL_WATERFALL_WIDTH, WATERFALL_HEIGHT_PX})) return 1;
     wTex.setSmooth(true);
     sf::Sprite wSpr(wTex); 
     LayoutState layout; sf::Vector2u lastSize = window.getSize();
@@ -1127,7 +1108,7 @@ int main() {
     lblRecPath->setText("Path: " + truncatePath(savedRecPath, 25));
 
     sf::Clock debouncer; sf::Clock interactionCooldown; bool isDraggingScale = false, isSpectrumDragging = false; bool isDraggingBW = false; float dragStartBW = 0.0f; float dragStartMouseX = 0.0f; float lastDragX = 0.0f; float aprsLogScrollOffset = 0.0f;
-    auto applySpectrumTuning = [&](float mouseX) { bool isHw = false; double hwSampleRate = 2e6; { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) { isHw = currentSource->isHardware(); hwSampleRate = currentSource->getSampleRate(); } } float zoom = 1.0f; { std::lock_guard<std::mutex> l(sharedData.mtx); zoom = sharedData.zoomLevel; } double effectiveRate = hwSampleRate / zoom; double clickPct = mouseX / layout.specW; double offsetHz = (clickPct - 0.5) * effectiveRate; long long clickedFreq = currentCenterFreq + (long long)offsetHz; long long step = STEP_VALUES[ddSnap->selectedIndex]; if (step > 0) { clickedFreq = (long long)std::round((double)clickedFreq / step) * step; double newOffset = (double)(clickedFreq - currentCenterFreq); clickPct = 0.5 + (newOffset / effectiveRate); } if (stickyCenterMode && isHw) { pendingCenterFreq = clickedFreq; debouncer.restart(); { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } freqVFO.setFrequency(clickedFreq); } else { { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5 + (offsetHz / hwSampleRate); } freqVFO.setFrequency(clickedFreq); } };
+    bool isPanningView = false; // NOWOŚĆ DLA PRAWY KLIK (PRZESUWANIE EKRANU)
 
     // --- APRS PREVIEW STATE ---
     bool showAprsModal = false;
@@ -1145,9 +1126,50 @@ int main() {
         if (currentSourceType == 0) {
             timeSlider.update(window);
             if (timeSlider.isDragging) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.pendingSeekRequest = timeSlider.currentVal; } else { timeSlider.currentVal = prog; timeSlider.updateHandlePos(); } }
-        bool aprsOn = false; double tunePct = 0.5; Mode mode = Mode::NFM; float currentZoom = 1.0f; int currentTheme = 0;
-        { std::lock_guard<std::mutex> l(sharedData.mtx); aprsOn = sharedData.aprsEnabled; tunePct = sharedData.tunedFreqPercent; mode = sharedData.mode; currentZoom = sharedData.zoomLevel; currentTheme = sharedData.waterfallTheme; }
+        
+        bool aprsOn = false; double tunePct = 0.5; Mode mode = Mode::NFM; float currentZoom = 1.0f; int currentTheme = 0; double viewCenter = 0.5;
+        { std::lock_guard<std::mutex> l(sharedData.mtx); aprsOn = sharedData.aprsEnabled; tunePct = sharedData.tunedFreqPercent; mode = sharedData.mode; currentZoom = sharedData.zoomLevel; currentTheme = sharedData.waterfallTheme; viewCenter = sharedData.viewCenterPct; }
         slZoom->update(window); 
+
+        // --- PRECYZYJNE WYLICZENIA EKRANU DLA WSZYSTKICH EVENTÓW ---
+        double visibleFraction = 1.0 / currentZoom;
+        double viewStartPct = viewCenter - visibleFraction / 2.0;
+        double viewEndPct = viewCenter + visibleFraction / 2.0;
+        
+        // Zabezpieczenie na wypadek ucieczki ekranu
+        if (viewStartPct < 0.0) { viewStartPct = 0.0; viewEndPct = visibleFraction; viewCenter = viewStartPct + visibleFraction/2.0; }
+        if (viewEndPct > 1.0) { viewEndPct = 1.0; viewStartPct = 1.0 - visibleFraction; viewCenter = viewStartPct + visibleFraction/2.0; }
+        double viewWidthPct = viewEndPct - viewStartPct;
+        
+        float tunerPosInView = (tunePct - viewStartPct) / viewWidthPct;
+        float visualCenterX = tunerPosInView * layout.specW;
+        float bwPct = (slBW->currentVal / hwSampleRate);
+        float bwPixels = (bwPct / viewWidthPct) * layout.specW;
+
+        auto applySpectrumTuning = [&](float mouseX) { 
+            bool isHwLocal = false; double sr = 2e6; 
+            { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) { isHwLocal = currentSource->isHardware(); sr = currentSource->getSampleRate(); } } 
+            
+            double clickViewPct = mouseX / layout.specW;
+            double clickedAbsolutePct = viewStartPct + clickViewPct * viewWidthPct;
+            double offsetHz = (clickedAbsolutePct - 0.5) * sr;
+            
+            long long clickedFreq = currentCenterFreq + (long long)offsetHz; 
+            long long step = STEP_VALUES[ddSnap->selectedIndex]; 
+            if (step > 0) { 
+                clickedFreq = (long long)std::round((double)clickedFreq / step) * step; 
+                double newOffset = (double)(clickedFreq - currentCenterFreq); 
+                clickedAbsolutePct = 0.5 + (newOffset / sr); 
+            } 
+            if (stickyCenterMode && isHwLocal) { 
+                pendingCenterFreq = clickedFreq; debouncer.restart(); 
+                { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; sharedData.viewCenterPct = 0.5; } 
+                freqVFO.setFrequency(clickedFreq); 
+            } else { 
+                { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = clickedAbsolutePct; } 
+                freqVFO.setFrequency(clickedFreq); 
+            } 
+        };
 
         if (pendingRfGain > -900.0f && gainDebouncer.getElapsedTime().asMilliseconds() > GAIN_LATENCY_MS) {
             {
@@ -1173,7 +1195,7 @@ int main() {
                     sf::FloatRect modalRect({mx, my}, {600.f, 400.f});
                     if (!modalRect.contains(m)) showAprsModal = false;
                  }
-                 continue; // Block everything else
+                 continue; 
             }
 
             // --- 2. SIDEBAR (High Priority & Blocking) ---
@@ -1194,52 +1216,41 @@ int main() {
                 topBarHandled = true;
                 long long targetVFO = freqVFO.getFrequency();
                 
-                // Calculate band limits (dependent on source Sample Rate)
                 double halfBW = hwSampleRate / 2.0;
                 double minF = (double)currentCenterFreq - halfBW;
                 double maxF = (double)currentCenterFreq + halfBW;
                 
-                // Band protection only works for files or "Software Tuning"
                 if (stickyCenterMode && isHw) {
                     pendingCenterFreq = targetVFO;
                     debouncer.restart();
-                    { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; }
+                    { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; sharedData.viewCenterPct = 0.5; }
                 } else {
-                    // Software Tuning / File mode
                     if (targetVFO > maxF || targetVFO < minF) {
                         if (isHw) {
-                            // We went off-screen! Automatically re-tune hardware following the mouse
                             pendingCenterFreq = targetVFO;
                             debouncer.restart();
-                            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; }
+                            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; sharedData.viewCenterPct = 0.5; }
                         } else {
-                            // For WAV file playback, we cannot re-tune hardware, so we clamp here
                             if (targetVFO > maxF) targetVFO = (long long)maxF;
                             if (targetVFO < minF) targetVFO = (long long)minF;
                             double newOffset = (double)(targetVFO - currentCenterFreq);
                             { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5 + (newOffset / hwSampleRate); }
                         }
                     } else {
-                        // We are within the visible screen limits, just move the tuning bar
                         double newOffset = (double)(targetVFO - currentCenterFreq);
                         { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5 + (newOffset / hwSampleRate); }
                     }
                 }
                 
-                // Update widget if we had to clamp the value
                 if (targetVFO != freqVFO.getFrequency()) freqVFO.setFrequency(targetVFO);
 
                 if (stickyCenterMode && isHw) { 
-                    // Hardware mode (changes physical radio frequency)
                     pendingCenterFreq = targetVFO; 
                     debouncer.restart(); 
-                    { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } 
+                    { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; sharedData.viewCenterPct = 0.5; } 
                 } else { 
-                    // File mode / Software Tuning
-                    // Calculate where the new frequency is in the spectrum (0.0 - 1.0)
                     double newOffset = (double)(targetVFO - currentCenterFreq);
                     double pct = 0.5 + (newOffset / hwSampleRate); 
-                    
                     { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = pct; } 
                 } 
             }
@@ -1269,7 +1280,7 @@ int main() {
                         freqVFO.setFrequency(rawNext); 
                         if (stickyCenterMode && isHw) { 
                             pendingCenterFreq = rawNext; debouncer.restart(); 
-                            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; } 
+                            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; sharedData.viewCenterPct = 0.5; } 
                         } else { 
                             double newOffset = (double)(rawNext - currentCenterFreq); 
                             double clickPct = 0.5 + (newOffset / hwSampleRate); 
@@ -1280,10 +1291,16 @@ int main() {
                 } 
             }
             if (const auto* mb = ev->getIf<sf::Event::MouseButtonPressed>()) { 
-                if (mb->button == sf::Mouse::Button::Left) { 
-                    sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window)); 
-                    
-                    // --- CLICK HANDLING FOR APRS LOG ---
+                sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window)); 
+                
+                if (mb->button == sf::Mouse::Button::Right) {
+                    bool inFreqScaleZone = (m.y > TOP_BAR_H && m.y < (TOP_BAR_H + layout.specH + layout.waterfallH) && m.x < layout.specW);
+                    if (inFreqScaleZone && !overAprs) {
+                        isPanningView = true;
+                        lastDragX = m.x;
+                    }
+                }
+                else if (mb->button == sf::Mouse::Button::Left) { 
                     if (overAprs) {
                         float logX = layout.specW - 300; 
                         float overlayY = layout.winH - 200.0f;
@@ -1302,13 +1319,9 @@ int main() {
                     bool overTimeline = (currentSourceType == 0) && (timeSlider.isDragging || (m.y > layout.winH - 40)); 
                     bool inFreqScaleZone = (m.y >= TOP_BAR_H + layout.specH - 10 && m.y <= TOP_BAR_H + layout.specH + 20 && m.x < layout.specW); 
                     
-                    // Calculate band edges (BW)
-                    double offsetFromCenter = (tunePct - 0.5); 
-                    float visualCenterX = (0.5 + (offsetFromCenter * currentZoom)) * layout.specW; 
-                    float bwPixels = (slBW->currentVal / (hwSampleRate / currentZoom)) * layout.specW; 
                     float leftEdge = visualCenterX - bwPixels / 2.0f; float rightEdge = visualCenterX + bwPixels / 2.0f; 
                     if (mode == Mode::USB) { leftEdge = visualCenterX; rightEdge = visualCenterX + bwPixels; } 
-                    if (mode == Mode::LSB) { leftEdge = visualCenterX - bwPixels; rightEdge = visualCenterX; } 
+                    if (mode == Mode::LSB) { leftEdge = visualCenterX - bwPixels; rightEdge = visualCenterX; }
                     
                     bool hitEdge = (std::abs(m.x - leftEdge) < 6 || std::abs(m.x - rightEdge) < 6) && (m.y > TOP_BAR_H && m.y < TOP_BAR_H + layout.specH); 
                     
@@ -1322,31 +1335,40 @@ int main() {
                 } 
             } else if (const auto* mr = ev->getIf<sf::Event::MouseButtonReleased>()) { 
                 if (mr->button == sf::Mouse::Button::Left) { isSpectrumDragging = false; isDraggingScale = false; isDraggingBW = false; } 
+                if (mr->button == sf::Mouse::Button::Right) { isPanningView = false; }
             } else if (const auto* mm = ev->getIf<sf::Event::MouseMoved>()) { 
                 sf::Vector2f m = window.mapPixelToCoords(mm->position); 
-                double offsetFromCenter = (tunePct - 0.5); 
-                float visualCenterX = (0.5 + (offsetFromCenter * currentZoom)) * layout.specW; 
-                float bwPixels = (slBW->currentVal / (hwSampleRate / currentZoom)) * layout.specW; 
+                
                 float leftEdge = visualCenterX - bwPixels / 2.0f; float rightEdge = visualCenterX + bwPixels / 2.0f; 
                 if (mode == Mode::USB) { leftEdge = visualCenterX; rightEdge = visualCenterX + bwPixels; } 
-                if (mode == Mode::LSB) { leftEdge = visualCenterX - bwPixels; rightEdge = visualCenterX; } 
+                if (mode == Mode::LSB) { leftEdge = visualCenterX - bwPixels; rightEdge = visualCenterX; }
                 bool hitEdge = (std::abs(m.x - leftEdge) < 6 || std::abs(m.x - rightEdge) < 6) && (m.y > TOP_BAR_H && m.y < TOP_BAR_H + layout.specH); 
                 
                 if ((hitEdge || isDraggingBW) && cursorSizeH) window.setMouseCursor(*cursorSizeH); 
-                if (isDraggingBW) { 
-                    float hzPerPx = (hwSampleRate / currentZoom) / layout.specW; 
+                
+                if (isPanningView) {
+                    float dx = lastDragX - m.x; 
+                    lastDragX = m.x;
+                    double pctShift = (dx / layout.specW) * viewWidthPct;
+                    std::lock_guard<std::mutex> l(sharedData.mtx);
+                    sharedData.viewCenterPct += pctShift;
+                    if (sharedData.viewCenterPct - visibleFraction/2.0 < 0.0) sharedData.viewCenterPct = visibleFraction/2.0;
+                    if (sharedData.viewCenterPct + visibleFraction/2.0 > 1.0) sharedData.viewCenterPct = 1.0 - visibleFraction/2.0;
+                }
+                else if (isDraggingBW) { 
+                    float hzPerPx = (hwSampleRate * viewWidthPct) / layout.specW; 
                     float dist = std::abs(m.x - visualCenterX); 
                     float newBW = dist * hzPerPx * 2.0f; 
-                    if (mode == Mode::USB || mode == Mode::LSB) newBW = dist * hzPerPx; 
+                    if (mode == Mode::USB || mode == Mode::LSB) newBW = dist * hzPerPx;
                     newBW = std::clamp(newBW, slBW->minVal, slBW->maxVal); 
                     slBW->setValueSilent(newBW); slBW->onChange(newBW); 
                 } else if (isSpectrumDragging) applySpectrumTuning(m.x); 
                 
                 if (isDraggingScale) { 
                     float dx = lastDragX - m.x; lastDragX = m.x; 
-                    double hzPerPx = (hwSampleRate / currentZoom) / layout.specW; 
+                    double hzPerPx = (hwSampleRate * viewWidthPct) / layout.specW; 
                     long long shift = (long long)(dx * hzPerPx); 
-                    long long nextCenter = currentCenterFreq + shift; 
+                    long long nextCenter = currentCenterFreq + shift;
                     if (nextCenter < 0) nextCenter = 0; 
                     currentCenterFreq = nextCenter; 
                     { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.centerFreq = nextCenter; } 
@@ -1397,10 +1419,7 @@ int main() {
         }
 
         if (hasData) {
-            // FIX: Check if size is correct before memcpy!
-            // Protects against crash if DSP thread sends data of a different size
             if (newRow.size() == MINI_W * 4) {
-                // Scroll down
                 if (MINI_H > 1) {
                     std::memmove(
                         miniWaterfall.data() + MINI_W * 4, 
@@ -1408,7 +1427,6 @@ int main() {
                         (MINI_H - 1) * MINI_W * 4
                     );
                 }
-                // Insert new row at the top
                 std::memcpy(miniWaterfall.data(), newRow.data(), MINI_W * 4);
                 miniTex.update(miniWaterfall.data());
             } else {
@@ -1421,7 +1439,8 @@ int main() {
         if (newRow2) { std::copy_backward(waterfall.begin(), waterfall.end() - INTERNAL_WATERFALL_WIDTH * 4, waterfall.end()); std::copy(row.begin(), row.end(), waterfall.begin()); wTex.update(waterfall.data()); }
         
         window.clear(sf::Color::Black); long long cf = 0; if (currentSource) cf = currentCenterFreq;
-        drawGrid(window, font, 0, TOP_BAR_H, layout.specW, layout.specH, cf, hwSampleRate / currentZoom, slMinDb->currentVal, slMaxDb->currentVal);
+        
+        drawGrid(window, font, 0, TOP_BAR_H, layout.specW, layout.specH, cf, hwSampleRate, viewStartPct, viewEndPct, slMinDb->currentVal, slMaxDb->currentVal);
         
         std::vector<double> smoothedSpectrum = spectrum; for (size_t i = 1; i < spectrum.size() - 1; i++) { smoothedSpectrum[i] = (spectrum[i-1] + spectrum[i] * 2.0 + spectrum[i+1]) / 4.0; }
         sf::VertexArray fillArea(sf::PrimitiveType::TriangleStrip); sf::VertexArray outline(sf::PrimitiveType::LineStrip);
@@ -1430,22 +1449,26 @@ int main() {
         sf::Color glowColor = Theme::Glow; 
         sf::Color bottomColor = Theme::AccentDim; bottomColor.a = 20;
 
-        int centerBin = spectrum.size() / 2; int spanBins = (int)(spectrum.size() / currentZoom); int startBin = centerBin - spanBins / 2; int endBin = centerBin + spanBins / 2; if (startBin < 0) startBin = 0; if (endBin > (int)spectrum.size()) endBin = spectrum.size();
-        int numPoints = endBin - startBin; if (numPoints < 0) numPoints = 0;
+        int numPoints = spectrum.size(); 
         fillArea.resize(numPoints * 2); outline.resize(numPoints);
         for (int i = 0; i < numPoints; ++i) {
-            int spectrumIdx = startBin + i; float normalizedPos = (float)i / (float)spanBins; float x = normalizedPos * layout.specW;
-            float norm = (smoothedSpectrum[spectrumIdx] - slMinDb->currentVal) / (slMaxDb->currentVal - slMinDb->currentVal); float y = layout.specH - (norm * layout.specH); if (y < 0) y = 0; if (y > layout.specH) y = layout.specH; float topY = y + TOP_BAR_H; float bottomY = layout.specH + TOP_BAR_H;
+            float x = ((float)i / (numPoints - 1)) * layout.specW;
+            float norm = (smoothedSpectrum[i] - slMinDb->currentVal) / (slMaxDb->currentVal - slMinDb->currentVal); float y = layout.specH - (norm * layout.specH); if (y < 0) y = 0; if (y > layout.specH) y = layout.specH; float topY = y + TOP_BAR_H; float bottomY = layout.specH + TOP_BAR_H;
             if (currentTheme == 4) { sf::Color dynColor = getHeatmap(norm, 4); coreColor = sf::Color(100, 200, 255, 255); glowColor = dynColor; glowColor.a = 150; bottomColor = dynColor; bottomColor.a = 20; }
             fillArea[2 * i] = sf::Vertex{sf::Vector2f(x, topY), glowColor}; fillArea[2 * i + 1] = sf::Vertex{sf::Vector2f(x, bottomY), bottomColor}; outline[i] = sf::Vertex{sf::Vector2f(x, topY), coreColor};
         }
         sf::RenderStates states; states.blendMode = sf::BlendAdd; window.draw(fillArea, states); window.draw(outline);
-        int visibleTexW = (int)(INTERNAL_WATERFALL_WIDTH / currentZoom); int texX = (INTERNAL_WATERFALL_WIDTH - visibleTexW) / 2; wSpr.setTextureRect(sf::IntRect({texX, 0}, {visibleTexW, (int)layout.waterfallH})); float scaleX = layout.specW / (float)visibleTexW; wSpr.setScale({scaleX, 1.0f}); window.draw(wSpr);
-        float mx = -1.0f; float my = -1.0f; { std::lock_guard<std::mutex> l(sharedData.mtx); mx = sharedData.mouseX_spectrum; my = sharedData.mouseY_spectrum; }
-        if (mx != -1.0f) { sf::Color guideColor(100, 100, 100); sf::VertexArray lineFFT(sf::PrimitiveType::Lines, 2); lineFFT[0].position = {mx, (float)TOP_BAR_H}; lineFFT[0].color = guideColor; lineFFT[1].position = {mx, (float)layout.specH + TOP_BAR_H}; lineFFT[1].color = guideColor; window.draw(lineFFT); if (my > (float)layout.specH) { sf::VertexArray lineWaterfall(sf::PrimitiveType::Lines, 2); lineWaterfall[0].position = {mx, (float)layout.specH + TOP_BAR_H}; lineWaterfall[0].color = guideColor; lineWaterfall[1].position = {mx, (float)(layout.specH + layout.waterfallH + TOP_BAR_H)}; lineWaterfall[1].color = guideColor; window.draw(lineWaterfall); } }
+        
+        wSpr.setTextureRect(sf::IntRect({0, 0}, {INTERNAL_WATERFALL_WIDTH, (int)layout.waterfallH})); 
+        float scaleX = layout.specW / (float)INTERNAL_WATERFALL_WIDTH; wSpr.setScale({scaleX, 1.0f}); window.draw(wSpr);
 
-        sf::RectangleShape tunerRect; double offsetFromCenter = (tunePct - 0.5); float visualCenterX = (0.5 + (offsetFromCenter * currentZoom)) * layout.specW; float bwPixels = (slBW->currentVal / (hwSampleRate / currentZoom)) * layout.specW; if (bwPixels < 2.0f) bwPixels = 2.0f; float rectX = visualCenterX - bwPixels / 2.0f; if (mode == Mode::USB) rectX += bwPixels / 2.0f; if (mode == Mode::LSB) rectX -= bwPixels / 2.0f; tunerRect.setSize({bwPixels, (float)layout.specH}); tunerRect.setPosition({rectX, (float)TOP_BAR_H}); tunerRect.setFillColor(mode == Mode::OFF ? sf::Color(50, 50, 50, 40) : sf::Color(200, 200, 200, 50)); window.draw(tunerRect);
-        sf::VertexArray centerLine(sf::PrimitiveType::Lines, 2); centerLine[0].position = {visualCenterX, (float)TOP_BAR_H}; centerLine[0].color = sf::Color::Red; centerLine[1].position = {visualCenterX, (float)layout.specH + TOP_BAR_H}; centerLine[1].color = sf::Color::Red; window.draw(centerLine);
+        float mx = -1.0f; float my = -1.0f; { std::lock_guard<std::mutex> l(sharedData.mtx); mx = sharedData.mouseX_spectrum; my = sharedData.mouseY_spectrum; }
+        if (mx != -1.0f) { sf::Color guideColor(100, 100, 100); sf::VertexArray lineFFT(sf::PrimitiveType::Lines, 2); lineFFT[0].position = sf::Vector2f(mx, (float)TOP_BAR_H); lineFFT[0].color = guideColor; lineFFT[1].position = sf::Vector2f(mx, (float)layout.specH + TOP_BAR_H); lineFFT[1].color = guideColor; window.draw(lineFFT); if (my > (float)layout.specH) { sf::VertexArray lineWaterfall(sf::PrimitiveType::Lines, 2); lineWaterfall[0].position = sf::Vector2f(mx, (float)layout.specH + TOP_BAR_H); lineWaterfall[0].color = guideColor; lineWaterfall[1].position = sf::Vector2f(mx, (float)(layout.specH + layout.waterfallH + TOP_BAR_H)); lineWaterfall[1].color = guideColor; window.draw(lineWaterfall); } }
+
+        if (tunerPosInView >= 0.0f && tunerPosInView <= 1.0f) {
+            sf::RectangleShape tunerRect; if (bwPixels < 2.0f) bwPixels = 2.0f; float rectX = visualCenterX - bwPixels / 2.0f; if (mode == Mode::USB) rectX += bwPixels / 2.0f; if (mode == Mode::LSB) rectX -= bwPixels / 2.0f; tunerRect.setSize({bwPixels, (float)layout.specH}); tunerRect.setPosition({rectX, (float)TOP_BAR_H}); tunerRect.setFillColor(mode == Mode::OFF ? sf::Color(50, 50, 50, 40) : sf::Color(200, 200, 200, 50)); window.draw(tunerRect);
+            sf::VertexArray centerLine(sf::PrimitiveType::Lines, 2); centerLine[0].position = sf::Vector2f(visualCenterX, (float)TOP_BAR_H); centerLine[0].color = sf::Color::Red; centerLine[1].position = sf::Vector2f(visualCenterX, (float)layout.specH + TOP_BAR_H); centerLine[1].color = sf::Color::Red; window.draw(centerLine);
+        }
         
         if (aprsOn) { 
             float aprsH = 200.0f; float overlayY = layout.winH - aprsH;
@@ -1455,7 +1478,7 @@ int main() {
             sf::CircleShape compass(compassR); compass.setOrigin({compassR, compassR}); compass.setPosition({compassX, compassY}); compass.setFillColor(sf::Color::Transparent); compass.setOutlineColor(sf::Color(100,100,100)); compass.setOutlineThickness(2); window.draw(compass);
             sf::Text dirT(font, "N", 24); dirT.setScale({0.5f, 0.5f});
             dirT.setFillColor(sf::Color::Yellow); dirT.setPosition({compassX - 4, compassY - compassR - 15}); window.draw(dirT); sf::RectangleShape northTick({2, 6}); northTick.setFillColor(sf::Color::Yellow); northTick.setPosition({compassX - 1, compassY - compassR}); window.draw(northTick);
-            if (pkt.course >= 0) { sf::VertexArray arrow(sf::PrimitiveType::Lines, 2); float rad = (pkt.course - 90.0f) * (3.14159f / 180.0f); arrow[0].position = {compassX, compassY}; arrow[0].color = sf::Color::Red; arrow[1].position = {compassX + cos(rad)*compassR, compassY + sin(rad)*compassR}; arrow[1].color = sf::Color::Red; window.draw(arrow); sf::Text crsTxt(font, std::to_string((int)pkt.course) + " deg", 24); crsTxt.setScale({0.5f, 0.5f}); crsTxt.setPosition({compassX - 20, compassY + compassR + 5}); window.draw(crsTxt); }
+            if (pkt.course >= 0) { sf::VertexArray arrow(sf::PrimitiveType::Lines, 2); float rad = (pkt.course - 90.0f) * (3.14159f / 180.0f); arrow[0].position = sf::Vector2f(compassX, compassY); arrow[0].color = sf::Color::Red; arrow[1].position = sf::Vector2f(compassX + cos(rad)*compassR, compassY + sin(rad)*compassR); arrow[1].color = sf::Color::Red; window.draw(arrow); sf::Text crsTxt(font, std::to_string((int)pkt.course) + " deg", 24); crsTxt.setScale({0.5f, 0.5f}); crsTxt.setPosition({compassX - 20, compassY + compassR + 5}); window.draw(crsTxt); }
             float textX = compassX + compassR + 40.0f; float curY = overlayY + 20.0f; sf::Text lblCall(font, pkt.src.empty() ? "-- WAITING --" : pkt.src, 64); lblCall.setScale({0.5f, 0.5f}); lblCall.setPosition({textX, curY}); lblCall.setFillColor(sf::Color::Green); lblCall.setStyle(sf::Text::Bold); window.draw(lblCall); if (!pkt.dest.empty()) { sf::Text lblDest(font, "> " + pkt.dest, 40); lblDest.setScale({0.5f, 0.5f}); lblDest.setPosition({textX + lblCall.getGlobalBounds().size.x + 15, curY + 12}); lblDest.setFillColor(sf::Color(200,200,200)); window.draw(lblDest); } curY += 40.0f; if (!pkt.coords.empty()) { sf::Text lblGPS(font, "GPS: " + pkt.coords, 36); lblGPS.setScale({0.5f, 0.5f}); lblGPS.setPosition({textX, curY}); lblGPS.setFillColor(sf::Color::Cyan); window.draw(lblGPS); curY += 25.0f; } if (!pkt.comment.empty()) { std::string wrappedMsg = wrapText(pkt.comment, font, 32, (layout.specW - 350.0f - textX) * 2.0f); sf::Text lblMsg(font, wrappedMsg, 32); lblMsg.setScale({0.5f, 0.5f}); lblMsg.setPosition({textX, curY}); lblMsg.setFillColor(sf::Color::Yellow); window.draw(lblMsg); }
             float logX = layout.specW - 300; float logW = 300; sf::RectangleShape divLine({2, aprsH}); divLine.setPosition({logX, overlayY}); divLine.setFillColor(sf::Color::White); window.draw(divLine); sf::Text logTitle(font, "PACKET HISTORY", 24); logTitle.setScale({0.5f, 0.5f}); logTitle.setPosition({logX + 10, overlayY + 5}); logTitle.setFillColor(sf::Color(150,150,150)); window.draw(logTitle); float listTopY = overlayY + 25.0f; int i=0; 
             
@@ -1553,14 +1576,11 @@ int main() {
 
         // --- DRAW MINI WATERFALL IN SIDEBAR ---
         if (modInspector->isOpen) {
-            // Get module position from Header
-            float mx = modInspector->headerBg.getPosition().x + 10; // Left margin
-            float my = modInspector->headerBg.getPosition().y + 30; // Below header
+            float mx = modInspector->headerBg.getPosition().x + 10; 
+            float my = modInspector->headerBg.getPosition().y + 30; 
             
-            // Set sprite position
             miniSpr.setPosition({(float)mx, (float)my});
             
-            // Border
             sf::RectangleShape border({(float)MINI_W + 2, (float)MINI_H + 2});
             border.setPosition({(float)mx - 1, (float)my - 1});
             border.setFillColor(sf::Color::Transparent);
@@ -1568,21 +1588,17 @@ int main() {
             border.setOutlineThickness(1);
             window.draw(border);
 
-            // Draw waterfall
             window.draw(miniSpr);
 
-            // Center line (where demodulator is tuning)
             sf::RectangleShape centerLine({2.0f, (float)MINI_H});
             centerLine.setPosition({mx + MINI_W / 2.0f - 1.0f, my});
             centerLine.setFillColor(sf::Color(255, 0, 0, 150));
             window.draw(centerLine);
             
-            // Information label
             sf::Text infoTxt(font, "Bandwidth Scope (" + std::to_string((int)slBW->currentVal) + " Hz)", 14);
-            infoTxt.setPosition({(float)mx, (float)my - 16}); // Above the graph? Or below?
+            infoTxt.setPosition({(float)mx, (float)my - 16}); 
             infoTxt.setScale({0.5f, 0.5f});
             infoTxt.setFillColor(sf::Color::Yellow);
-            // window.draw(infoTxt); // Optional
         }
 
         window.display();
