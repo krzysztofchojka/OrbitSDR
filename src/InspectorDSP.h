@@ -26,7 +26,13 @@ public:
         int decimation = (int)(sampleRate / targetRate);
         if (decimation < 1) decimation = 1;
 
-        double angle = -2.0 * PI * (targetFreqOffset / sampleRate);
+        // 2. Configure NCO (Mixer) to shift frequency to 0 Hz
+        // Dla SSB (USB/LSB) dodajemy kompensację szerokości pasma, aby zrekompensować przesunięcie wstęgi.
+        double ssbTuneOffset = targetFreqOffset;
+        if (shared.mode == Mode::USB) ssbTuneOffset += shared.bandwidth / 2.0;
+        else if (shared.mode == Mode::LSB) ssbTuneOffset -= shared.bandwidth / 2.0;
+
+        double angle = -2.0 * PI * (ssbTuneOffset / sampleRate);
         ncoStep = std::polar(1.0, angle);
 
         for (const auto& s : rawIQ) {

@@ -74,23 +74,51 @@ inline std::deque<AprsLastPacket> loadLastLogLinesAsPackets(const std::string& f
 }
 
 inline sf::Color getHeatmap(float v, int theme) {
-    v = std::clamp(v, 0.0f, 1.0f); std::uint8_t r=0,g=0,b=0;
-    if (theme == 0 || theme == 4) { 
-        if(v<0.25f) b=static_cast<std::uint8_t>(v*4*255);
-        else if(v<0.5f) {b=255; g=static_cast<std::uint8_t>((v-0.25f)*4*255);}
-        else if(v<0.75f) {r=static_cast<std::uint8_t>((v-0.5f)*4*255); g=255; b=static_cast<std::uint8_t>(255-r);}
-        else {r=255; g=static_cast<std::uint8_t>((1.0f-v)*4*255);}
-    } else if (theme == 1) { 
+    v = std::clamp(v, 0.0f, 1.0f); 
+    std::uint8_t r=0,g=0,b=0;
+    
+    if (theme == 0 || theme == 4) {
+        // 1. Magia kontrastu: krzywa gamma "zgniatająca" szumy tła
+        // Wartości bliskie zera ciemnieją mocniej, sygnały pozostają jasne
+        v = std::pow(v, 1.2f); 
+        
+        // 2. Wielostopniowa paleta kolorów
+        if (v < 0.2f) { // Czarne tło -> Ciemny granat
+            float t = v / 0.2f;
+            r = 0; g = 0; b = static_cast<std::uint8_t>(t * 120);
+        } else if (v < 0.4f) { // Granat -> Jasnoniebieski
+            float t = (v - 0.2f) / 0.2f;
+            r = 0; g = static_cast<std::uint8_t>(t * 150); b = 120 + static_cast<std::uint8_t>(t * 135);
+        } else if (v < 0.6f) { // Jasnoniebieski -> Żółto-Zielony
+            float t = (v - 0.4f) / 0.2f;
+            r = static_cast<std::uint8_t>(t * 180); g = 150 + static_cast<std::uint8_t>(t * 105); b = 255 - static_cast<std::uint8_t>(t * 200);
+        } else if (v < 0.8f) { // Żółto-Zielony -> Czysty Żółty
+            float t = (v - 0.6f) / 0.2f;
+            r = 180 + static_cast<std::uint8_t>(t * 75); g = 255; b = 55 - static_cast<std::uint8_t>(t * 55);
+        } else if (v < 0.95f) { // Żółty -> Czerwony (Mocne sygnały)
+            float t = (v - 0.8f) / 0.15f;
+            r = 255; g = 255 - static_cast<std::uint8_t>(t * 220); b = 0;
+        } else { // Czerwony -> Biały (Absolutne przesterowanie na czubkach)
+            float t = (v - 0.95f) / 0.05f;
+            r = 255; g = 35 + static_cast<std::uint8_t>(t * 220); b = static_cast<std::uint8_t>(t * 255);
+        }
+    } 
+    else if (theme == 1) { // NEON
+        v = std::pow(v, 1.1f); // Lekki kontrast dla neona
         if(v < 0.3f) { r=0; g=0; b=static_cast<std::uint8_t>(v * 3.33f * 255); }
         else if(v < 0.6f) { float t = (v - 0.3f) / 0.3f; r = static_cast<std::uint8_t>(t * 180); g = 0; b = 255; }
         else if(v < 0.85f) { float t = (v - 0.6f) / 0.25f; r = 180 + static_cast<std::uint8_t>(t * 75); g = 0; b = 255 - static_cast<std::uint8_t>(t * 100); }
         else { float t = (v - 0.85f) / 0.15f; r = 255; g = static_cast<std::uint8_t>(t * 255); b = 155 + static_cast<std::uint8_t>(t * 100); }
-    } else if (theme == 2) { 
+    } 
+    else if (theme == 2) { // Matrix
+        v = std::pow(v, 1.2f);
         r = 0; if(v < 0.5f) { g = static_cast<std::uint8_t>(v * 2 * 200); b=0; } else { g = 200 + static_cast<std::uint8_t>((v-0.5f)*2*55); b = static_cast<std::uint8_t>((v-0.5f)*2*255); r = b; }
-    } else if (theme == 3) { 
-        std::uint8_t lum = static_cast<std::uint8_t>(v * 255); r = lum; g = lum; b = lum;
+    } 
+    else if (theme == 3) { // Grayscale
+        std::uint8_t lum = static_cast<std::uint8_t>(std::pow(v, 1.2f) * 255); r = lum; g = lum; b = lum;
     }
-    return {r,g,b};
+    
+    return {r, g, b};
 }
 
 inline std::string formatHz(long long hz) { std::stringstream ss; ss << std::fixed << std::setprecision(3) << (hz / 1000000.0) << " MHz"; return ss.str(); }

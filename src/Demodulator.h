@@ -316,7 +316,17 @@ public:
                         rawAudio = filtered.real();
                         if (mode != Mode::RAW) {
                             rawAudio *= 2.0f; // Boost for radio
-                            audioLpfState += audioAlpha * (rawAudio - audioLpfState); // Audio filter (high cut)
+                            
+                            // Przefiltrujemy sygnał audio, aby odciąć to co jest poza zdefiniowanym zakresem Bandwidth/AudioAlpha
+                            if (!filtersConfigured) {
+                                // Zakładamy filtr audio mowy na częstotliwość od 300Hz do 2700Hz
+                                cutoffL.configureLowPass(2700.0f, (float)sampleRateOut);
+                                cutoffR.configureLowPass(2700.0f, (float)sampleRateOut);
+                                filtersConfigured = true;
+                            }
+                            rawAudio = cutoffL.process(rawAudio);
+                            
+                            audioLpfState += audioAlpha * (rawAudio - audioLpfState);
                         }
                     }
                     

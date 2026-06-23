@@ -257,8 +257,8 @@ int main() {
     modDecoders->addWidget(chkAIS);
 
     auto modDisp = sidebar.addModule("Display");
-    auto slMinDb = std::make_shared<Slider>(SIDEBAR_W - 40, -120.0f, -20.0f, -90.0f, "Min dB", font); slMinDb->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.minDb = v; }; modDisp->addWidget(slMinDb);
-    auto slMaxDb = std::make_shared<Slider>(SIDEBAR_W - 40, -40.0f, 40.0f, 0.0f, "Max dB", font); slMaxDb->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.maxDb = v; }; modDisp->addWidget(slMaxDb);
+    auto slMinDb = std::make_shared<Slider>(SIDEBAR_W - 40, -140.0f, -20.0f, -90.0f, "Min dB", font); slMinDb->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.minDb = v; }; modDisp->addWidget(slMinDb);
+    auto slMaxDb = std::make_shared<Slider>(SIDEBAR_W - 40, -60.0f, 40.0f, 0.0f, "Max dB", font); slMaxDb->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.maxDb = v; }; modDisp->addWidget(slMaxDb);
     
     auto slZoom = std::make_shared<Slider>(SIDEBAR_W - 40, 1.0f, 16.0f, 1.0f, "Zoom", font); 
     slZoom->onChange = [&](float v) { 
@@ -408,11 +408,27 @@ int main() {
                 } else if (isSpectrumDragging) applySpectrumTuning(m.x); 
                 
                 if (isDraggingScale) { 
-                    float dx = lastDragX - m.x; lastDragX = m.x; double hzPerPx = (hwSampleRate * viewWidthPct) / layout.specW; long long shift = (long long)(dx * hzPerPx); long long nextCenter = currentCenterFreq + shift;
-                    if (nextCenter < 0) nextCenter = 0; currentCenterFreq = nextCenter; 
-                    { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.centerFreq = nextCenter; } 
-                    if (debouncer.getElapsedTime().asMilliseconds() > TUNING_LATENCY_MS) { { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->setCenterFrequency(nextCenter); } debouncer.restart(); } 
-                } 
+                    float dx = lastDragX - m.x; lastDragX = m.x; 
+                    double hzPerPx = (hwSampleRate * viewWidthPct) / layout.specW; 
+                    long long shift = (long long)(dx * hzPerPx); 
+                    
+                    // Pozwalamy na swobodne przesuwanie osi i dla sprzętu i dla plików
+                    if (isHw) {
+                        long long nextCenter = currentCenterFreq + shift;
+                        if (nextCenter < 0) nextCenter = 0; 
+                        currentCenterFreq = nextCenter; 
+                        { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.centerFreq = nextCenter; } 
+                        if (debouncer.getElapsedTime().asMilliseconds() > TUNING_LATENCY_MS) { 
+                            { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->setCenterFrequency(nextCenter); } 
+                            debouncer.restart(); 
+                        }
+                    } else {
+                        // Dla plików .wav płynnie przesuwamy "widziane centrum" w ramach długości nagrania
+                        double pctShift = (dx / layout.specW) * viewWidthPct;
+                        std::lock_guard<std::mutex> l(sharedData.mtx);
+                        sharedData.viewCenterPct = std::clamp(sharedData.viewCenterPct + pctShift, visibleFraction/2.0, 1.0 - visibleFraction/2.0);
+                    }
+                }
                 if (!overAprs && m.x >= 0 && m.x < layout.specW && m.y >= TOP_BAR_H && m.y < (TOP_BAR_H + layout.specH + layout.waterfallH)) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.mouseX_spectrum = m.x; sharedData.mouseY_spectrum = m.y - TOP_BAR_H; } else { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.mouseX_spectrum = -1.0f; } 
             }
             sidebar.handleEvent(*ev, window);
