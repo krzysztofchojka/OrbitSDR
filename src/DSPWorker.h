@@ -117,7 +117,9 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                 int viewEndBin = (int)(viewEndPct * FFT_SIZE);
                 int visibleBins = viewEndBin - viewStartBin;
 
-                float alpha = (play) ? 0.3f : 1.0f;
+                // smooth waterfall
+                // float alpha = (play) ? 0.3f : 1.0f;
+                float alpha = 1.0f;
                 std::vector<uint8_t> tempRow(INTERNAL_WATERFALL_WIDTH * 4);
                 
                 for (int x = 0; x < INTERNAL_WATERFALL_WIDTH; x++) {
