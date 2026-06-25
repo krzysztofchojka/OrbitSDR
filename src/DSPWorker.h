@@ -42,6 +42,8 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
     WavWriter recorder;
     sf::Clock waterfallTimer;
 
+    int squelchHold = 0;
+
     while (running) {
         std::shared_ptr<IQSource> src = nullptr;
         {
@@ -212,8 +214,19 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                     activeModule->processAudio(mono);
                 }
 
+                static float squelchEnv = 1.0f;
                 if (sqThr > -99.0f) {
-                    if (smoothedRssi < sqThr) std::fill(audioData.begin(), audioData.end(), 0.0f);
+                    if (smoothedRssi < sqThr) {
+                        squelchEnv *= 0.9f; // Miękkie zamykanie (fade-out)
+                    } else {
+                        squelchEnv = 1.0f;  // Błyskawiczne otwieranie
+                    }
+                    if (squelchEnv < 0.001f) squelchEnv = 0.0f; // Pełna matematyczna cisza w głośniku
+                    
+                    // Przemnóż próbki przez obwiednię
+                    for (auto& s : audioData) {
+                        s *= squelchEnv;
+                    }
                 }
 
                 float finalVol = muted ? 0.0f : vol;

@@ -112,3 +112,59 @@ public:
         return false;
     }
 };
+
+class DecimatingFIR {
+    std::vector<float> taps;
+    std::vector<Complex> buffer;
+    int bufIdx = 0;
+
+public:
+    void configure(float cutoffHz, float sampleRate, int numTaps = 101) {
+        if (sampleRate <= 0) return;
+        if (numTaps % 2 == 0) numTaps++; // Filtr musi być nieparzysty
+        taps.resize(numTaps);
+        buffer.assign(numTaps, {0,0});
+        bufIdx = 0;
+
+        float fc = cutoffHz / sampleRate;
+        float sum = 0.0f;
+
+        // Okno Blackmana + idealny filtr Sinc
+        for (int i = 0; i < numTaps; i++) {
+            if (i == numTaps / 2) {
+                taps[i] = 2.0f * (float)PI * fc;
+            } else {
+                float n = (float)(i - numTaps / 2);
+                taps[i] = std::sin(2.0f * (float)PI * fc * n) / n;
+            }
+            taps[i] *= 0.42f - 0.5f * std::cos(2.0f * (float)PI * i / (numTaps - 1)) + 0.08f * std::cos(4.0f * (float)PI * i / (numTaps - 1));
+            sum += taps[i];
+        }
+        for (int i = 0; i < numTaps; i++) taps[i] /= sum; // Normalizacja
+    }
+
+    inline void push(Complex in) {
+        buffer[bufIdx] = in;
+        bufIdx = (bufIdx + 1) % buffer.size();
+    }
+
+    inline Complex compute() {
+        if (taps.empty()) return {0,0};
+        Complex out = {0,0};
+        int numTaps = taps.size();
+        int idx = bufIdx - 1;
+        if (idx < 0) idx += numTaps;
+
+        for (int i = 0; i < numTaps; i++) {
+            out += buffer[idx] * (double)taps[i];
+            idx--;
+            if (idx < 0) idx += numTaps;
+        }
+        return out;
+    }
+
+    void reset() {
+        std::fill(buffer.begin(), buffer.end(), Complex(0,0));
+        bufIdx = 0;
+    }
+};

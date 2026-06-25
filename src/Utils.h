@@ -77,7 +77,7 @@ inline sf::Color getHeatmap(float v, int theme) {
     v = std::clamp(v, 0.0f, 1.0f); 
     std::uint8_t r=0,g=0,b=0;
     
-    if (theme == 0 || theme == 4) {
+    if (theme == 0) {
         // 1. Magia kontrastu: krzywa gamma "zgniatająca" szumy tła
         // Wartości bliskie zera ciemnieją mocniej, sygnały pozostają jasne
         v = std::pow(v, 1.2f); 
@@ -103,13 +103,29 @@ inline sf::Color getHeatmap(float v, int theme) {
             r = 255; g = 35 + static_cast<std::uint8_t>(t * 220); b = static_cast<std::uint8_t>(t * 255);
         }
     } 
-    else if (theme == 1) { // NEON
-        v = std::pow(v, 1.1f); // Lekki kontrast dla neona
-        if(v < 0.3f) { r=0; g=0; b=static_cast<std::uint8_t>(v * 3.33f * 255); }
-        else if(v < 0.6f) { float t = (v - 0.3f) / 0.3f; r = static_cast<std::uint8_t>(t * 180); g = 0; b = 255; }
-        else if(v < 0.85f) { float t = (v - 0.6f) / 0.25f; r = 180 + static_cast<std::uint8_t>(t * 75); g = 0; b = 255 - static_cast<std::uint8_t>(t * 100); }
-        else { float t = (v - 0.85f) / 0.15f; r = 255; g = static_cast<std::uint8_t>(t * 255); b = 155 + static_cast<std::uint8_t>(t * 100); }
-    } 
+    else if (theme == 1 || theme == 4) { // INTELIGENTNY NEON (Synthwave z ciemnym tłem)
+        v = std::pow(v, 1.2f); 
+        
+        if (v < 0.2f) { // Szum tła: Czarny -> Ciemny granat (uspokojone tło)
+            float t = v / 0.2f;
+            r = 0; g = 0; b = static_cast<std::uint8_t>(t * 120);
+        } else if (v < 0.4f) { // Słabe sygnały: Ciemny granat -> Elektryczna Purpura
+            float t = (v - 0.2f) / 0.2f;
+            r = static_cast<std::uint8_t>(t * 150); g = 0; b = 120 + static_cast<std::uint8_t>(t * 80);
+        } else if (v < 0.6f) { // Średnie sygnały: Purpura -> Gorąca Magenta (Hot Pink)
+            float t = (v - 0.4f) / 0.2f;
+            r = 150 + static_cast<std::uint8_t>(t * 105); g = 0; b = 200 - static_cast<std::uint8_t>(t * 50);
+        } else if (v < 0.8f) { // Mocne sygnały: Magenta -> Neonowy Pomarańcz
+            float t = (v - 0.6f) / 0.2f;
+            r = 255; g = static_cast<std::uint8_t>(t * 120); b = 150 - static_cast<std::uint8_t>(t * 150);
+        } else if (v < 0.95f) { // Bardzo mocne: Pomarańcz -> Jasny Żółto-Biały
+            float t = (v - 0.8f) / 0.15f;
+            r = 255; g = 120 + static_cast<std::uint8_t>(t * 100); b = static_cast<std::uint8_t>(t * 100);
+        } else { // Przesterowanie/Piki: Żółto-Biały -> Czysta Biel
+            float t = (v - 0.95f) / 0.05f;
+            r = 255; g = 220 + static_cast<std::uint8_t>(t * 35); b = 100 + static_cast<std::uint8_t>(t * 155);
+        }
+    }
     else if (theme == 2) { // Matrix
         v = std::pow(v, 1.2f);
         r = 0; if(v < 0.5f) { g = static_cast<std::uint8_t>(v * 2 * 200); b=0; } else { g = 200 + static_cast<std::uint8_t>((v-0.5f)*2*55); b = static_cast<std::uint8_t>((v-0.5f)*2*255); r = b; }
