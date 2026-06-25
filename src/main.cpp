@@ -873,7 +873,7 @@ int main() {
         layout.sidebarX = layout.winW - SIDEBAR_W;
         layout.specW = layout.sidebarX;
         layout.specH = 250.0f;
-        layout.waterfallH = layout.winH - TOP_BAR_H - layout.specH;
+        layout.waterfallH = layout.winH - TOP_BAR_H - layout.specH - layout.tuneBarH; // Zostawiamy miejsce na pasek
 
         if (layout.waterfallH < 100) layout.waterfallH = 100;
 
@@ -891,7 +891,7 @@ int main() {
         timeSlider.setPosition(20, layout.winH - 30);
         timeSlider.setWidth(layout.specW - 40);
 
-        wSpr.setPosition({0, TOP_BAR_H + layout.specH});
+        wSpr.setPosition({0, TOP_BAR_H + layout.specH + layout.tuneBarH});
         float scaleX = layout.specW / (float)INTERNAL_WATERFALL_WIDTH;
         wSpr.setScale({scaleX, 1.0f});
         wSpr.setTextureRect(sf::IntRect({0, 0}, {INTERNAL_WATERFALL_WIDTH, (int)layout.waterfallH}));
@@ -993,6 +993,13 @@ int main() {
     SdrButton btnModalCopy(80, 30, "Copy", font);
     btnModalClose.onClick = [&]() { showAprsModal = false; };
     btnModalCopy.onClick = [&]() { sf::Clipboard::setString(selectedAprsPacket.raw); };
+
+    // Ładowanie Band Planu
+    std::string bpPath = "bandplan.json";
+    if (!std::ifstream(bpPath).good()) {
+        bpPath = "../Resources/bandplan.json"; // Ścieżka dla macOS wewnątrz OrbitSDR.app/Contents/MacOS/
+    }
+    globalBandPlan = loadBandPlan(bpPath);
 
     while (window.isOpen()) {
         sf::Vector2u currSize = window.getSize();
@@ -1328,7 +1335,7 @@ int main() {
                     }
 
                     bool overTimeline = (currentSourceType == 0) && (timeSlider.isDragging || (m.y > layout.winH - 40));
-                    bool inFreqScaleZone = (m.y >= TOP_BAR_H + layout.specH - 10 && m.y <= TOP_BAR_H + layout.specH + 20 && m.x < layout.specW);
+                    bool inFreqScaleZone = (m.y >= TOP_BAR_H + layout.specH && m.y <= TOP_BAR_H + layout.specH + layout.tuneBarH && m.x < layout.specW);
 
                     float leftEdge = visualCenterX - bwPixels / 2.0f;
                     float rightEdge = visualCenterX + bwPixels / 2.0f;
@@ -1499,7 +1506,63 @@ int main() {
         long long cf = 0;
         if (currentSource) cf = currentCenterFreq;
 
+        // --- RYSOWANIE DEDYKOWANEGO PASKA STROJENIA ---
+        sf::RectangleShape tuneBarBg({layout.specW, layout.tuneBarH});
+        tuneBarBg.setPosition({0, (float)(TOP_BAR_H + layout.specH)});
+        tuneBarBg.setFillColor(sf::Color(10, 10, 12)); // Głęboka czerń/szarość
+        window.draw(tuneBarBg);
+
         drawGrid(window, font, 0, TOP_BAR_H, layout.specW, layout.specH, cf, hwSampleRate, viewStartPct, viewEndPct, slMinDb->currentVal, slMaxDb->currentVal);
+
+        // --- RYSOWANIE BAND PLANU ---
+        double startFreq = (double)cf + (viewStartPct - 0.5) * hwSampleRate;
+        double endFreq = (double)cf + (viewEndPct - 0.5) * hwSampleRate;
+        double visibleSpan = endFreq - startFreq;
+
+        for (const auto& band : globalBandPlan) {
+            // Sprawdź, czy pasmo mieści się w widocznym oknie
+            if (band.endFreq > startFreq && band.startFreq < endFreq) {
+                // Oblicz pozycje X
+                float startX = layout.specW * ((band.startFreq - startFreq) / visibleSpan);
+                float endX = layout.specW * ((band.endFreq - startFreq) / visibleSpan);
+                
+                // Przytnij do krawędzi ekranu
+                if (startX < 0) startX = 0;
+                if (endX > layout.specW) endX = layout.specW;
+                float widthX = endX - startX;
+
+                if (widthX > 1.0f) {
+                    // 1. Półprzeźroczysty gradient na wykresie FFT
+                    sf::VertexArray gradient(sf::PrimitiveType::TriangleStrip, 4);
+                    sf::Color topColor = band.color; topColor.a = 35; // Bardzo delikatna przeźroczystość
+                    sf::Color bottomColor = band.color; bottomColor.a = 0; // Zanika całkowicie
+                    
+                    float topY = TOP_BAR_H;
+                    float bottomY = TOP_BAR_H + layout.specH;
+
+                    gradient[0] = sf::Vertex{sf::Vector2f(startX, topY), topColor};
+                    gradient[1] = sf::Vertex{sf::Vector2f(endX, topY), topColor};
+                    gradient[2] = sf::Vertex{sf::Vector2f(startX, bottomY), bottomColor};
+                    gradient[3] = sf::Vertex{sf::Vector2f(endX, bottomY), bottomColor};
+                    window.draw(gradient);
+
+                    // 2. Poziomy pasek nad wykresem
+                    sf::RectangleShape bar({widthX, 4.0f});
+                    bar.setPosition({startX, (float)TOP_BAR_H});
+                    bar.setFillColor(band.color);
+                    window.draw(bar);
+
+                    // 3. Nazwa pasma
+                    if (widthX > 40.0f) { // Rysuj tekst tylko jeśli jest wystarczająco dużo miejsca
+                        sf::Text bText(font, band.name, 28);
+                        bText.setScale({0.5f, 0.5f});
+                        bText.setPosition({startX + 4, (float)TOP_BAR_H + 5});
+                        bText.setFillColor(sf::Color(255, 255, 255, 200));
+                        window.draw(bText);
+                    }
+                }
+            }
+        }
 
         std::vector<double> smoothedSpectrum = spectrum;
         for (size_t i = 1; i < spectrum.size() - 1; i++) {
@@ -1560,23 +1623,58 @@ int main() {
         }
 
         if (mx != -1.0f) {
-            sf::Color guideColor(100, 100, 100);
-            sf::VertexArray lineFFT(sf::PrimitiveType::Lines, 2);
-            lineFFT[0].position = sf::Vector2f(mx, (float)TOP_BAR_H);
-            lineFFT[0].color = guideColor;
-            lineFFT[1].position = sf::Vector2f(mx, (float)layout.specH + TOP_BAR_H);
-            lineFFT[1].color = guideColor;
-            window.draw(lineFFT);
+        sf::Color guideColor(100, 100, 100);
+        sf::VertexArray lineFFT(sf::PrimitiveType::Lines, 2);
+        lineFFT[0].position = sf::Vector2f(mx, (float)TOP_BAR_H);
+        lineFFT[0].color = guideColor;
+        lineFFT[1].position = sf::Vector2f(mx, (float)layout.specH + TOP_BAR_H);
+        lineFFT[1].color = guideColor;
+        window.draw(lineFFT);
 
-            if (my > (float)layout.specH) {
-                sf::VertexArray lineWaterfall(sf::PrimitiveType::Lines, 2);
-                lineWaterfall[0].position = sf::Vector2f(mx, (float)layout.specH + TOP_BAR_H);
-                lineWaterfall[0].color = guideColor;
-                lineWaterfall[1].position = sf::Vector2f(mx, (float)(layout.specH + layout.waterfallH + TOP_BAR_H));
-                lineWaterfall[1].color = guideColor;
-                window.draw(lineWaterfall);
+        // --- WARUNEK: TOOLTIP TYLKO W DOLNEJ CZĘŚCI FFT ---
+        if (my > layout.specH - 50.0f && my <= layout.specH) {
+            double hoverFreq = startFreq + (mx / layout.specW) * visibleSpan;
+            int binIdx = std::clamp((int)((mx / layout.specW) * spectrum.size()), 0, (int)spectrum.size() - 1);
+            float hoverPower = spectrum.empty() ? -127.0f : spectrum[binIdx];
+
+            std::string freqFormat = freqVFO.formatWithDots((long long)hoverFreq) + " Hz";
+            std::stringstream pwrStream;
+            pwrStream << std::fixed << std::setprecision(2) << hoverPower << " dBm";
+            std::string tooltipStr = freqFormat + "\nPower: " + pwrStream.str();
+
+            sf::Text tooltipText(font, tooltipStr, 24);
+            tooltipText.setScale({0.5f, 0.5f});
+            tooltipText.setFillColor(sf::Color::White);
+            
+            sf::FloatRect textBounds = tooltipText.getGlobalBounds();
+            sf::RectangleShape tooltipBg({textBounds.size.x + 16, textBounds.size.y + 12});
+            tooltipBg.setFillColor(sf::Color(20, 20, 25, 230));
+            tooltipBg.setOutlineColor(Theme::Accent);
+            tooltipBg.setOutlineThickness(1.0f);
+
+            float ttX = mx + 15.0f;
+            float ttY = my + TOP_BAR_H + 15.0f;
+            if (ttX + tooltipBg.getSize().x > layout.specW) {
+                ttX = mx - tooltipBg.getSize().x - 15.0f;
             }
+
+            tooltipBg.setPosition({ttX, ttY});
+            tooltipText.setPosition({ttX + 8, ttY + 4});
+
+            window.draw(tooltipBg);
+            window.draw(tooltipText);
         }
+
+        // Kreska na wodospadzie uwzględniająca przesunięcie paska
+        if (my > (float)layout.specH) {
+            sf::VertexArray lineWaterfall(sf::PrimitiveType::Lines, 2);
+            lineWaterfall[0].position = sf::Vector2f(mx, (float)layout.specH + layout.tuneBarH + TOP_BAR_H);
+            lineWaterfall[0].color = guideColor;
+            lineWaterfall[1].position = sf::Vector2f(mx, (float)(layout.specH + layout.tuneBarH + layout.waterfallH + TOP_BAR_H));
+            lineWaterfall[1].color = guideColor;
+            window.draw(lineWaterfall);
+        }
+    }
 
         if (tunerPosInView >= 0.0f && tunerPosInView <= 1.0f) {
             sf::RectangleShape tunerRect;
@@ -1742,6 +1840,92 @@ int main() {
             float tableH = 250.0f;
             float tableY = layout.winH - tableH;
             decoderUI->draw(window, 0, tableY, layout.specW, tableH);
+        } else {
+            // --- STATUS BAR Z S-METEREM (Ukrywany gdy działają dekodery) ---
+            float statusH = 40.0f;
+            float statusY = layout.winH - statusH;
+            
+            // Tło paska
+            sf::RectangleShape statusBarBg({layout.specW, statusH});
+            statusBarBg.setPosition({0, statusY});
+            statusBarBg.setFillColor(sf::Color(30, 30, 35));
+            statusBarBg.setOutlineThickness(1);
+            statusBarBg.setOutlineColor(sf::Color(60, 60, 60));
+            window.draw(statusBarBg);
+
+            // Wskaźniki LED po lewej
+            float ledX = 20.0f;
+            auto drawLED = [&](std::string label, bool state, sf::Color colorOn) {
+                sf::CircleShape led(5.0f);
+                led.setPosition({ledX, statusY + 15.0f});
+                led.setFillColor(state ? colorOn : sf::Color(50, 50, 50));
+                window.draw(led);
+                
+                sf::Text txt(font, label, 20);
+                txt.setScale({0.5f, 0.5f});
+                txt.setPosition({ledX + 15.0f, statusY + 10.0f});
+                txt.setFillColor(state ? sf::Color::White : sf::Color(150, 150, 150));
+                window.draw(txt);
+                ledX += 80.0f;
+            };
+
+            drawLED("PLAY", sharedData.isPlaying, Theme::Accent);
+            drawLED("REC", sharedData.isRecording, sf::Color(255, 50, 50));
+            drawLED("HW", isHw, sf::Color(50, 255, 100));
+
+            // Skala graficzna S-Metera ułożona centralnie
+            float meterW = 400.0f;
+            float meterX = (layout.specW / 2.0f) - (meterW / 2.0f);
+            
+            // Pobierz moc i mapuj na S-Meter (-127 dBm do -20 dBm)
+            int centerBin = std::clamp((int)(tunePct * spectrum.size()), 0, (int)spectrum.size() - 1);
+            float currentPower = spectrum.empty() ? -127.0f : spectrum[centerBin];
+            float minPwr = -127.0f;
+            float maxPwr = -20.0f;
+            float fillPct = std::clamp((currentPower - minPwr) / (maxPwr - minPwr), 0.0f, 1.0f);
+
+            // Tło wskaźnika S-metera
+            sf::RectangleShape sBg({meterW, 12.0f});
+            sBg.setPosition({meterX, statusY + 20.0f});
+            sBg.setFillColor(sf::Color(20, 20, 20));
+            window.draw(sBg);
+
+            // Wypełnienie S-Metera z kolorowaniem (czerwony dla obszaru S9+)
+            float fillW = meterW * fillPct;
+            float s9ThresholdW = meterW * ((-73.0f - minPwr) / (maxPwr - minPwr)); // S9 = -73 dBm
+            
+            sf::RectangleShape sFill({fillW, 12.0f});
+            sFill.setPosition({meterX, statusY + 20.0f});
+            // Jeśli moc przekracza S9, użyj czerwonego, jeśli nie - zielonego
+            sFill.setFillColor(currentPower > -73.0f ? sf::Color(255, 60, 60) : sf::Color(60, 255, 60));
+            window.draw(sFill);
+
+            // Teksty skali (S1...S9...+)
+            int sUnit = std::clamp(std::round((currentPower + 127.0f) / 6.0f), 0.0f, 9.0f);
+            std::string sTextStr = "S" + std::to_string(sUnit);
+            if (currentPower > -73.0f) {
+                int plusDb = std::round(currentPower - (-73.0f));
+                sTextStr = "S9+" + std::to_string(plusDb) + "dB";
+            }
+
+            std::stringstream pwrFmt;
+            pwrFmt << std::fixed << std::setprecision(1) << currentPower << " dBm";
+
+            sf::Text sValTxt(font, sTextStr + " / " + pwrFmt.str(), 24);
+            sValTxt.setScale({0.5f, 0.5f});
+            sValTxt.setPosition({meterX, statusY + 2.0f});
+            sValTxt.setFillColor(Theme::Accent);
+            window.draw(sValTxt);
+            
+            // Narysuj markery skali S
+            for (int s = 1; s <= 9; s += 2) {
+                float markerDb = -127.0f + (s * 6.0f);
+                float mPct = (markerDb - minPwr) / (maxPwr - minPwr);
+                sf::RectangleShape tick({2.0f, 4.0f});
+                tick.setPosition({meterX + (meterW * mPct), statusY + 16.0f});
+                tick.setFillColor(sf::Color(150, 150, 150));
+                window.draw(tick);
+            }
         }
 
         if (currentSourceType == 0) timeSlider.draw(window);

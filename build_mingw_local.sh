@@ -84,6 +84,9 @@ for dll in $(ldd "$OUT_FILE" | grep "/ucrt64" | awk '{print $3}'); do
     cp "$dll" "$BUILD_DIR/"
 done
 
+echo "Copying bandplan.json to build folder..."
+cp bandplan.json "$BUILD_DIR/" 2>/dev/null || echo "WARNING: bandplan.json not found!"
+
 # 6. OVERRIDE: Download latest RTL-SDR drivers for V4 support
 echo "------------------------------------------"
 echo "Attempting to download latest RTL-SDR V4 drivers from Osmocom..."

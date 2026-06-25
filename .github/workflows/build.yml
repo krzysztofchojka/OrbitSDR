@@ -55,6 +55,7 @@ jobs:
           path: |
             orbitsdr.exe
             *.dll
+            bandplan.json
   # --------------------------------------------------------
   # LINUX (Unchanged - Working)
   # --------------------------------------------------------
@@ -86,6 +87,7 @@ jobs:
         mkdir -p OrbitSDR_Linux/libs
         cp orbitsdr OrbitSDR_Linux/OrbitSDR
         cp icon.png OrbitSDR_Linux/ || true
+        cp bandplan.json OrbitSDR_Linux/ || true
         cp sfml/lib/*.so* OrbitSDR_Linux/libs/
         cp deps/sdrplay/lib/linux/*.so* OrbitSDR_Linux/libs/
         cat > OrbitSDR_Linux/OrbitSDR_Run.sh <<EOF
@@ -136,6 +138,7 @@ jobs:
         # 2. Copy Binary & Libs
         cp orbitsdr OrbitSDR.app/Contents/MacOS/OrbitSDR
         cp deps/sdrplay/lib/macos/libsdrplay_api.dylib OrbitSDR.app/Contents/Frameworks/
+        cp bandplan.json OrbitSDR.app/Contents/Resources/ || true
 
         # --- ICON GENERATION START ---
         # macOS requires an .icns file, which contains the icon in multiple resolutions.

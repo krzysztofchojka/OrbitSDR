@@ -1,0 +1,16 @@
+[
+  { "start": 137000, "end": 137800, "name": "137 kHz (2200m)", "color": "100,200,100" },
+  { "start": 1810000, "end": 2000000, "name": "160m Amateur", "color": "100,200,100" },
+  { "start": 3500000, "end": 3800000, "name": "80m Amateur", "color": "100,200,100" },
+  { "start": 7000000, "end": 7200000, "name": "40m Amateur", "color": "100,200,100" },
+  { "start": 14000000, "end": 14350000, "name": "20m Amateur", "color": "100,200,100" },
+  { "start": 21000000, "end": 21450000, "name": "15m Amateur", "color": "100,200,100" },
+  { "start": 26960000, "end": 27410000, "name": "CB Radio", "color": "255,165,0" },
+  { "start": 28000000, "end": 29700000, "name": "10m Amateur", "color": "100,200,100" },
+  { "start": 87500000, "end": 108000000, "name": "FM Broadcast", "color": "150,150,255" },
+  { "start": 118000000, "end": 136975000, "name": "Airband (AM)", "color": "200,200,100" },
+  { "start": 144000000, "end": 146000000, "name": "2m Amateur", "color": "100,200,100" },
+  { "start": 156000000, "end": 162025000, "name": "Marine VHF", "color": "0,255,255" },
+  { "start": 430000000, "end": 440000000, "name": "70cm Amateur", "color": "100,200,100" },
+  { "start": 446000000, "end": 446200000, "name": "PMR446", "color": "255,100,100" }
+]

@@ -155,10 +155,21 @@ inline void drawGrid(sf::RenderWindow& window, const sf::Font& font, float x, fl
     if (visibleSpan < 1000000) stepHz = 100000.0; if (visibleSpan < 500000) stepHz = 50000.0; if (visibleSpan < 200000) stepHz = 25000.0; if (visibleSpan > 5000000) stepHz = 500000.0; if (visibleSpan > 10000000) stepHz = 1000000.0;
     long long firstLineFreq = (long long)(ceil(startFreq / stepHz) * stepHz);
     for (double f = (double)firstLineFreq; f < endFreq; f += stepHz) {
-        float normPos = (float)((f - startFreq) / visibleSpan); float xPos = x + normPos * w;
-        sf::RectangleShape line({1, h}); line.setPosition(sf::Vector2f(xPos, y)); line.setFillColor(sf::Color(80, 80, 80, 100)); window.draw(line);
-        std::string freqStr = formatHz((long long)f); if(freqStr.size() > 4) freqStr = freqStr.substr(0, freqStr.size()-4);
-        sf::Text l(font, freqStr, 20); l.setScale(sf::Vector2f(0.5f, 0.5f));
-        sf::FloatRect b = l.getGlobalBounds(); l.setPosition(sf::Vector2f(xPos - b.size.x/2, y + h - 15)); l.setFillColor(sf::Color(220, 220, 220, 200)); window.draw(l);
+        float normPos = (float)((f - startFreq) / visibleSpan);
+        float xPos = x + normPos * w;
+        
+        // Przedłużamy linię, aby weszła jako "znacznik" na czarny pasek
+        sf::RectangleShape line({1, h + 8}); 
+        line.setPosition(sf::Vector2f(xPos, y));
+        line.setFillColor(sf::Color(80, 80, 80, 100));
+        window.draw(line);
+        std::string freqStr = formatHz((long long)f);
+        if(freqStr.size() > 4) freqStr = freqStr.substr(0, freqStr.size()-4);
+        sf::Text l(font, freqStr, 26);
+        l.setScale(sf::Vector2f(0.5f, 0.5f));
+        sf::FloatRect b = l.getGlobalBounds();
+        l.setPosition(sf::Vector2f(xPos - b.size.x/2, y + h + 4));
+        l.setFillColor(sf::Color(220, 220, 220, 200));
+        window.draw(l);
     }
 }

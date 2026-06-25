@@ -113,6 +113,11 @@ if [ "$IS_MACOS" = true ]; then
         echo "WARNING: icon.png not found! App will have generic icon."
     fi
 
+    # Kopiowanie bandplan.json do Resources
+    if [ -f "bandplan.json" ]; then
+        cp "bandplan.json" "$APP_BUNDLE/Contents/Resources/"
+    fi
+
     # Fix libraries linking
     if [[ "$SDRPLAY_MODE" == "yes" ]] && [ -f "/usr/local/lib/libsdrplay_api.so.3" ]; then
         cp "/usr/local/lib/libsdrplay_api.so.3" "$APP_BUNDLE/Contents/Frameworks/"
@@ -177,6 +182,10 @@ else
     # Na Linuxie po prostu kopiujemy png obok binarki, żeby kod C++ mógł go załadować
     if [ -f "icon.png" ]; then
         cp "icon.png" "icon.png" # Dummy copy just to be explicit, logic handled in C++
+    fi
+    # Kopiowanie bandplan.json
+    if [ -f "bandplan.json" ]; then
+        cp "bandplan.json" "bandplan.json"
     fi
     echo "SUCCESS! Run ./$OUT_FILE"
 fi

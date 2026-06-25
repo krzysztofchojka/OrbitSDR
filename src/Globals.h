@@ -76,4 +76,41 @@ struct SharedData {
                    inspectorWaterfallRow(280 * 4, 0) {} 
 };
 
-struct LayoutState { float winW, winH, sidebarX, specW, specH, waterfallH; };
+struct LayoutState {
+    float winW, winH, sidebarX, specW, specH, waterfallH;
+    float tuneBarH = 24.0f; // Wysokość czarnego paska strojenia
+};
+
+struct BandRegion {
+    long long startFreq;
+    long long endFreq;
+    std::string name;
+    sf::Color color;
+};
+
+// Prosty parser JSON wykorzystujący regex, niewymagający zewnętrznych bibliotek
+inline std::vector<BandRegion> loadBandPlan(const std::string& filepath) {
+    std::vector<BandRegion> bands;
+    std::ifstream file(filepath);
+    if (!file.is_open()) return bands;
+
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    // Oczekiwany format w JSON: {"start": 144000000, "end": 146000000, "name": "2m Amateur", "color": "255,0,0"}
+    std::regex bandRegex("\"start\"\\s*:\\s*(\\d+).*?\"end\"\\s*:\\s*(\\d+).*?\"name\"\\s*:\\s*\"([^\"]+)\".*?\"color\"\\s*:\\s*\"(\\d+),(\\d+),(\\d+)\"");
+    
+    auto words_begin = std::sregex_iterator(content.begin(), content.end(), bandRegex);
+    auto words_end = std::sregex_iterator();
+
+    for (std::sregex_iterator i = words_begin; i != words_end; ++i) {
+        std::smatch match = *i;
+        BandRegion b;
+        b.startFreq = std::stoll(match[1].str());
+        b.endFreq = std::stoll(match[2].str());
+        b.name = match[3].str();
+        b.color = sf::Color(std::stoi(match[4]), std::stoi(match[5]), std::stoi(match[6]));
+        bands.push_back(b);
+    }
+    return bands;
+}
+
+inline std::vector<BandRegion> globalBandPlan; // Globalna zmienna do przechowania pasm

@@ -90,6 +90,9 @@ else
     rm -f rtlsdr_v4.zip
 fi
 
+echo "Copying bandplan.json..."
+cp bandplan.json . 2>/dev/null || echo "WARNING: bandplan.json not found!"
+
 echo "------------------------------------------"
 echo "DONE! The orbitsdr.exe file and libraries are ready."
 echo "------------------------------------------"
