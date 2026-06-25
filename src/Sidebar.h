@@ -158,7 +158,6 @@ public:
         }
     }
 
-    // CHANGE: Checks if the mouse is hovering over the ENTIRE sidebar panel, not just individual widgets
     bool isMouseOver(const sf::RenderWindow& win) const {
         sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
         return (m.x >= x && m.x <= x + width && m.y >= y && m.y <= y + height);
@@ -170,15 +169,13 @@ public:
         return false;
     }
 
-    // CHANGE: Returns bool (true = event handled/captured)
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) {
         // 1. Priority: Dropdowns (always rendered on top)
         if (Dropdown::currentActive) {
             for (auto& mod : modules) {
                 if(mod->handleEvent(ev, win)) return true;
             }
-            // If clicked outside the dropdown, consume the event anyway to close it
-            return true;
+            return true; // Clicked outside the dropdown, close it
         }
 
         bool captured = false;

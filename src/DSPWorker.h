@@ -243,6 +243,7 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                     viewStartPct = 1.0 - visibleFraction;
                 }
 
+                // Wodospad - używamy precyzji float, by nie obcinać resztek do krawędzi FFT
                 float exactStartBin = viewStartPct * FFT_SIZE;
                 float exactEndBin = viewEndPct * FFT_SIZE;
                 float exactVisibleBins = exactEndBin - exactStartBin;
@@ -288,5 +289,6 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
+
     if (recorder.active) recorder.stop();
 }

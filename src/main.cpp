@@ -729,7 +729,6 @@ int main() {
 
     modDecoders->addWidget(chkAIS);
 
-
     auto modDisp = sidebar.addModule("Display");
 
     auto slMinDb = std::make_shared<Slider>(SIDEBAR_W - 40, -140.0f, -20.0f, -90.0f, "Min dB", font);
@@ -847,7 +846,6 @@ int main() {
         }
     };
     modRec->addWidget(btnRecToggle);
-
 
     const int MINI_W = 280;
     const int MINI_H = 120;
@@ -976,7 +974,6 @@ int main() {
         sharedData.recPath = savedRecPath;
     }
     lblRecPath->setText("Path: " + truncatePath(savedRecPath, 25));
-
 
     sf::Clock debouncer;
     sf::Clock interactionCooldown;
@@ -1232,60 +1229,29 @@ int main() {
                 double minF = (double)currentCenterFreq - halfBW;
                 double maxF = (double)currentCenterFreq + halfBW;
 
-                if (stickyCenterMode && isHw) {
-                    pendingCenterFreq = targetVFO;
-                    debouncer.restart();
+                if (isHw && (stickyCenterMode || targetVFO < minF || targetVFO > maxF)) {
+                    currentCenterFreq = targetVFO;
                     {
                         std::lock_guard<std::mutex> l(sharedData.mtx);
+                        sharedData.centerFreq = targetVFO;
                         sharedData.tunedFreqPercent = 0.5;
                         sharedData.viewCenterPct = 0.5;
                     }
+                    pendingCenterFreq = targetVFO;
+                    debouncer.restart();
                 } else {
-                    if (targetVFO > maxF || targetVFO < minF) {
-                        if (isHw) {
-                            pendingCenterFreq = targetVFO;
-                            debouncer.restart();
-                            {
-                                std::lock_guard<std::mutex> l(sharedData.mtx);
-                                sharedData.tunedFreqPercent = 0.5;
-                                sharedData.viewCenterPct = 0.5;
-                            }
-                        } else {
-                            if (targetVFO > maxF) targetVFO = (long long)maxF;
-                            if (targetVFO < minF) targetVFO = (long long)minF;
-                            double newOffset = (double)(targetVFO - currentCenterFreq);
-                            {
-                                std::lock_guard<std::mutex> l(sharedData.mtx);
-                                sharedData.tunedFreqPercent = 0.5 + (newOffset / hwSampleRate);
-                            }
-                        }
-                    } else {
-                        double newOffset = (double)(targetVFO - currentCenterFreq);
-                        {
-                            std::lock_guard<std::mutex> l(sharedData.mtx);
-                            sharedData.tunedFreqPercent = 0.5 + (newOffset / hwSampleRate);
-                        }
+                    if (!isHw) {
+                        if (targetVFO > maxF) targetVFO = (long long)maxF;
+                        if (targetVFO < minF) targetVFO = (long long)minF;
+                    }
+                    double newOffset = (double)(targetVFO - currentCenterFreq);
+                    {
+                        std::lock_guard<std::mutex> l(sharedData.mtx);
+                        sharedData.tunedFreqPercent = 0.5 + (newOffset / hwSampleRate);
                     }
                 }
 
                 if (targetVFO != freqVFO.getFrequency()) freqVFO.setFrequency(targetVFO);
-
-                if (stickyCenterMode && isHw) {
-                    pendingCenterFreq = targetVFO;
-                    debouncer.restart();
-                    {
-                        std::lock_guard<std::mutex> l(sharedData.mtx);
-                        sharedData.tunedFreqPercent = 0.5;
-                        sharedData.viewCenterPct = 0.5;
-                    }
-                } else {
-                    double newOffset = (double)(targetVFO - currentCenterFreq);
-                    double pct = 0.5 + (newOffset / hwSampleRate);
-                    {
-                        std::lock_guard<std::mutex> l(sharedData.mtx);
-                        sharedData.tunedFreqPercent = pct;
-                    }
-                }
             }
 
             if (topBarHandled) continue;
@@ -1314,10 +1280,12 @@ int main() {
                         freqVFO.setFrequency(rawNext);
 
                         if (stickyCenterMode && isHw) {
+                            currentCenterFreq = rawNext;
                             pendingCenterFreq = rawNext;
                             debouncer.restart();
                             {
                                 std::lock_guard<std::mutex> l(sharedData.mtx);
+                                sharedData.centerFreq = rawNext;
                                 sharedData.tunedFreqPercent = 0.5;
                                 sharedData.viewCenterPct = 0.5;
                             }
@@ -1412,7 +1380,6 @@ int main() {
                 } else if (isSpectrumDragging) applySpectrumTuning(m.x);
 
                 if (isDraggingScale) {
-                    // Akumulator zapobiega utracie resztek pikseli przy szybkim przesuwaniu
                     static double dragAccumulator = 0.0;
                     float dx = lastDragX - m.x;
                     lastDragX = m.x;
@@ -1429,7 +1396,7 @@ int main() {
                         currentCenterFreq = nextCenter; // Szybki update dla wizualizacji
                         { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.centerFreq = nextCenter; }
                         
-                        // Zamiast zmuszać RTL-SDR do natychmiastowego skoku, kolejkujemy go:
+                        // Kolejkowanie skoku do urządzenia (debouncer)
                         pendingCenterFreq = nextCenter;
                     } else {
                         double pctShift = (dx / layout.specW) * viewWidthPct;
@@ -1447,15 +1414,17 @@ int main() {
                     sharedData.mouseX_spectrum = -1.0f;
                 }
             }
-        }
+        } // <- Koniec bezpiecznie zamkniętej pętli pollEvent()
 
         if (pendingCenterFreq != 0 && debouncer.getElapsedTime().asMilliseconds() > TUNING_LATENCY_MS) {
             std::lock_guard<std::mutex> l(sourceMtx);
             if (currentSource && currentSource->isHardware()) {
                 currentSource->setCenterFrequency(pendingCenterFreq);
+                currentCenterFreq = pendingCenterFreq;
             }
+            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.centerFreq = pendingCenterFreq; }
             pendingCenterFreq = 0;
-            debouncer.restart(); // Opóźniamy następny skok do RTL-SDR o minimum TUNING_LATENCY_MS
+            debouncer.restart();
         }
 
         sidebar.update(window);
