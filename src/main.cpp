@@ -1,10 +1,11 @@
 #ifdef _WIN32
-  #ifndef NOMINMAX
-  #define NOMINMAX
-  #endif
-  #include <winsock2.h>
-  #include <ws2tcpip.h>
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
 #endif
+
 #define MINIAUDIO_IMPLEMENTATION
 #include <SFML/Graphics.hpp>
 #include <SFML/Window/Clipboard.hpp>
@@ -22,6 +23,7 @@
 #include "IQSources.h"
 #include "APRS_Decoder.h"
 #include "Settings.h"
+#include "PlatformUtils.h"
 
 // Extracted Modules
 #include "Globals.h"
@@ -35,7 +37,7 @@
 #include "modules/AIS/AIS_Decoder.h"
 
 int main() {
-#ifdef _WIN32
+    #ifdef _WIN32
     HMODULE hUser32 = LoadLibraryA("user32.dll");
     if (hUser32) {
         typedef BOOL (WINAPI *SetProcessDpiAwarenessContextProc)(void*);
@@ -44,7 +46,7 @@ int main() {
             setDpiAware((void*)-4);
         }
     }
-#endif
+    #endif
 
     SettingsManager settingsMgr;
     std::string settingsPath = getSettingsFilePath();
@@ -81,10 +83,13 @@ int main() {
     sf::RenderWindow window(sf::VideoMode::getDesktopMode(), "OrbitSDR", sf::Style::Default, sf::State::Windowed, settings);
     window.setFramerateLimit(60);
 
+    // Icon: looked up next to the executable and in ../Resources (macOS bundle)
     sf::Image icon;
-    if (!icon.loadFromFile("icon.png") && !icon.loadFromFile("../Resources/icon.png")) {}
-    else {
-        window.setIcon(icon);
+    {
+        std::string iconPath = findResourceFile("icon.png");
+        if (!iconPath.empty() && icon.loadFromFile(iconPath)) {
+            window.setIcon(icon);
+        }
     }
 
     sf::Font font;
@@ -97,6 +102,28 @@ int main() {
         !font.openFromFile("arial.ttf")) {
         std::cerr << "Font not found!\n";
     }
+
+    // --- UI SCALE SETUP ---
+    // The whole UI is drawn in "logical" coordinates and the window view is scaled,
+    // so every widget / mouse hit-test automatically follows the chosen scale.
+    const std::vector<std::string> UI_SCALE_NAMES  = {"Auto (system)", "100%", "125%", "150%", "175%", "200%", "250%"};
+    const std::vector<float>       UI_SCALE_VALUES = {0.0f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f, 2.5f};
+    int uiScaleIdx = 0;
+    float autoUiScale = 1.0f;
+    #ifdef _WIN32
+    autoUiScale = detectWindowsUiScale((void*)window.getNativeHandle());
+    std::cout << "[INFO] Detected Windows UI scale: " << autoUiScale << std::endl;
+    #endif
+    auto getUiScale = [&]() -> float {
+        int idx = std::clamp(uiScaleIdx, 0, (int)UI_SCALE_VALUES.size() - 1);
+        if (idx == 0) return autoUiScale;
+        return UI_SCALE_VALUES[idx];
+    };
+    std::function<void()> applyUiScale; // assigned after updateLayout is defined
+
+    // --- RTL-TCP connection state ---
+    bool tcpConnected = false;
+    std::string tcpAddr;
 
     std::vector<std::unique_ptr<SDRModule>> modules;
     auto aisMod = std::make_unique<AISDecoder>();
@@ -113,6 +140,7 @@ int main() {
     topBar.setFillColor(sf::Color(19, 19, 21));
 
     Theme::setTheme(0);
+
     FrequencyDisplay freqVFO(20, 8, font);
     freqVFO.setFrequency(savedFreq);
 
@@ -122,7 +150,6 @@ int main() {
 
     SdrButton btnPlay(40, 40, ">", font);
     btnPlay.setColor(sf::Color(116, 57, 57));
-
     SdrButton btnMute(40, 40, "M", font);
 
     Slider volSlider(150, 0.0f, 4.0f, 1.0f, "Volume", font);
@@ -136,7 +163,7 @@ int main() {
     auto chkAIS = std::make_shared<Checkbox>("Enable AIS (162.025)", font);
 
     auto btnNFM = std::make_shared<SdrButton>(36, 25, "NFM", font);
-    auto btnAM = std::make_shared<SdrButton>(36, 25, "AM", font);
+    auto btnAM  = std::make_shared<SdrButton>(36, 25, "AM", font);
     auto btnWFM = std::make_shared<SdrButton>(36, 25, "WFM", font);
     auto btnUSB = std::make_shared<SdrButton>(36, 25, "USB", font);
     auto btnLSB = std::make_shared<SdrButton>(36, 25, "LSB", font);
@@ -144,13 +171,9 @@ int main() {
     auto btnOFF = std::make_shared<SdrButton>(36, 25, "OFF", font);
 
     auto rowModes = std::make_shared<RowContainer>();
-    rowModes->add(btnNFM);
-    rowModes->add(btnAM);
-    rowModes->add(btnWFM);
-    rowModes->add(btnUSB);
-    rowModes->add(btnLSB);
-    rowModes->add(btnRAW);
-    rowModes->add(btnOFF);
+    rowModes->add(btnNFM); rowModes->add(btnAM); rowModes->add(btnWFM);
+    rowModes->add(btnUSB); rowModes->add(btnLSB); rowModes->add(btnRAW); rowModes->add(btnOFF);
+
     auto slBW = std::make_shared<Slider>(SIDEBAR_W - 40, 1000.0f, 200000.0f, 12500.0f, "Bandwidth (Hz)", font);
 
     auto modSource = sidebar.addModule("Source / Input");
@@ -162,9 +185,9 @@ int main() {
     auto lblDevice = std::make_shared<Label>("Select Device:", font);
     auto ddDevice = std::make_shared<Dropdown>(SIDEBAR_W - 40, 25.0f, font);
     auto btnRefresh = std::make_shared<SdrButton>(SIDEBAR_W - 40, 25, "Refresh Device List", font);
-
     auto ddRate = std::make_shared<Dropdown>(SIDEBAR_W - 40, 25.0f, font);
     ddRate->setOptions({"None"});
+
     auto lblHost = std::make_shared<Label>("Server (host:port):", font);
     auto txtHost = std::make_shared<TextInput>(SIDEBAR_W - 40, 25.0f, font);
     txtHost->setText(settingsMgr.getString("rtltcp_host", "127.0.0.1:1234"));
@@ -198,7 +221,6 @@ int main() {
         slGain->setEnabled(!b);
         pendingRfGain = b ? -1.0f : slGain->currentVal;
     };
-
     slGain->setEnabled(false);
 
     auto lblAntenna = std::make_shared<Label>("Antenna (SDRPlay):", font);
@@ -267,7 +289,6 @@ int main() {
         sidebar.recalculateLayout();
         sidebar.updateStyle();
     };
-
     updateRadioControls(0);
 
     long long currentCenterFreq = savedFreq;
@@ -282,13 +303,17 @@ int main() {
                 currentSource = nullptr;
             }
         }
+        // Whatever happens next, we are not connected to an RTL-TCP server any more
+        tcpConnected = false;
+        btnConnect->setText("Connect");
+        btnConnect->setActive(false);
+
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
         std::shared_ptr<IQSource> newSource;
         uint32_t targetRate = 0;
         bool success = false;
         currentSourceType = sourceIdx;
-
         updateRadioControls(sourceIdx);
 
         if (sourceIdx == 0) {
@@ -299,7 +324,6 @@ int main() {
                 std::lock_guard<std::mutex> l(sharedData.mtx);
                 sharedData.currentFilename = path;
             }
-
             std::string fileName = path.substr(path.find_last_of("/\\") + 1);
             ddRate->setOptions({fileName, "[ Change File... ]"});
             ddRate->setSelection(0);
@@ -308,18 +332,13 @@ int main() {
             std::regex freqRegex(R"(_(\d+)Hz_)");
             std::smatch match;
             if (std::regex_search(path, match, freqRegex)) {
-                try {
-                    f = std::stoll(match[1]);
-                } catch(...) {}
+                try { f = std::stoll(match[1]); } catch(...) {}
             }
             currentCenterFreq = f;
             freqVFO.setFrequency(f);
-            {
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                sharedData.centerFreq = f;
-            }
-
-        } else if (sourceIdx == 1) {
+            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.centerFreq = f; }
+        }
+        else if (sourceIdx == 1) {
             targetRate = (rateIdx < RTL_RATES_VAL.size()) ? RTL_RATES_VAL[rateIdx] : 2048000;
             auto rtl = std::make_shared<RtlSdrSource>();
             ddRate->setOptions(rtl->getAvailableSampleRatesText());
@@ -340,8 +359,8 @@ int main() {
             slGain->setText("RF Gain: AGC");
             newSource->setHardwareOption("direct_sampling", hwState.directSampling);
             newSource->setHardwareOption("bias_t", hwState.biasT ? 1 : 0);
-
-        } else if (sourceIdx == 2) {
+        }
+        else if (sourceIdx == 2) {
             targetRate = (rateIdx < SDRPLAY_RATES_VAL.size()) ? SDRPLAY_RATES_VAL[rateIdx] : 2000000;
             auto sdr = std::make_shared<SdrPlaySource>();
             ddRate->setOptions(sdr->getAvailableSampleRatesText());
@@ -367,8 +386,8 @@ int main() {
             newSource->setHardwareOption("fm_notch", hwState.fmNotch ? 1 : 0);
             newSource->setHardwareOption("mw_notch", hwState.mwNotch ? 1 : 0);
             newSource->setHardwareOption("bias_t", hwState.biasT ? 1 : 0);
-
-        } else if (sourceIdx == 4) {
+        }
+        else if (sourceIdx == 4) {
             targetRate = (rateIdx < (int)RTL_RATES_VAL.size()) ? RTL_RATES_VAL[rateIdx] : 2048000;
             auto tcp = std::make_shared<RtlTcpSource>();
             ddRate->setOptions(tcp->getAvailableSampleRatesText());
@@ -379,10 +398,12 @@ int main() {
             if (currentCenterFreq < 1000000) currentCenterFreq = 97800000;
             freqVFO.setFrequency(currentCenterFreq);
             newSource->setCenterFrequency(currentCenterFreq);
-            { std::lock_guard<std::mutex> l(sharedData.mtx);
-              sharedData.tunedFreqPercent = 0.5; sharedData.viewCenterPct = 0.5;
-              sharedData.centerFreq = currentCenterFreq; }
-
+            {
+                std::lock_guard<std::mutex> l(sharedData.mtx);
+                sharedData.tunedFreqPercent = 0.5;
+                sharedData.viewCenterPct = 0.5;
+                sharedData.centerFreq = currentCenterFreq;
+            }
             slGain->setLimits(0.0f, 49.6f);
             slGain->setText("RF Gain: AGC");
             newSource->setHardwareOption("direct_sampling", hwState.directSampling);
@@ -399,6 +420,14 @@ int main() {
             currentSource = newSource;
         }
 
+        // RTL-TCP connected successfully -> the button turns into "Disconnect"
+        if (sourceIdx == 4) {
+            tcpConnected = true;
+            tcpAddr = deviceID;
+            btnConnect->setText("Disconnect");
+            btnConnect->setActive(true);
+        }
+
         {
             std::lock_guard<std::mutex> lock(sharedData.mtx);
             sharedData.isPlaying = false;
@@ -408,6 +437,31 @@ int main() {
         btnPlay.setText(">");
         btnPlay.setActive(false);
         audio.clear();
+    };
+
+    // Cleanly drops the RTL-TCP connection and leaves the app in an idle (no source) state
+    std::function<void()> doDisconnectTcp = [&]() {
+        {
+            std::lock_guard<std::mutex> lock(sourceMtx);
+            if (currentSource) {
+                currentSource->stop();
+                currentSource->close();
+            }
+            currentSource = std::make_shared<FileSource>();   // idle placeholder, reads nothing
+        }
+        {
+            std::lock_guard<std::mutex> lock(sharedData.mtx);
+            sharedData.isPlaying = false;
+            sharedData.isRecording = false;
+        }
+        audio.stop();
+        btnPlay.setText(">");
+        btnPlay.setActive(false);
+        audio.clear();
+
+        tcpConnected = false;
+        btnConnect->setText("Connect");
+        btnConnect->setActive(false);
     };
 
     std::vector<SDRDeviceItem> cachedDevices;
@@ -420,10 +474,7 @@ int main() {
         if (ddSourceType->selectedIndex == 0) {
             modSource->addWidget(std::make_shared<Label>("Loaded File:", font));
             std::string fname;
-            {
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                fname = sharedData.currentFilename;
-            }
+            { std::lock_guard<std::mutex> l(sharedData.mtx); fname = sharedData.currentFilename; }
             if (fname == "None" || fname.empty()) {
                 ddRate->setOptions({"[ Select File... ]"});
             } else {
@@ -444,25 +495,31 @@ int main() {
             modSource->addWidget(std::make_shared<Label>("Sample Rate:", font));
             modSource->addWidget(ddRate);
         }
-
         sidebar.recalculateLayout();
         sidebar.updateStyle();
     };
 
     ddSourceType->onChange = [&](int idx) {
+        // Switching away from RTL-TCP while connected: drop the connection first
+        if (idx != 4 && tcpConnected) doDisconnectTcp();
+
         if (idx == 0) {
             std::string path = openFileDialog();
             if (!path.empty()) {
                 doOpenSource(0, "", 0, path);
                 refreshSourceUI();
             } else refreshSourceUI();
-        } else if (idx == 4) {
-            ddRate->setOptions({"1.4 MSps", "1.8 MSps", "2.048 MSps", "2.4 MSps", "3.2 MSps"});
-            ddRate->setSelection(2);
-            refreshSourceUI();      // pokazuje pole host:port, łączy dopiero przycisk Connect
-        }else {
+        }
+        else if (idx == 4) {
+            if (!tcpConnected) {
+                ddRate->setOptions({"1.4 MSps", "1.8 MSps", "2.048 MSps", "2.4 MSps", "3.2 MSps"});
+                ddRate->setSelection(2);
+            }
+            refreshSourceUI();   // shows host:port, connection is made only by the Connect button
+        } else {
             cachedDevices.clear();
             std::vector<std::string> names;
+
             if (idx == 1) cachedDevices = RtlSdrSource::getDeviceList();
             else if (idx == 2) {
                 cachedDevices = SdrPlaySource::getDeviceList();
@@ -474,8 +531,8 @@ int main() {
 
             for(auto& d : cachedDevices) names.push_back(d.name);
             if (names.empty()) names.push_back("No Devices Found");
-
             ddDevice->setOptions(names);
+
             refreshSourceUI();
 
             if (!cachedDevices.empty()) {
@@ -508,6 +565,7 @@ int main() {
 
         std::vector<std::string> names;
         for(auto& d : cachedDevices) names.push_back(d.name);
+
         if (names.empty()) {
             names.push_back("No Devices Found");
             ddDevice->setOptions(names);
@@ -518,26 +576,37 @@ int main() {
         }
     };
 
+    // Connect <-> Disconnect toggle
     btnConnect->onClick = [&]() {
+        if (tcpConnected) {
+            doDisconnectTcp();
+            return;
+        }
         std::string addr = txtHost->getText();
         if (addr.empty()) return;
         doOpenSource(4, addr, ddRate->selectedIndex, "");
     };
-    txtHost->onSubmit = [&](const std::string&) { if (btnConnect->onClick) btnConnect->onClick(); };
+
+    // Enter in the host field only CONNECTS (it must never disconnect an active session)
+    txtHost->onSubmit = [&](const std::string&) {
+        if (!tcpConnected && btnConnect->onClick) btnConnect->onClick();
+    };
 
     ddRate->onChange = [&](int idx) {
         if (ddSourceType->selectedIndex == 0) {
             std::string currentOpt = "";
             if(idx >= 0 && idx < ddRate->options.size()) currentOpt = ddRate->options[idx];
+
             if (currentOpt == "[ Select File... ]" || currentOpt == "[ Change File... ]") {
                 std::string path = openFileDialog();
                 if (!path.empty()) doOpenSource(0, "", 0, path);
                 else refreshSourceUI();
             }
-        } else if (ddSourceType->selectedIndex == 4) {
-            std::string addr = txtHost->getText();
-            if (currentSourceType == 4 && !addr.empty()) doOpenSource(4, addr, idx, "");
-        }else if (ddSourceType->selectedIndex != 0 && !cachedDevices.empty()) {
+        }
+        else if (ddSourceType->selectedIndex == 4) {
+            // Changing the sample rate re-connects to the same server, but only while connected
+            if (tcpConnected && !tcpAddr.empty()) doOpenSource(4, tcpAddr, idx, "");
+        } else if (ddSourceType->selectedIndex != 0 && !cachedDevices.empty()) {
             doOpenSource(ddSourceType->selectedIndex, cachedDevices[ddDevice->selectedIndex].id, idx, "");
         }
     };
@@ -567,17 +636,11 @@ int main() {
     modDemod->addWidget(slBW);
 
     auto slSq = std::make_shared<Slider>(SIDEBAR_W - 40, -100.0f, 0.0f, -100.0f, "Squelch (dB)", font);
-    slSq->onChange = [&](float v) {
-        std::lock_guard<std::mutex> l(sharedData.mtx);
-        sharedData.squelchThreshold = v;
-    };
+    slSq->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.squelchThreshold = v; };
     modDemod->addWidget(slSq);
 
     auto chkStereo = std::make_shared<Checkbox>("Stereo (WFM only)", font);
-    chkStereo->onToggle = [&](bool b) {
-        std::lock_guard<std::mutex> l(sharedData.mtx);
-        sharedData.stereoEnabled = b;
-    };
+    chkStereo->onToggle = [&](bool b) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.stereoEnabled = b; };
     modDemod->addWidget(chkStereo);
 
     Mode previousMode = Mode::NFM;
@@ -585,61 +648,39 @@ int main() {
     auto setMode = [&](Mode m, SdrButton* me) {
         if (chkAprs->checked) {
             chkAprs->checked = false;
-            {
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                sharedData.aprsEnabled = false;
-            }
+            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.aprsEnabled = false; }
         }
-
         if (chkAIS->checked) {
             chkAIS->checked = false;
-            {
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                sharedData.activeDecoder = nullptr;
-                ptrAIS->enabled = false;
-            }
+            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.activeDecoder = nullptr; ptrAIS->enabled = false; }
         }
 
         rowModes->setEnabled(true);
-        btnNFM->setActive(false);
-        btnAM->setActive(false);
-        btnWFM->setActive(false);
-        btnUSB->setActive(false);
-        btnLSB->setActive(false);
-        btnRAW->setActive(false);
-        btnOFF->setActive(false);
+        btnNFM->setActive(false); btnAM->setActive(false); btnWFM->setActive(false);
+        btnUSB->setActive(false); btnLSB->setActive(false); btnRAW->setActive(false); btnOFF->setActive(false);
         me->setActive(true);
 
         std::lock_guard<std::mutex> l(sharedData.mtx);
         sharedData.mode = m;
 
         if (m == Mode::WFM) {
-            slBW->setLimits(50000, 200000);
-            slBW->setValueSilent(180000);
-            sharedData.bandwidth = 180000;
-            slBW->setText("Bandwidth: 180 kHz");
+            slBW->setLimits(50000, 200000); slBW->setValueSilent(180000);
+            sharedData.bandwidth = 180000; slBW->setText("Bandwidth: 180 kHz");
         } else if (m == Mode::RAW) {
-            slBW->setLimits(1000, 200000);
-            slBW->setValueSilent(48000);
-            sharedData.bandwidth = 48000;
-            slBW->setText("Bandwidth: 48.0 kHz");
+            slBW->setLimits(1000, 200000); slBW->setValueSilent(48000);
+            sharedData.bandwidth = 48000; slBW->setText("Bandwidth: 48.0 kHz");
         } else if (m == Mode::NFM || m == Mode::AM) {
-            slBW->setLimits(4000, 40000);
-            slBW->setValueSilent(12500);
-            sharedData.bandwidth = 12500;
-            slBW->setText("Bandwidth: 12.5 kHz");
+            slBW->setLimits(4000, 40000); slBW->setValueSilent(12500);
+            sharedData.bandwidth = 12500; slBW->setText("Bandwidth: 12.5 kHz");
         } else if (m == Mode::OFF) {
-
         } else {
-            slBW->setLimits(1000, 10000);
-            slBW->setValueSilent(3000);
-            sharedData.bandwidth = 3000;
-            slBW->setText("Bandwidth: 3 kHz");
+            slBW->setLimits(1000, 10000); slBW->setValueSilent(3000);
+            sharedData.bandwidth = 3000; slBW->setText("Bandwidth: 3 kHz");
         }
     };
 
     btnNFM->onClick = [&](){ setMode(Mode::NFM, btnNFM.get()); };
-    btnAM->onClick = [&](){ setMode(Mode::AM, btnAM.get()); };
+    btnAM->onClick  = [&](){ setMode(Mode::AM, btnAM.get()); };
     btnWFM->onClick = [&](){ setMode(Mode::WFM, btnWFM.get()); };
     btnUSB->onClick = [&](){ setMode(Mode::USB, btnUSB.get()); };
     btnLSB->onClick = [&](){ setMode(Mode::LSB, btnLSB.get()); };
@@ -647,35 +688,21 @@ int main() {
     btnOFF->onClick = [&](){ setMode(Mode::OFF, btnOFF.get()); };
 
     chkAprs->onToggle = [&](bool b) {
-        {
-            std::lock_guard<std::mutex> l(sharedData.mtx);
-            sharedData.aprsEnabled = b;
-        }
+        { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.aprsEnabled = b; }
         rowModes->setEnabled(!b);
 
         if(b && chkAIS->checked) {
             chkAIS->checked = false;
-            {
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                sharedData.activeDecoder = nullptr;
-                ptrAIS->enabled = false;
-            }
+            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.activeDecoder = nullptr; ptrAIS->enabled = false; }
         }
 
         if (b) {
-            {
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                previousMode = sharedData.mode;
-            }
+            { std::lock_guard<std::mutex> l(sharedData.mtx); previousMode = sharedData.mode; }
+
             bool isAudioIn = (currentSourceType == 3);
 
-            btnNFM->setActive(!isAudioIn);
-            btnAM->setActive(false);
-            btnWFM->setActive(false);
-            btnUSB->setActive(false);
-            btnLSB->setActive(false);
-            btnRAW->setActive(isAudioIn);
-            btnOFF->setActive(false);
+            btnNFM->setActive(!isAudioIn); btnAM->setActive(false); btnWFM->setActive(false);
+            btnUSB->setActive(false); btnLSB->setActive(false); btnRAW->setActive(isAudioIn); btnOFF->setActive(false);
 
             {
                 std::lock_guard<std::mutex> l(sharedData.mtx);
@@ -702,7 +729,6 @@ int main() {
             else setMode(Mode::OFF, btnOFF.get());
         }
     };
-
     modDecoders->addWidget(chkAprs);
 
     btnCopyAprs->onClick = [&](){
@@ -713,11 +739,11 @@ int main() {
 
     chkAIS->onToggle = [&](bool b) {
         std::lock_guard<std::mutex> l(sharedData.mtx);
+
         if(b && chkAprs->checked) {
             chkAprs->checked = false;
             sharedData.aprsEnabled = false;
         }
-
         rowModes->setEnabled(!b);
 
         if (b) {
@@ -726,16 +752,12 @@ int main() {
             previousMode = sharedData.mode;
 
             bool isAudioIn = (currentSourceType == 3);
+
             sharedData.mode = isAudioIn ? Mode::RAW : Mode::NFM;
             sharedData.bandwidth = isAudioIn ? 48000.0f : 25000.0f;
 
-            btnNFM->setActive(!isAudioIn);
-            btnAM->setActive(false);
-            btnWFM->setActive(false);
-            btnUSB->setActive(false);
-            btnLSB->setActive(false);
-            btnRAW->setActive(isAudioIn);
-            btnOFF->setActive(false);
+            btnNFM->setActive(!isAudioIn); btnAM->setActive(false); btnWFM->setActive(false);
+            btnUSB->setActive(false); btnLSB->setActive(false); btnRAW->setActive(isAudioIn); btnOFF->setActive(false);
 
             if (isAudioIn) {
                 slBW->setLimits(1000, 200000);
@@ -773,33 +795,25 @@ int main() {
     modDecoders->addWidget(chkAIS);
 
     auto modDisp = sidebar.addModule("Display");
-
     auto slMinDb = std::make_shared<Slider>(SIDEBAR_W - 40, -140.0f, -20.0f, -90.0f, "Min dB", font);
-    slMinDb->onChange = [&](float v) {
-        std::lock_guard<std::mutex> l(sharedData.mtx);
-        sharedData.minDb = v;
-    };
+    slMinDb->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.minDb = v; };
     modDisp->addWidget(slMinDb);
 
     auto slMaxDb = std::make_shared<Slider>(SIDEBAR_W - 40, -60.0f, 40.0f, 0.0f, "Max dB", font);
-    slMaxDb->onChange = [&](float v) {
-        std::lock_guard<std::mutex> l(sharedData.mtx);
-        sharedData.maxDb = v;
-    };
+    slMaxDb->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.maxDb = v; };
     modDisp->addWidget(slMaxDb);
 
     auto slZoom = std::make_shared<Slider>(SIDEBAR_W - 40, 1.0f, 16.0f, 1.0f, "Zoom", font);
     slZoom->onChange = [&](float v) {
         std::lock_guard<std::mutex> l(sharedData.mtx);
-
         double oldZoom = sharedData.zoomLevel;
         double oldVisibleFraction = 1.0 / oldZoom;
         double oldViewStart = sharedData.viewCenterPct - oldVisibleFraction / 2.0;
-
         double tunerOffsetFromStart = sharedData.tunedFreqPercent - oldViewStart;
         double tunerPosRatio = tunerOffsetFromStart / oldVisibleFraction;
 
         sharedData.zoomLevel = v;
+
         double newVisibleFraction = 1.0 / v;
         double newViewStart = sharedData.tunedFreqPercent - (tunerPosRatio * newVisibleFraction);
         sharedData.viewCenterPct = newViewStart + newVisibleFraction / 2.0;
@@ -827,34 +841,31 @@ int main() {
     modDisp->addWidget(std::make_shared<Label>("Waterfall Theme:", font));
     modDisp->addWidget(ddTheme);
 
+    // UI scale selector (for HiDPI / tiny UI on Windows laptops)
+    auto ddScale = std::make_shared<Dropdown>(SIDEBAR_W - 40, 25.0f, font);
+    ddScale->setOptions(UI_SCALE_NAMES);
+    ddScale->setSelection(0);
+    ddScale->onChange = [&](int idx) {
+        uiScaleIdx = idx;
+        if (applyUiScale) applyUiScale();
+    };
+    modDisp->addWidget(std::make_shared<Label>("UI Scale:", font));
+    modDisp->addWidget(ddScale);
+
     auto ddSnap = std::make_shared<Dropdown>(150.0f, 25.0f, font);
     ddSnap->setOptions(STEP_NAMES);
     ddSnap->setSelection(5);
     modDisp->addWidget(std::make_shared<Label>("Tuning Step:", font));
     modDisp->addWidget(ddSnap);
 
-
     auto modRec = sidebar.addModule("Recording");
-
     auto rowRecMode = std::make_shared<RowContainer>();
     auto btnRecAudio = std::make_shared<SdrButton>(80, 25, "Audio", font);
     btnRecAudio->setActive(true);
     auto btnRecIQ = std::make_shared<SdrButton>(80, 25, "Baseband", font);
 
-    btnRecAudio->onClick = [&](){
-        btnRecAudio->setActive(true);
-        btnRecIQ->setActive(false);
-        std::lock_guard<std::mutex> l(sharedData.mtx);
-        sharedData.recMode = RecMode::AUDIO;
-    };
-
-    btnRecIQ->onClick = [&](){
-        btnRecAudio->setActive(false);
-        btnRecIQ->setActive(true);
-        std::lock_guard<std::mutex> l(sharedData.mtx);
-        sharedData.recMode = RecMode::BASEBAND;
-    };
-
+    btnRecAudio->onClick = [&](){ btnRecAudio->setActive(true); btnRecIQ->setActive(false); std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.recMode = RecMode::AUDIO; };
+    btnRecIQ->onClick = [&](){ btnRecAudio->setActive(false); btnRecIQ->setActive(true); std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.recMode = RecMode::BASEBAND; };
     rowRecMode->add(btnRecAudio);
     rowRecMode->add(btnRecIQ);
     modRec->addWidget(rowRecMode);
@@ -866,10 +877,7 @@ int main() {
     btnSetFolder->onClick = [&](){
         std::string p = selectFolderDialog();
         if(!p.empty()) {
-            {
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                sharedData.recPath = p;
-            }
+            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.recPath = p; }
             lblRecPath->setText("Path: " + truncatePath(p, 25));
         }
     };
@@ -881,11 +889,9 @@ int main() {
         std::lock_guard<std::mutex> l(sharedData.mtx);
         sharedData.isRecording = !sharedData.isRecording;
         if(sharedData.isRecording) {
-            btnRecToggle->setText("STOP RECORDING");
-            btnRecToggle->setColor(sf::Color(180, 50, 50));
+            btnRecToggle->setText("STOP RECORDING"); btnRecToggle->setColor(sf::Color(180, 50, 50));
         } else {
-            btnRecToggle->setText("START RECORDING");
-            btnRecToggle->setColor(sf::Color(40, 40, 45));
+            btnRecToggle->setText("START RECORDING"); btnRecToggle->setColor(sf::Color(40, 40, 45));
         }
     };
     modRec->addWidget(btnRecToggle);
@@ -911,27 +917,23 @@ int main() {
     LayoutState layout;
     sf::Vector2u lastSize = window.getSize();
 
+    // w / h are LOGICAL sizes (window pixels divided by the UI scale)
     auto updateLayout = [&](int w, int h) {
         layout.winW = (float)w;
         layout.winH = (float)h;
         layout.sidebarX = layout.winW - SIDEBAR_W;
         layout.specW = layout.sidebarX;
         layout.specH = 250.0f;
-        layout.waterfallH = layout.winH - TOP_BAR_H - layout.specH - layout.tuneBarH; // Zostawiamy miejsce na pasek
-
+        layout.waterfallH = layout.winH - TOP_BAR_H - layout.specH - layout.tuneBarH;
         if (layout.waterfallH < 100) layout.waterfallH = 100;
 
         topBar.setSize({layout.winW, (float)TOP_BAR_H});
-
         freqVFO.setPosition(20, 4);
         btnTuningMode.setPosition(370, 10);
         btnPlay.setPosition(320, 10);
-
         volSlider.setPosition(layout.winW - 170, 10);
         btnMute.setPosition(layout.winW - 220, 10);
-
         sidebar.setGeometry(layout.sidebarX, TOP_BAR_H, layout.winH - TOP_BAR_H);
-
         timeSlider.setPosition(20, layout.winH - 30);
         timeSlider.setWidth(layout.specW - 40);
 
@@ -941,8 +943,22 @@ int main() {
         wSpr.setTextureRect(sf::IntRect({0, 0}, {INTERNAL_WATERFALL_WIDTH, (int)layout.waterfallH}));
     };
 
-    updateLayout(window.getSize().x, window.getSize().y);
+    // Applies the current UI scale: scaled view + layout computed in logical units
+    applyUiScale = [&]() {
+        sf::Vector2u sz = window.getSize();
+        if (sz.x == 0 || sz.y == 0) return;
+        float s = getUiScale();
+        if (s < 0.5f) s = 0.5f;
+        float lw = (float)sz.x / s;
+        float lh = (float)sz.y / s;
+        window.setView(sf::View(sf::FloatRect({0.f, 0.f}, {lw, lh})));
+        updateLayout((int)lw, (int)lh);
+    };
 
+    // Restore saved scale before the first layout pass
+    uiScaleIdx = std::clamp(settingsMgr.getInt("ui_scale", 0), 0, (int)UI_SCALE_VALUES.size() - 1);
+    ddScale->setSelection(uiScaleIdx);
+    applyUiScale();
 
     for (auto& mod : sidebar.modules) {
         if (mod->title == "Source / Input") mod->isOpen = true;
@@ -953,14 +969,9 @@ int main() {
     ddTheme->setSelection(savedTheme);
     ddTheme->onChange(savedTheme);
 
-    slMinDb->setValueSilent(settingsMgr.getFloat("min_db", -90.0f));
-    slMinDb->onChange(slMinDb->currentVal);
-
-    slMaxDb->setValueSilent(settingsMgr.getFloat("max_db", 0.0f));
-    slMaxDb->onChange(slMaxDb->currentVal);
-
-    slZoom->setValueSilent(settingsMgr.getFloat("zoom", 1.0f));
-    slZoom->onChange(slZoom->currentVal);
+    slMinDb->setValueSilent(settingsMgr.getFloat("min_db", -90.0f)); slMinDb->onChange(slMinDb->currentVal);
+    slMaxDb->setValueSilent(settingsMgr.getFloat("max_db", 0.0f));   slMaxDb->onChange(slMaxDb->currentVal);
+    slZoom->setValueSilent(settingsMgr.getFloat("zoom", 1.0f));      slZoom->onChange(slZoom->currentVal);
 
     ddSnap->setSelection(settingsMgr.getInt("step_index", 5));
 
@@ -975,12 +986,10 @@ int main() {
     else setMode(Mode::OFF, btnOFF.get());
 
     float savedBw = settingsMgr.getFloat("bandwidth", 12500.0f);
-    slBW->setValueSilent(savedBw);
-    slBW->onChange(savedBw);
+    slBW->setValueSilent(savedBw); slBW->onChange(savedBw);
 
     float savedSq = settingsMgr.getFloat("squelch", -100.0f);
-    slSq->setValueSilent(savedSq);
-    slSq->onChange(savedSq);
+    slSq->setValueSilent(savedSq); slSq->onChange(savedSq);
 
     bool savedStereo = settingsMgr.getBool("stereo", false);
     chkStereo->checked = savedStereo;
@@ -1017,21 +1026,16 @@ int main() {
     if (savedRecPath.empty()) {
         savedRecPath = getDefaultRecordingPath();
     }
-    {
-        std::lock_guard<std::mutex> l(sharedData.mtx);
-        sharedData.recPath = savedRecPath;
-    }
+    { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.recPath = savedRecPath; }
     lblRecPath->setText("Path: " + truncatePath(savedRecPath, 25));
 
     sf::Clock debouncer;
     sf::Clock interactionCooldown;
-
     bool isDraggingScale = false, isSpectrumDragging = false;
     bool isDraggingBW = false;
     float dragStartBW = 0.0f;
     float dragStartMouseX = 0.0f;
     float lastDragX = 0.0f;
-
     float aprsLogScrollOffset = 0.0f;
     bool isPanningView = false;
 
@@ -1042,26 +1046,27 @@ int main() {
     btnModalClose.onClick = [&]() { showAprsModal = false; };
     btnModalCopy.onClick = [&]() { sf::Clipboard::setString(selectedAprsPacket.raw); };
 
-    // Ładowanie Band Planu
-    std::string bpPath = "bandplan.json";
-    if (!std::ifstream(bpPath).good()) {
-        bpPath = "../Resources/bandplan.json"; // Ścieżka dla macOS wewnątrz OrbitSDR.app/Contents/MacOS/
+    // Band plan: resolved relative to the EXECUTABLE (works from Finder / .app bundle / any cwd)
+    {
+        std::string bpPath = findResourceFile("bandplan.json");
+        if (!bpPath.empty()) {
+            std::cout << "[INFO] Loading band plan from: " << bpPath << std::endl;
+            globalBandPlan = loadBandPlan(bpPath);
+        } else {
+            std::cerr << "[Warning] bandplan.json not found." << std::endl;
+        }
     }
-    globalBandPlan = loadBandPlan(bpPath);
 
     while (window.isOpen()) {
         sf::Vector2u currSize = window.getSize();
         if (currSize != lastSize && currSize.x > 0 && currSize.y > 0) {
-            sf::FloatRect visibleArea({0.f, 0.f}, {(float)currSize.x, (float)currSize.y});
-            window.setView(sf::View(visibleArea));
-            updateLayout(currSize.x, currSize.y);
+            applyUiScale();
             lastSize = currSize;
         }
 
         bool isHw = false;
         double hwSampleRate = 2e6;
         double prog = 0.0;
-
         {
             std::lock_guard<std::mutex> l(sourceMtx);
             if (currentSource) {
@@ -1071,11 +1076,24 @@ int main() {
             }
         }
 
-        freqVFO.setEnabled(true);
-        if (!ddSourceType->isOpen && !ddRate->isOpen && !ddDevice->isOpen)
-            freqVFO.update(window);
+        // RTL-TCP: detect that the server dropped the connection and reset the UI
+        if (tcpConnected) {
+            bool lost = false;
+            {
+                std::lock_guard<std::mutex> l(sourceMtx);
+                RtlTcpSource* t = dynamic_cast<RtlTcpSource*>(currentSource.get());
+                if (t && t->isConnectionLost()) lost = true;
+            }
+            if (lost) {
+                doDisconnectTcp();
+                showPopup("RTL-TCP", "Connection to the server was lost.");
+            }
+        }
 
+        freqVFO.setEnabled(true);
+        if (!ddSourceType->isOpen && !ddRate->isOpen && !ddDevice->isOpen) freqVFO.update(window);
         volSlider.update(window);
+
         if (std::abs(volSlider.currentVal - sharedData.volume) > 0.01f) {
             std::lock_guard<std::mutex> l(sharedData.mtx);
             sharedData.volume = volSlider.currentVal;
@@ -1114,23 +1132,12 @@ int main() {
         double visibleFraction = 1.0 / currentZoom;
         double viewStartPct = viewCenter - visibleFraction / 2.0;
         double viewEndPct = viewCenter + visibleFraction / 2.0;
-
-        if (viewStartPct < 0.0) {
-            viewStartPct = 0.0;
-            viewEndPct = visibleFraction;
-            viewCenter = viewStartPct + visibleFraction/2.0;
-        }
-        if (viewEndPct > 1.0) {
-            viewEndPct = 1.0;
-            viewStartPct = 1.0 - visibleFraction;
-            viewCenter = viewStartPct + visibleFraction/2.0;
-        }
-
+        if (viewStartPct < 0.0) { viewStartPct = 0.0; viewEndPct = visibleFraction; viewCenter = viewStartPct + visibleFraction/2.0; }
+        if (viewEndPct > 1.0) { viewEndPct = 1.0; viewStartPct = 1.0 - visibleFraction; viewCenter = viewStartPct + visibleFraction/2.0; }
         double viewWidthPct = viewEndPct - viewStartPct;
 
         float tunerPosInView = (tunePct - viewStartPct) / viewWidthPct;
         float visualCenterX = tunerPosInView * layout.specW;
-
         float bwPct = (slBW->currentVal / hwSampleRate);
         float bwPixels = (bwPct / viewWidthPct) * layout.specW;
 
@@ -1147,6 +1154,7 @@ int main() {
 
             double clickViewPct = mouseX / layout.specW;
             double clickedAbsolutePct = viewStartPct + clickViewPct * viewWidthPct;
+
             double offsetHz = (clickedAbsolutePct - 0.5) * sr;
             long long clickedFreq = currentCenterFreq + (long long)offsetHz;
 
@@ -1189,7 +1197,7 @@ int main() {
         while (const std::optional<sf::Event> ev = window.pollEvent()) {
             if (ev->is<sf::Event::Closed>()) window.close();
 
-            // Nadrzędny chwytacz zwolnienia przycisku myszy - zapobiega blokowaniu UI
+            // Global mouse-release catcher - prevents UI from getting stuck
             if (const auto* mr = ev->getIf<sf::Event::MouseButtonReleased>()) {
                 if (mr->button == sf::Mouse::Button::Left) {
                     isSpectrumDragging = false;
@@ -1217,7 +1225,6 @@ int main() {
             if (sidebar.handleEvent(*ev, window)) continue;
 
             bool topBarHandled = false;
-
             if (volSlider.handleEvent(*ev, window)) topBarHandled = true;
             if (slZoom->handleEvent(*ev, window)) topBarHandled = true;
             if (currentSourceType == 0 && timeSlider.handleEvent(*ev, window)) topBarHandled = true;
@@ -1225,8 +1232,7 @@ int main() {
             if (btnMute.isClicked(*ev, window)) {
                 static bool m = false;
                 m = !m;
-                if(m) btnMute.setActive(true);
-                else btnMute.setActive(false);
+                if(m) btnMute.setActive(true); else btnMute.setActive(false);
                 std::lock_guard<std::mutex> l(sharedData.mtx);
                 sharedData.isMuted = m;
                 topBarHandled = true;
@@ -1240,21 +1246,13 @@ int main() {
                     s = sharedData.isPlaying;
                 }
                 if (s) {
-                    btnPlay.setText("||");
-                    btnPlay.setActive(true);
+                    btnPlay.setText("||"); btnPlay.setActive(true);
                     audio.start();
-                    {
-                        std::lock_guard<std::mutex> l(sourceMtx);
-                        if (currentSource) currentSource->start();
-                    }
+                    { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->start(); }
                 } else {
-                    btnPlay.setText(">");
-                    btnPlay.setActive(false);
+                    btnPlay.setText(">"); btnPlay.setActive(false);
                     audio.stop();
-                    {
-                        std::lock_guard<std::mutex> l(sourceMtx);
-                        if (currentSource) currentSource->stop();
-                    }
+                    { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->stop(); }
                 }
                 topBarHandled = true;
             }
@@ -1262,17 +1260,12 @@ int main() {
             if (isHw && btnTuningMode.isClicked(*ev, window)) {
                 stickyCenterMode = !stickyCenterMode;
                 if(stickyCenterMode) {
-                    btnTuningMode.setText("CTR");
-                    btnTuningMode.setActive(true);
-                    {
-                        std::lock_guard<std::mutex> l(sharedData.mtx);
-                        sharedData.tunedFreqPercent = 0.5;
-                    }
+                    btnTuningMode.setText("CTR"); btnTuningMode.setActive(true);
+                    { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; }
                     pendingCenterFreq = freqVFO.getFrequency();
                     debouncer.restart();
                 } else {
-                    btnTuningMode.setText("FIX");
-                    btnTuningMode.setActive(false);
+                    btnTuningMode.setText("FIX"); btnTuningMode.setActive(false);
                 }
                 topBarHandled = true;
             }
@@ -1305,7 +1298,6 @@ int main() {
                         sharedData.tunedFreqPercent = 0.5 + (newOffset / hwSampleRate);
                     }
                 }
-
                 if (targetVFO != freqVFO.getFrequency()) freqVFO.setFrequency(targetVFO);
             }
 
@@ -1322,6 +1314,7 @@ int main() {
                     if (m.y > TOP_BAR_H && m.x < layout.specW) {
                         long long step = STEP_VALUES[ddSnap->selectedIndex];
                         if (step == 0) step = 100;
+
                         long long current = freqVFO.getFrequency();
                         long long rawNext = current + (long long)(scroll->delta * step);
 
@@ -1330,8 +1323,8 @@ int main() {
                             if (remainder > step / 2) rawNext += (step - remainder);
                             else rawNext -= remainder;
                         }
-
                         if (rawNext < 0) rawNext = 0;
+
                         freqVFO.setFrequency(rawNext);
 
                         if (stickyCenterMode && isHw) {
@@ -1366,7 +1359,8 @@ int main() {
                         isPanningView = true;
                         lastDragX = m.x;
                     }
-                } else if (mb->button == sf::Mouse::Button::Left) {
+                }
+                else if (mb->button == sf::Mouse::Button::Left) {
                     if (overAprs) {
                         float logX = layout.specW - 300;
                         float overlayY = layout.winH - 200.0f;
@@ -1389,29 +1383,30 @@ int main() {
                     float rightEdge = visualCenterX + bwPixels / 2.0f;
                     if (mode == Mode::USB) { leftEdge = visualCenterX; rightEdge = visualCenterX + bwPixels; }
                     if (mode == Mode::LSB) { leftEdge = visualCenterX - bwPixels; rightEdge = visualCenterX; }
-
                     bool hitEdge = (std::abs(m.x - leftEdge) < 6 || std::abs(m.x - rightEdge) < 6) && (m.y > TOP_BAR_H && m.y < TOP_BAR_H + layout.specH);
 
                     if (hitEdge && !overAprs) {
                         isDraggingBW = true;
                         dragStartBW = slBW->currentVal;
                         dragStartMouseX = m.x;
-                    } else if (inFreqScaleZone && !overTimeline && !overAprs) {
+                    }
+                    else if (inFreqScaleZone && !overTimeline && !overAprs) {
                         isDraggingScale = true;
                         lastDragX = m.x;
-                    } else if (!overTimeline && !overAprs && m.x < layout.specW && m.y > TOP_BAR_H && m.y < (TOP_BAR_H + layout.specH + layout.waterfallH)) {
+                    }
+                    else if (!overTimeline && !overAprs && m.x < layout.specW && m.y > TOP_BAR_H && m.y < (TOP_BAR_H + layout.specH + layout.waterfallH)) {
                         isSpectrumDragging = true;
                         applySpectrumTuning(m.x);
                     }
                 }
-            } else if (const auto* mm = ev->getIf<sf::Event::MouseMoved>()) {
+            }
+            else if (const auto* mm = ev->getIf<sf::Event::MouseMoved>()) {
                 sf::Vector2f m = window.mapPixelToCoords(mm->position);
 
                 float leftEdge = visualCenterX - bwPixels / 2.0f;
                 float rightEdge = visualCenterX + bwPixels / 2.0f;
                 if (mode == Mode::USB) { leftEdge = visualCenterX; rightEdge = visualCenterX + bwPixels; }
                 if (mode == Mode::LSB) { leftEdge = visualCenterX - bwPixels; rightEdge = visualCenterX; }
-
                 bool hitEdge = (std::abs(m.x - leftEdge) < 6 || std::abs(m.x - rightEdge) < 6) && (m.y > TOP_BAR_H && m.y < TOP_BAR_H + layout.specH);
 
                 if ((hitEdge || isDraggingBW) && cursorSizeH) window.setMouseCursor(*cursorSizeH);
@@ -1424,7 +1419,8 @@ int main() {
                     sharedData.viewCenterPct += pctShift;
                     if (sharedData.viewCenterPct - visibleFraction/2.0 < 0.0) sharedData.viewCenterPct = visibleFraction/2.0;
                     if (sharedData.viewCenterPct + visibleFraction/2.0 > 1.0) sharedData.viewCenterPct = 1.0 - visibleFraction/2.0;
-                } else if (isDraggingBW) {
+                }
+                else if (isDraggingBW) {
                     float hzPerPx = (hwSampleRate * viewWidthPct) / layout.specW;
                     float dist = std::abs(m.x - visualCenterX);
                     float newBW = dist * hzPerPx * 2.0f;
@@ -1432,14 +1428,15 @@ int main() {
                     newBW = std::clamp(newBW, slBW->minVal, slBW->maxVal);
                     slBW->setValueSilent(newBW);
                     slBW->onChange(newBW);
-                } else if (isSpectrumDragging) applySpectrumTuning(m.x);
+                }
+                else if (isSpectrumDragging) applySpectrumTuning(m.x);
 
                 if (isDraggingScale) {
                     static double dragAccumulator = 0.0;
                     float dx = lastDragX - m.x;
                     lastDragX = m.x;
+
                     double hzPerPx = (hwSampleRate * viewWidthPct) / layout.specW;
-                    
                     double exactShift = dx * hzPerPx + dragAccumulator;
                     long long shift = (long long)exactShift;
                     dragAccumulator = exactShift - shift;
@@ -1469,7 +1466,7 @@ int main() {
                     sharedData.mouseX_spectrum = -1.0f;
                 }
             }
-        } // <- Koniec bezpiecznie zamkniętej pętli pollEvent()
+        } // end of pollEvent loop
 
         if (pendingCenterFreq != 0 && debouncer.getElapsedTime().asMilliseconds() > TUNING_LATENCY_MS) {
             std::lock_guard<std::mutex> l(sourceMtx);
@@ -1477,7 +1474,10 @@ int main() {
                 currentSource->setCenterFrequency(pendingCenterFreq);
                 currentCenterFreq = pendingCenterFreq;
             }
-            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.centerFreq = pendingCenterFreq; }
+            {
+                std::lock_guard<std::mutex> l(sharedData.mtx);
+                sharedData.centerFreq = pendingCenterFreq;
+            }
             pendingCenterFreq = 0;
             debouncer.restart();
         }
@@ -1496,16 +1496,11 @@ int main() {
             if (btnPlay.isMouseOver(window) || btnMute.isMouseOver(window) || btnTuningMode.isMouseOver(window)) showHand = true;
             if (aprsOn && mousePos.y > (layout.winH - 200) && mousePos.x < layout.specW) showHand = true;
         }
-
         if (showAprsModal) showHand = false;
 
-        if (isDraggingBW && cursorSizeH) {
-            window.setMouseCursor(*cursorSizeH);
-        } else if (showHand && cursorHand) {
-            window.setMouseCursor(*cursorHand);
-        } else if (cursorArrow) {
-            window.setMouseCursor(*cursorArrow);
-        }
+        if (isDraggingBW && cursorSizeH) { window.setMouseCursor(*cursorSizeH); }
+        else if (showHand && cursorHand) { window.setMouseCursor(*cursorHand); }
+        else if (cursorArrow) { window.setMouseCursor(*cursorArrow); }
 
         std::vector<uint8_t> newRow;
         bool hasData = false;
@@ -1517,7 +1512,6 @@ int main() {
                 hasData = true;
             }
         }
-
         if (hasData) {
             if (newRow.size() == MINI_W * 4) {
                 if (MINI_H > 1) {
@@ -1553,37 +1547,36 @@ int main() {
         long long cf = 0;
         if (currentSource) cf = currentCenterFreq;
 
-        // --- RYSOWANIE DEDYKOWANEGO PASKA STROJENIA ---
+        // --- DEDICATED TUNING BAR ---
         sf::RectangleShape tuneBarBg({layout.specW, layout.tuneBarH});
         tuneBarBg.setPosition({0, (float)(TOP_BAR_H + layout.specH)});
-        tuneBarBg.setFillColor(sf::Color(10, 10, 12)); // Głęboka czerń/szarość
+        tuneBarBg.setFillColor(sf::Color(10, 10, 12));
         window.draw(tuneBarBg);
 
         drawGrid(window, font, 0, TOP_BAR_H, layout.specW, layout.specH, cf, hwSampleRate, viewStartPct, viewEndPct, slMinDb->currentVal, slMaxDb->currentVal);
 
-        // --- RYSOWANIE BAND PLANU ---
+        // --- BAND PLAN ---
         double startFreq = (double)cf + (viewStartPct - 0.5) * hwSampleRate;
         double endFreq = (double)cf + (viewEndPct - 0.5) * hwSampleRate;
         double visibleSpan = endFreq - startFreq;
 
         for (const auto& band : globalBandPlan) {
-            // Sprawdź, czy pasmo mieści się w widocznym oknie
             if (band.endFreq > startFreq && band.startFreq < endFreq) {
-                // Oblicz pozycje X
                 float startX = layout.specW * ((band.startFreq - startFreq) / visibleSpan);
                 float endX = layout.specW * ((band.endFreq - startFreq) / visibleSpan);
-                
-                // Przytnij do krawędzi ekranu
+
                 if (startX < 0) startX = 0;
                 if (endX > layout.specW) endX = layout.specW;
+
                 float widthX = endX - startX;
 
                 if (widthX > 1.0f) {
-                    // 1. Półprzeźroczysty gradient na wykresie FFT
                     sf::VertexArray gradient(sf::PrimitiveType::TriangleStrip, 4);
-                    sf::Color topColor = band.color; topColor.a = 35; // Bardzo delikatna przeźroczystość
-                    sf::Color bottomColor = band.color; bottomColor.a = 0; // Zanika całkowicie
-                    
+                    sf::Color topColor = band.color;
+                    topColor.a = 35;
+                    sf::Color bottomColor = band.color;
+                    bottomColor.a = 0;
+
                     float topY = TOP_BAR_H;
                     float bottomY = TOP_BAR_H + layout.specH;
 
@@ -1593,14 +1586,12 @@ int main() {
                     gradient[3] = sf::Vertex{sf::Vector2f(endX, bottomY), bottomColor};
                     window.draw(gradient);
 
-                    // 2. Poziomy pasek nad wykresem
                     sf::RectangleShape bar({widthX, 4.0f});
                     bar.setPosition({startX, (float)TOP_BAR_H});
                     bar.setFillColor(band.color);
                     window.draw(bar);
 
-                    // 3. Nazwa pasma
-                    if (widthX > 40.0f) { // Rysuj tekst tylko jeśli jest wystarczająco dużo miejsca
+                    if (widthX > 40.0f) {
                         sf::Text bText(font, band.name, 28);
                         bText.setScale({0.5f, 0.5f});
                         bText.setPosition({startX + 4, (float)TOP_BAR_H + 5});
@@ -1618,6 +1609,7 @@ int main() {
 
         sf::VertexArray fillArea(sf::PrimitiveType::TriangleStrip);
         sf::VertexArray outline(sf::PrimitiveType::LineStrip);
+
         sf::Color coreColor = Theme::Accent;
         sf::Color glowColor = Theme::Glow;
         sf::Color bottomColor = Theme::AccentDim;
@@ -1631,8 +1623,7 @@ int main() {
             float x = ((float)i / (numPoints - 1)) * layout.specW;
             float norm = (smoothedSpectrum[i] - slMinDb->currentVal) / (slMaxDb->currentVal - slMinDb->currentVal);
             float y = layout.specH - (norm * layout.specH);
-            if (y < 0) y = 0;
-            if (y > layout.specH) y = layout.specH;
+            if (y < 0) y = 0; if (y > layout.specH) y = layout.specH;
 
             float topY = y + TOP_BAR_H;
             float bottomY = layout.specH + TOP_BAR_H;
@@ -1646,9 +1637,9 @@ int main() {
                 bottomColor.a = 20;
             }
 
-            fillArea[2 * i] = sf::Vertex{sf::Vector2f(x, topY), glowColor};
+            fillArea[2 * i]     = sf::Vertex{sf::Vector2f(x, topY), glowColor};
             fillArea[2 * i + 1] = sf::Vertex{sf::Vector2f(x, bottomY), bottomColor};
-            outline[i] = sf::Vertex{sf::Vector2f(x, topY), coreColor};
+            outline[i]          = sf::Vertex{sf::Vector2f(x, topY), coreColor};
         }
 
         sf::RenderStates states;
@@ -1670,62 +1661,66 @@ int main() {
         }
 
         if (mx != -1.0f) {
-        sf::Color guideColor(100, 100, 100);
-        sf::VertexArray lineFFT(sf::PrimitiveType::Lines, 2);
-        lineFFT[0].position = sf::Vector2f(mx, (float)TOP_BAR_H);
-        lineFFT[0].color = guideColor;
-        lineFFT[1].position = sf::Vector2f(mx, (float)layout.specH + TOP_BAR_H);
-        lineFFT[1].color = guideColor;
-        window.draw(lineFFT);
+            sf::Color guideColor(100, 100, 100);
 
-        // --- WARUNEK: TOOLTIP TYLKO W DOLNEJ CZĘŚCI FFT ---
-        if (my > layout.specH - 50.0f && my <= layout.specH) {
-            double hoverFreq = startFreq + (mx / layout.specW) * visibleSpan;
-            int binIdx = std::clamp((int)((mx / layout.specW) * spectrum.size()), 0, (int)spectrum.size() - 1);
-            float hoverPower = spectrum.empty() ? -127.0f : spectrum[binIdx];
+            sf::VertexArray lineFFT(sf::PrimitiveType::Lines, 2);
+            lineFFT[0].position = sf::Vector2f(mx, (float)TOP_BAR_H);
+            lineFFT[0].color = guideColor;
+            lineFFT[1].position = sf::Vector2f(mx, (float)layout.specH + TOP_BAR_H);
+            lineFFT[1].color = guideColor;
+            window.draw(lineFFT);
 
-            std::string freqFormat = freqVFO.formatWithDots((long long)hoverFreq) + " Hz";
-            std::stringstream pwrStream;
-            pwrStream << std::fixed << std::setprecision(2) << hoverPower << " dBm";
-            std::string tooltipStr = freqFormat + "\nPower: " + pwrStream.str();
+            // --- TOOLTIP ONLY IN THE LOWER PART OF THE FFT ---
+            if (my > layout.specH - 50.0f && my <= layout.specH) {
+                double hoverFreq = startFreq + (mx / layout.specW) * visibleSpan;
+                int binIdx = std::clamp((int)((mx / layout.specW) * spectrum.size()), 0, (int)spectrum.size() - 1);
+                float hoverPower = spectrum.empty() ? -127.0f : spectrum[binIdx];
 
-            sf::Text tooltipText(font, tooltipStr, 24);
-            tooltipText.setScale({0.5f, 0.5f});
-            tooltipText.setFillColor(sf::Color::White);
-            
-            sf::FloatRect textBounds = tooltipText.getGlobalBounds();
-            sf::RectangleShape tooltipBg({textBounds.size.x + 16, textBounds.size.y + 12});
-            tooltipBg.setFillColor(sf::Color(20, 20, 25, 230));
-            tooltipBg.setOutlineColor(Theme::Accent);
-            tooltipBg.setOutlineThickness(1.0f);
+                std::string freqFormat = freqVFO.formatWithDots((long long)hoverFreq) + " Hz";
 
-            float ttX = mx + 15.0f;
-            float ttY = my + TOP_BAR_H + 15.0f;
-            if (ttX + tooltipBg.getSize().x > layout.specW) {
-                ttX = mx - tooltipBg.getSize().x - 15.0f;
+                std::stringstream pwrStream;
+                pwrStream << std::fixed << std::setprecision(2) << hoverPower << " dBm";
+
+                std::string tooltipStr = freqFormat + "\nPower: " + pwrStream.str();
+
+                sf::Text tooltipText(font, tooltipStr, 24);
+                tooltipText.setScale({0.5f, 0.5f});
+                tooltipText.setFillColor(sf::Color::White);
+
+                sf::FloatRect textBounds = tooltipText.getGlobalBounds();
+                sf::RectangleShape tooltipBg({textBounds.size.x + 16, textBounds.size.y + 12});
+                tooltipBg.setFillColor(sf::Color(20, 20, 25, 230));
+                tooltipBg.setOutlineColor(Theme::Accent);
+                tooltipBg.setOutlineThickness(1.0f);
+
+                float ttX = mx + 15.0f;
+                float ttY = my + TOP_BAR_H + 15.0f;
+
+                if (ttX + tooltipBg.getSize().x > layout.specW) {
+                    ttX = mx - tooltipBg.getSize().x - 15.0f;
+                }
+
+                tooltipBg.setPosition({ttX, ttY});
+                tooltipText.setPosition({ttX + 8, ttY + 4});
+
+                window.draw(tooltipBg);
+                window.draw(tooltipText);
             }
 
-            tooltipBg.setPosition({ttX, ttY});
-            tooltipText.setPosition({ttX + 8, ttY + 4});
-
-            window.draw(tooltipBg);
-            window.draw(tooltipText);
+            if (my > (float)layout.specH) {
+                sf::VertexArray lineWaterfall(sf::PrimitiveType::Lines, 2);
+                lineWaterfall[0].position = sf::Vector2f(mx, (float)layout.specH + layout.tuneBarH + TOP_BAR_H);
+                lineWaterfall[0].color = guideColor;
+                lineWaterfall[1].position = sf::Vector2f(mx, (float)(layout.specH + layout.tuneBarH + layout.waterfallH + TOP_BAR_H));
+                lineWaterfall[1].color = guideColor;
+                window.draw(lineWaterfall);
+            }
         }
-
-        // Kreska na wodospadzie uwzględniająca przesunięcie paska
-        if (my > (float)layout.specH) {
-            sf::VertexArray lineWaterfall(sf::PrimitiveType::Lines, 2);
-            lineWaterfall[0].position = sf::Vector2f(mx, (float)layout.specH + layout.tuneBarH + TOP_BAR_H);
-            lineWaterfall[0].color = guideColor;
-            lineWaterfall[1].position = sf::Vector2f(mx, (float)(layout.specH + layout.tuneBarH + layout.waterfallH + TOP_BAR_H));
-            lineWaterfall[1].color = guideColor;
-            window.draw(lineWaterfall);
-        }
-    }
 
         if (tunerPosInView >= 0.0f && tunerPosInView <= 1.0f) {
             sf::RectangleShape tunerRect;
             if (bwPixels < 2.0f) bwPixels = 2.0f;
+
             float rectX = visualCenterX - bwPixels / 2.0f;
             if (mode == Mode::USB) rectX += bwPixels / 2.0f;
             if (mode == Mode::LSB) rectX -= bwPixels / 2.0f;
@@ -1765,6 +1760,7 @@ int main() {
             float compassX = 60.0f;
             float compassY = overlayY + 70.0f;
             float compassR = 40.0f;
+
             sf::CircleShape compass(compassR);
             compass.setOrigin({compassR, compassR});
             compass.setPosition({compassX, compassY});
@@ -1816,6 +1812,7 @@ int main() {
                 lblDest.setFillColor(sf::Color(200,200,200));
                 window.draw(lblDest);
             }
+
             curY += 40.0f;
 
             if (!pkt.coords.empty()) {
@@ -1838,6 +1835,7 @@ int main() {
 
             float logX = layout.specW - 300;
             float logW = 300;
+
             sf::RectangleShape divLine({2, aprsH});
             divLine.setPosition({logX, overlayY});
             divLine.setFillColor(sf::Color::White);
@@ -1866,6 +1864,7 @@ int main() {
 
                     std::string lShort = logPkt.timestamp + " " + logPkt.src + ">" + logPkt.dest;
                     if(lShort.length()>35) lShort=lShort.substr(0,32)+"...";
+
                     sf::Text l(font, lShort, 24);
                     l.setScale({0.5f, 0.5f});
                     l.setPosition({logX + 10, yPos});
@@ -1887,12 +1886,12 @@ int main() {
             float tableH = 250.0f;
             float tableY = layout.winH - tableH;
             decoderUI->draw(window, 0, tableY, layout.specW, tableH);
-        } else {
-            // --- STATUS BAR Z S-METEREM (Ukrywany gdy działają dekodery) ---
+        }
+        else {
+            // --- STATUS BAR WITH S-METER (hidden while decoders are running) ---
             float statusH = 40.0f;
             float statusY = layout.winH - statusH;
-            
-            // Tło paska
+
             sf::RectangleShape statusBarBg({layout.specW, statusH});
             statusBarBg.setPosition({0, statusY});
             statusBarBg.setFillColor(sf::Color(30, 30, 35));
@@ -1900,14 +1899,13 @@ int main() {
             statusBarBg.setOutlineColor(sf::Color(60, 60, 60));
             window.draw(statusBarBg);
 
-            // Wskaźniki LED po lewej
             float ledX = 20.0f;
             auto drawLED = [&](std::string label, bool state, sf::Color colorOn) {
                 sf::CircleShape led(5.0f);
                 led.setPosition({ledX, statusY + 15.0f});
                 led.setFillColor(state ? colorOn : sf::Color(50, 50, 50));
                 window.draw(led);
-                
+
                 sf::Text txt(font, label, 20);
                 txt.setScale({0.5f, 0.5f});
                 txt.setPosition({ledX + 15.0f, statusY + 10.0f});
@@ -1920,34 +1918,30 @@ int main() {
             drawLED("REC", sharedData.isRecording, sf::Color(255, 50, 50));
             drawLED("HW", isHw, sf::Color(50, 255, 100));
 
-            // Skala graficzna S-Metera ułożona centralnie
             float meterW = 400.0f;
             float meterX = (layout.specW / 2.0f) - (meterW / 2.0f);
-            
-            // Pobierz moc i mapuj na S-Meter (-127 dBm do -20 dBm)
+
             int centerBin = std::clamp((int)(tunePct * spectrum.size()), 0, (int)spectrum.size() - 1);
             float currentPower = spectrum.empty() ? -127.0f : spectrum[centerBin];
+
             float minPwr = -127.0f;
             float maxPwr = -20.0f;
             float fillPct = std::clamp((currentPower - minPwr) / (maxPwr - minPwr), 0.0f, 1.0f);
 
-            // Tło wskaźnika S-metera
             sf::RectangleShape sBg({meterW, 12.0f});
             sBg.setPosition({meterX, statusY + 20.0f});
             sBg.setFillColor(sf::Color(20, 20, 20));
             window.draw(sBg);
 
-            // Wypełnienie S-Metera z kolorowaniem (czerwony dla obszaru S9+)
             float fillW = meterW * fillPct;
-            float s9ThresholdW = meterW * ((-73.0f - minPwr) / (maxPwr - minPwr)); // S9 = -73 dBm
-            
+            float s9ThresholdW = meterW * ((-73.0f - minPwr) / (maxPwr - minPwr));
+            (void)s9ThresholdW;
+
             sf::RectangleShape sFill({fillW, 12.0f});
             sFill.setPosition({meterX, statusY + 20.0f});
-            // Jeśli moc przekracza S9, użyj czerwonego, jeśli nie - zielonego
             sFill.setFillColor(currentPower > -73.0f ? sf::Color(255, 60, 60) : sf::Color(60, 255, 60));
             window.draw(sFill);
 
-            // Teksty skali (S1...S9...+)
             int sUnit = std::clamp(std::round((currentPower + 127.0f) / 6.0f), 0.0f, 9.0f);
             std::string sTextStr = "S" + std::to_string(sUnit);
             if (currentPower > -73.0f) {
@@ -1963,8 +1957,7 @@ int main() {
             sValTxt.setPosition({meterX, statusY + 2.0f});
             sValTxt.setFillColor(Theme::Accent);
             window.draw(sValTxt);
-            
-            // Narysuj markery skali S
+
             for (int s = 1; s <= 9; s += 2) {
                 float markerDb = -127.0f + (s * 6.0f);
                 float mPct = (markerDb - minPwr) / (maxPwr - minPwr);
@@ -1977,10 +1970,10 @@ int main() {
 
         if (currentSourceType == 0) timeSlider.draw(window);
         sidebar.draw(window);
+
         window.draw(topBar);
         freqVFO.draw(window);
         btnPlay.draw(window);
-
         if (isHw) btnTuningMode.draw(window);
         btnMute.draw(window);
         volSlider.draw(window);
@@ -2006,6 +1999,7 @@ int main() {
 
             float cx = mx + 20;
             float cy = my + 60;
+
             auto drawField = [&](std::string label, std::string val, sf::Color c = sf::Color::White) {
                 sf::Text l(font, label, 24);
                 l.setScale({0.5f, 0.5f});
@@ -2055,12 +2049,14 @@ int main() {
             float my = modInspector->headerBg.getPosition().y + 30;
 
             miniSpr.setPosition({(float)mx, (float)my});
+
             sf::RectangleShape border({(float)MINI_W + 2, (float)MINI_H + 2});
             border.setPosition({(float)mx - 1, (float)my - 1});
             border.setFillColor(sf::Color::Transparent);
             border.setOutlineColor(sf::Color(100, 100, 100));
             border.setOutlineThickness(1);
             window.draw(border);
+
             window.draw(miniSpr);
 
             sf::RectangleShape centerLine({2.0f, (float)MINI_H});
@@ -2079,7 +2075,9 @@ int main() {
 
     SettingsManager saveMgr;
     for (auto& mod : sidebar.modules) saveMgr.set("sidebar_" + mod->title, mod->isOpen);
+
     saveMgr.set("theme", ddTheme->selectedIndex);
+    saveMgr.set("ui_scale", uiScaleIdx);
     saveMgr.set("zoom", slZoom->currentVal);
     saveMgr.set("min_db", slMinDb->currentVal);
     saveMgr.set("max_db", slMaxDb->currentVal);
@@ -2096,11 +2094,14 @@ int main() {
     saveMgr.set("hw_direct_samp", hwState.directSampling);
     saveMgr.set("hw_antenna", hwState.antennaIndex);
     saveMgr.set("rtltcp_host", txtHost->getText());
+
     {
         std::lock_guard<std::mutex> l(sharedData.mtx);
         saveMgr.set("rec_path", sharedData.recPath);
     }
+
     saveMgr.set("frequency", (double)currentCenterFreq);
+
     saveMgr.save(settingsPath);
 
     dspRunning = false;
