@@ -9,129 +9,138 @@ on:
 
 jobs:
   build-windows-mingw:
-      name: Windows (MinGW64)
-      runs-on: windows-latest
-      
-      steps:
-      - uses: actions/checkout@v4
-      
-      # 1. Setup MSYS2
-      # Install gcc, make, and rtlsdr (which provides librtlsdr)
-      - name: Setup MSYS2
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: UCRT64
-          update: true
-          install: >-
-            mingw-w64-ucrt-x86_64-gcc
-            mingw-w64-ucrt-x86_64-rtl-sdr
-            mingw-w64-ucrt-x86_64-make
-            unzip
-            wget
+    name: Windows (MinGW64)
+    runs-on: windows-latest
 
-      # 2. Download SFML 3.0 (MinGW Version)
-      - name: Download SFML 3.0 (MinGW)
-        shell: msys2 {0}
-        run: |
-          wget -q https://github.com/SFML/SFML/releases/download/3.0.0/SFML-3.0.0-windows-gcc-14.2.0-mingw-64-bit.zip -O sfml.zip
-          unzip -q sfml.zip
-          mv SFML-3.0.0 sfml
+    steps:
+    - uses: actions/checkout@v4
 
-      # 3. Compilation and Packaging
-      # Run our build_mingw.sh script within the MSYS2 environment
-      # This script automatically copies sdrplay_api.dll next to the exe file
-      - name: Compile OrbitSDR
-        shell: msys2 {0}
-        run: |
-          chmod +x build_mingw.sh
-          ./build_mingw.sh
+    # 1. Setup MSYS2
+    # Install gcc, make, and rtlsdr (which provides librtlsdr)
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: UCRT64
+        update: true
+        install: >-
+          mingw-w64-ucrt-x86_64-gcc
+          mingw-w64-ucrt-x86_64-rtl-sdr
+          mingw-w64-ucrt-x86_64-make
+          unzip
+          wget
 
-      # 4. Upload Artifact
-      # Collect exe and all dlls (including sdrplay_api.dll, which the script copied)
-      - name: Upload Windows Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: orbitsdr-windows-mingw
-          path: |
-            orbitsdr.exe
-            *.dll
-            bandplan.json
+    # 2. Download SFML 3.0 (MinGW Version)
+    - name: Download SFML 3.0 (MinGW)
+      shell: msys2 {0}
+      run: |
+        wget -q https://github.com/SFML/SFML/releases/download/3.0.0/SFML-3.0.0-windows-gcc-14.2.0-mingw-64-bit.zip -O sfml.zip
+        unzip -q sfml.zip
+        mv SFML-3.0.0 sfml
+
+    # 3. Compilation and Packaging
+    # Run our build_mingw.sh script within the MSYS2 environment
+    # This script automatically copies sdrplay_api.dll next to the exe file
+    - name: Compile OrbitSDR
+      shell: msys2 {0}
+      run: |
+        chmod +x build_mingw.sh
+        ./build_mingw.sh
+
+    # 4. Upload Artifact
+    # Collect exe and all dlls (including sdrplay_api.dll, which the script copied)
+    - name: Upload Windows Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: orbitsdr-windows-mingw
+        path: |
+          orbitsdr.exe
+          *.dll
+          bandplan.json
+
   # --------------------------------------------------------
   # LINUX (Unchanged - Working)
   # --------------------------------------------------------
   build-linux:
     name: Linux (Ubuntu)
     runs-on: ubuntu-24.04
+
     steps:
-      - uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential librtlsdr-dev libgl1-mesa-dev libudev-dev libopenal-dev libvorbis-dev libflac-dev libfreetype6-dev libx11-dev libxrandr-dev libxcursor-dev libxi-dev
+    - name: Install System Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential librtlsdr-dev libgl1-mesa-dev libudev-dev libopenal-dev libvorbis-dev libflac-dev libfreetype6-dev libx11-dev libxrandr-dev libxcursor-dev libxi-dev
 
-      - name: Install SFML 3.0
-        run: |
-          tar -xzf $GITHUB_WORKSPACE/deps/SFML-3.0.0-linux-gcc-64-bit.tar.gz
-          mv SFML-3.0.0 sfml
+    - name: Install SFML 3.0
+      run: |
+        tar -xzf $GITHUB_WORKSPACE/deps/SFML-3.0.0-linux-gcc-64-bit.tar.gz
+        mv SFML-3.0.0 sfml
 
-      - name: Compile OrbitSDR
-        run: |
-          chmod +x build.sh
-          SFML_PATH="$GITHUB_WORKSPACE/sfml"
-          SDR_INC="$GITHUB_WORKSPACE/deps/sdrplay/include"
-          SDR_LIB="$GITHUB_WORKSPACE/deps/sdrplay/lib/linux"
-          export CXXFLAGS="-I$SFML_PATH/include -I$SDR_INC"
-          export LDFLAGS="-Wl,-rpath,'\$ORIGIN/libs'"
-          export LIBS="-L$SFML_PATH/lib -L$SDR_LIB -lsfml-graphics -lsfml-window -lsfml-system -ldl -lpthread -lm -lrtlsdr -lsdrplay_api"
-          ./build.sh --enable-sdrplay
+    - name: Compile OrbitSDR
+      run: |
+        chmod +x build.sh
+        SFML_PATH="$GITHUB_WORKSPACE/sfml"
+        SDR_INC="$GITHUB_WORKSPACE/deps/sdrplay/include"
+        SDR_LIB="$GITHUB_WORKSPACE/deps/sdrplay/lib/linux"
 
-      - name: Create Bundle
-        run: |
-          mkdir -p OrbitSDR_Linux/libs
-          cp orbitsdr OrbitSDR_Linux/OrbitSDR
-          cp icon.png OrbitSDR_Linux/ || true
-          cp bandplan.json OrbitSDR_Linux/ || true
-          
-          # Kopiujemy pliki fizycznie (-L), rozwiązując problem znikających symlinków w ZIP
-          cp -L sfml/lib/*.so* OrbitSDR_Linux/libs/
-          cp -L deps/sdrplay/lib/linux/*.so* OrbitSDR_Linux/libs/
-          cp -L /usr/lib/x86_64-linux-gnu/librtlsdr.so* OrbitSDR_Linux/libs/ || true
-          
-          # KLUCZOWE: Gwarantujemy, że plik o nazwie .so.3 fizycznie istnieje w folderze libs
-          for f in OrbitSDR_Linux/libs/libsdrplay_api.so*; do
-            cp -L "$f" OrbitSDR_Linux/libs/libsdrplay_api.so.3 || true
-            break
-          done
-          
-          cat > OrbitSDR_Linux/OrbitSDR_Run.sh << 'EOF'
-          #!/bin/bash
-          cd "$(dirname "$0")"
-          chmod +x ./OrbitSDR 2>/dev/null || true
-          export LD_LIBRARY_PATH="$(pwd)/libs:$LD_LIBRARY_PATH"
-          ./OrbitSDR
-          EOF
-          chmod +x OrbitSDR_Linux/OrbitSDR_Run.sh
+        export CXXFLAGS="-I$SFML_PATH/include -I$SDR_INC"
+        export LDFLAGS="-Wl,-rpath,'\$ORIGIN/libs'"
+        export LIBS="-L$SFML_PATH/lib -L$SDR_LIB -lsfml-graphics -lsfml-window -lsfml-system -ldl -lpthread -lm -lrtlsdr -lsdrplay_api"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: OrbitSDR-Ubuntu24.04-x64
-          path: OrbitSDR_Linux/
+        ./build.sh --enable-sdrplay
+
+    - name: Create Bundle
+      run: |
+        mkdir -p OrbitSDR_Linux/libs
+        cp orbitsdr OrbitSDR_Linux/OrbitSDR
+        cp icon.png OrbitSDR_Linux/ || true
+        cp bandplan.json OrbitSDR_Linux/ || true
+
+        # Kopiujemy pliki fizycznie (-L), rozwiązując problem znikających symlinków w ZIP
+        cp -L sfml/lib/*.so* OrbitSDR_Linux/libs/
+        cp -L deps/sdrplay/lib/linux/*.so* OrbitSDR_Linux/libs/
+        cp -L /usr/lib/x86_64-linux-gnu/librtlsdr.so* OrbitSDR_Linux/libs/ || true
+
+        # KLUCZOWE: Gwarantujemy, że plik o nazwie .so.3 fizycznie istnieje w folderze libs
+        for f in OrbitSDR_Linux/libs/libsdrplay_api.so*; do
+          cp -L "$f" OrbitSDR_Linux/libs/libsdrplay_api.so.3 || true
+          break
+        done
+
+        cat > OrbitSDR_Linux/OrbitSDR_Run.sh << 'EOF'
+        #!/bin/bash
+        cd "$(dirname "$0")"
+        chmod +x ./OrbitSDR 2>/dev/null || true
+        export LD_LIBRARY_PATH="$(pwd)/libs:$LD_LIBRARY_PATH"
+        ./OrbitSDR
+        EOF
+        chmod +x OrbitSDR_Linux/OrbitSDR_Run.sh
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: OrbitSDR-Ubuntu24.04-x64
+        path: OrbitSDR_Linux/
 
   # --------------------------------------------------------
-  # MACOS (Fixed: Creates real .app structure)
+  # MACOS (works on macOS 15 Sequoia AND macOS 26 Tahoe)
+  #  - runner pinned to macos-15, so Homebrew libs are built for macOS 15
+  #  - MACOSX_DEPLOYMENT_TARGET=15.0, so the binary accepts macOS 15+
+  #  - all dylibs are bundled inside the .app (no Homebrew needed on your Mac)
   # --------------------------------------------------------
   build-macos:
-    name: macOS (Universal)
-    runs-on: macos-latest
-    
+    name: macOS 15+ (Apple Silicon)
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+
     steps:
     - uses: actions/checkout@v4
 
     - name: Install Dependencies
       run: |
         brew update
-        brew install sfml librtlsdr 
+        brew install sfml librtlsdr dylibbundler
 
     - name: Compile OrbitSDR
       run: |
@@ -139,9 +148,9 @@ jobs:
         SDR_INC="$GITHUB_WORKSPACE/deps/sdrplay/include"
         SDR_LIB="$GITHUB_WORKSPACE/deps/sdrplay/lib/macos"
 
-        export CXXFLAGS="-I$SDR_INC"
-        export LDFLAGS="-L/opt/homebrew/lib -L$SDR_LIB -lsdrplay_api"
-        
+        export CXXFLAGS="-I$SDR_INC -mmacosx-version-min=15.0"
+        export LDFLAGS="-L/opt/homebrew/lib -L$SDR_LIB -lsdrplay_api -mmacosx-version-min=15.0"
+
         ./build.sh --enable-sdrplay
 
     - name: Create .App Bundle with Icon
@@ -151,10 +160,10 @@ jobs:
         mkdir -p OrbitSDR.app/Contents/Frameworks
         mkdir -p OrbitSDR.app/Contents/Resources
 
-        # 2. Copy Binary & Libs
+        # 2. Copy Binary & resources
         cp orbitsdr OrbitSDR.app/Contents/MacOS/OrbitSDR
-        cp deps/sdrplay/lib/macos/libsdrplay_api.dylib OrbitSDR.app/Contents/Frameworks/
         cp bandplan.json OrbitSDR.app/Contents/Resources/ || true
+        cp icon.png OrbitSDR.app/Contents/Resources/ || true
 
         # --- ICON GENERATION START ---
         # macOS requires an .icns file, which contains the icon in multiple resolutions.
@@ -170,15 +179,15 @@ jobs:
         sips -z 512 512   icon.png --out OrbitSDR.iconset/icon_256x256@2x.png
         sips -z 512 512   icon.png --out OrbitSDR.iconset/icon_512x512.png
         sips -z 1024 1024 icon.png --out OrbitSDR.iconset/icon_512x512@2x.png
-        
+
         # Convert the folder into a .icns file
         iconutil -c icns OrbitSDR.iconset
-        
+
         # Move it to Resources
         cp OrbitSDR.icns OrbitSDR.app/Contents/Resources/
         # --- ICON GENERATION END ---
 
-        # 3. Create Info.plist (Updated to include Icon)
+        # 3. Create Info.plist (includes Icon + minimum macOS version)
         cat > OrbitSDR.app/Contents/Info.plist <<EOF
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -196,24 +205,44 @@ jobs:
             <string>APPL</string>
             <key>CFBundleShortVersionString</key>
             <string>1.0</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>15.0</string>
             <key>NSHighResolutionCapable</key>
             <true/>
             <key>NSMicrophoneUsageDescription</key>
             <string>OrbitSDR requires audio access to use Line-In and Sound Card sources.</string>
-          </dict>
+        </dict>
         </plist>
         EOF
 
-        # 4. Fix Binary Paths
-        install_name_tool -change libsdrplay_api.so.3 @executable_path/../Frameworks/libsdrplay_api.dylib OrbitSDR.app/Contents/MacOS/OrbitSDR
-        
-        # 5. Sign
+        # 4. Bundle ALL dynamic libraries (SFML, rtlsdr, libusb, freetype, SDRplay...) into Frameworks
+        # The SDRplay library is found via a search folder under the exact name the binary expects.
+        SDR_DEP=$(otool -L OrbitSDR.app/Contents/MacOS/OrbitSDR | awk '/sdrplay/ {print $1; exit}')
+        mkdir -p sdrsearch
+        if [ -n "$SDR_DEP" ]; then
+          cp deps/sdrplay/lib/macos/libsdrplay_api.dylib "sdrsearch/$(basename "$SDR_DEP")"
+        fi
+
+        dylibbundler -cd -of -b \
+          -x OrbitSDR.app/Contents/MacOS/OrbitSDR \
+          -d OrbitSDR.app/Contents/Frameworks/ \
+          -p @executable_path/../Frameworks/ \
+          -s sdrsearch \
+          -s /opt/homebrew/lib
+
+        # 5. Show what macOS versions the binary and libs require (for the log)
+        for f in OrbitSDR.app/Contents/MacOS/OrbitSDR OrbitSDR.app/Contents/Frameworks/*.dylib; do
+          echo "$(basename "$f"): minos $(otool -l "$f" | awk '/LC_BUILD_VERSION/ {b=1} b && /minos/ {print $2; exit}')"
+        done
+
+        # 6. Sign (ad-hoc), libs first, then the app
+        codesign --force --sign - OrbitSDR.app/Contents/Frameworks/*.dylib
         codesign --force --deep --sign - OrbitSDR.app
 
     - name: Zip and Upload
       run: |
-        zip -r OrbitSDR-macOS.zip OrbitSDR.app
-        
+        ditto -c -k --keepParent OrbitSDR.app OrbitSDR-macOS.zip
+
     - uses: actions/upload-artifact@v4
       with:
         name: OrbitSDR-macOS
