@@ -342,46 +342,62 @@ public:
 
     // --- WORKER LOOP (SYNC) ---
     void workerLoop() {
-        std::vector<uint8_t> buffer(USB_BUFFER_SIZE);
-        const float inv = 1.0f / 127.5f;
+            std::vector<uint8_t> buffer(USB_BUFFER_SIZE);
+            const float inv = 1.0f / 127.5f;
 
-        while (running) {
+            while (running) {
             // 1. Obsługa zmiany częstotliwości (Safe Tuning)
             long long newFreq = pendingCenterFreq.exchange(0);
             if (newFreq != 0) {
-                if (dev) rtlsdr_set_center_freq(dev, (uint32_t)newFreq);
+                if (dev) {
+                    // Krótki oddech dla kontrolera USB/I2C po ostatnim transferze blokowym
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    
+                    int r = rtlsdr_set_center_freq(dev, (uint32_t)newFreq);
+                    if (r < 0) {
+                        // Jeśli tuner R820T/R828D był zajęty i odrzucił komendę, ponów próbę!
+                        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+                        rtlsdr_set_center_freq(dev, (uint32_t)newFreq);
+                    }
+                    
+                    // Resetujemy bufor sprzętowy USB oraz nasz bufor kołowy w RAMie
+                    rtlsdr_reset_buffer(dev);
+                    ringBuffer.clear();
+                }
                 currentCenterFreq = newFreq;
             }
 
-            // 2. Obsługa zmiany wzmocnienia (Safe Gain)
-            int newGain = pendingGain.exchange(-999);
-            if (newGain != -999) {
-                if (dev) {
-                    if (newGain == -1) {
-                        // Włączenie AGC z powrotem
-                        rtlsdr_set_tuner_gain_mode(dev, 0); // 0 = Auto Tuner AGC
-                        rtlsdr_set_agc_mode(dev, 1);        // 1 = Włącz RTL AGC
-                    } else {
-                        // Wyłączenie AGC (przejście na tryb manualny)
-                        rtlsdr_set_tuner_gain_mode(dev, 1); // 1 = Manual Tuner
-                        rtlsdr_set_agc_mode(dev, 0);        // 0 = Wyłącz RTL AGC
-
-                        // Znajdź najbliższy dostępny gain
-                        int targetGain = newGain * 10;
-                        int bestGain = targetGain;
-                        int minDiff = 100000;
-                        for (int g : availableGains) {
-                            int diff = std::abs(g - targetGain);
-                            if (diff < minDiff) {
-                                minDiff = diff;
-                                bestGain = g;
+                // 2. Obsługa zmiany wzmocnienia (Safe Gain)
+                int newGain = pendingGain.exchange(-999);
+                if (newGain != -999) {
+                    if (dev) {
+                        if (newGain == -1) {
+                            // Włączenie AGC z powrotem
+                            rtlsdr_set_tuner_gain_mode(dev, 0); 
+                            rtlsdr_set_agc_mode(dev, 1);        
+                        } else {
+                            // Wyłączenie AGC (przejście na tryb manualny)
+                            rtlsdr_set_tuner_gain_mode(dev, 1); 
+                            rtlsdr_set_agc_mode(dev, 0);        
+                            
+                            // Znajdź najbliższy dostępny gain
+                            int targetGain = newGain * 10;
+                            int bestGain = targetGain;
+                            int minDiff = 100000;
+                            for (int g : availableGains) {
+                                int diff = std::abs(g - targetGain);
+                                if (diff < minDiff) {
+                                    minDiff = diff;
+                                    bestGain = g;
+                                }
                             }
+                            rtlsdr_set_tuner_gain(dev, bestGain);
                         }
-                        rtlsdr_set_tuner_gain(dev, bestGain);
+                        // Po zmianie Gainu również warto wyrzucić stare próbki
+                        ringBuffer.clear();
                     }
+                    currentGain = newGain;
                 }
-                currentGain = newGain;
-            }
 
             // 3. Odczyt synchroniczny (blokuje na chwilę, ale bezpiecznie)
             int n_read = 0;

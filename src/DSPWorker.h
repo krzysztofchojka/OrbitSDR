@@ -12,6 +12,10 @@
 #include "Utils.h"
 
 inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio) {
+    #ifdef _WIN32
+        // Zapobiega zrzucaniu wątku DSP na wolne rdzenie E-Core w Windows 11
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    #endif
     Demodulator demod(2000000, AUDIO_RATE);
     APRSDecoder aprsDecoder(AUDIO_RATE);
     InspectorDSP inspector;

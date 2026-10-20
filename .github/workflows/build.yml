@@ -63,44 +63,52 @@ jobs:
     name: Linux (Ubuntu)
     runs-on: ubuntu-24.04
     steps:
-    - uses: actions/checkout@v4
-    - name: Install System Dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential librtlsdr-dev libgl1-mesa-dev libudev-dev libopenal-dev libvorbis-dev libflac-dev libfreetype6-dev libx11-dev libxrandr-dev libxcursor-dev libxi-dev
-    - name: Install SFML 3.0
-      run: |
-        tar -xzf $GITHUB_WORKSPACE/deps/SFML-3.0.0-linux-gcc-64-bit.tar.gz
-        mv SFML-3.0.0 sfml
-    - name: Compile OrbitSDR
-      run: |
-        chmod +x build.sh
-        SFML_PATH="$GITHUB_WORKSPACE/sfml"
-        SDR_INC="$GITHUB_WORKSPACE/deps/sdrplay/include"
-        SDR_LIB="$GITHUB_WORKSPACE/deps/sdrplay/lib/linux"
-        export CXXFLAGS="-I$SFML_PATH/include -I$SDR_INC"
-        export LDFLAGS="-Wl,-rpath,'\$ORIGIN/libs'"
-        export LIBS="-L$SFML_PATH/lib -L$SDR_LIB -lsfml-graphics -lsfml-window -lsfml-system -ldl -lpthread -lm -lrtlsdr -lsdrplay_api"
-        ./build.sh --enable-sdrplay
-    - name: Create Bundle
-      run: |
-        mkdir -p OrbitSDR_Linux/libs
-        cp orbitsdr OrbitSDR_Linux/OrbitSDR
-        cp icon.png OrbitSDR_Linux/ || true
-        cp bandplan.json OrbitSDR_Linux/ || true
-        cp sfml/lib/*.so* OrbitSDR_Linux/libs/
-        cp deps/sdrplay/lib/linux/*.so* OrbitSDR_Linux/libs/
-        cat > OrbitSDR_Linux/OrbitSDR_Run.sh <<EOF
-        #!/bin/bash
-        cd "\$(dirname "\$0")"
-        export LD_LIBRARY_PATH="\$LD_LIBRARY_PATH:./libs"
-        ./OrbitSDR
-        EOF
-        chmod +x OrbitSDR_Linux/OrbitSDR_Run.sh
-    - uses: actions/upload-artifact@v4
-      with:
-        name: OrbitSDR-Linux
-        path: OrbitSDR_Linux/
+      - uses: actions/checkout@v4
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential librtlsdr-dev libgl1-mesa-dev libudev-dev libopenal-dev libvorbis-dev libflac-dev libfreetype6-dev libx11-dev libxrandr-dev libxcursor-dev libxi-dev
+
+      - name: Install SFML 3.0
+        run: |
+          tar -xzf $GITHUB_WORKSPACE/deps/SFML-3.0.0-linux-gcc-64-bit.tar.gz
+          mv SFML-3.0.0 sfml
+
+      - name: Compile OrbitSDR
+        run: |
+          chmod +x build.sh
+          SFML_PATH="$GITHUB_WORKSPACE/sfml"
+          SDR_INC="$GITHUB_WORKSPACE/deps/sdrplay/include"
+          SDR_LIB="$GITHUB_WORKSPACE/deps/sdrplay/lib/linux"
+          export CXXFLAGS="-I$SFML_PATH/include -I$SDR_INC"
+          export LDFLAGS="-Wl,-rpath,'\$ORIGIN/libs'"
+          export LIBS="-L$SFML_PATH/lib -L$SDR_LIB -lsfml-graphics -lsfml-window -lsfml-system -ldl -lpthread -lm -lrtlsdr -lsdrplay_api"
+          ./build.sh --enable-sdrplay
+
+      - name: Create Bundle
+        run: |
+          mkdir -p OrbitSDR_Linux/libs
+          cp orbitsdr OrbitSDR_Linux/OrbitSDR
+          cp icon.png OrbitSDR_Linux/ || true
+          cp bandplan.json OrbitSDR_Linux/ || true
+          # Użycie -P zachowuje dowiązania symboliczne (rozwiązuje błąd .so.3.0)
+          cp -P sfml/lib/*.so* OrbitSDR_Linux/libs/
+          cp -P deps/sdrplay/lib/linux/*.so* OrbitSDR_Linux/libs/
+          # Dodanie systemowej biblioteki RTL-SDR, aby działało out-of-the-box
+          cp -P /usr/lib/x86_64-linux-gnu/librtlsdr.so* OrbitSDR_Linux/libs/ || true
+          cat > OrbitSDR_Linux/OrbitSDR_Run.sh <<EOF
+          #!/bin/bash
+          cd "\$(dirname "\$0")"
+          export LD_LIBRARY_PATH="\$LD_LIBRARY_PATH:./libs"
+          ./OrbitSDR
+          EOF
+          chmod +x OrbitSDR_Linux/OrbitSDR_Run.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OrbitSDR-Ubuntu24.04-x64
+          path: OrbitSDR_Linux/
 
   # --------------------------------------------------------
   # MACOS (Fixed: Creates real .app structure)

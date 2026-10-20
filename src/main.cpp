@@ -858,11 +858,12 @@ int main() {
     auto spacer = std::make_shared<Spacer>(130.0f);
     modInspector->addWidget(spacer);
 
-    std::vector<std::uint8_t> waterfall(INTERNAL_WATERFALL_WIDTH * WATERFALL_HEIGHT_PX * 4, 0);
     sf::Texture wTex;
     if(!wTex.resize({INTERNAL_WATERFALL_WIDTH, WATERFALL_HEIGHT_PX})) return 1;
     wTex.setSmooth(true);
+    wTex.setRepeated(true);
     sf::Sprite wSpr(wTex);
+    int currentWaterfallY = 0;
 
     LayoutState layout;
     sf::Vector2u lastSize = window.getSize();
@@ -1399,11 +1400,11 @@ int main() {
                     if (isHw) {
                         long long nextCenter = currentCenterFreq + shift;
                         if (nextCenter < 0) nextCenter = 0;
-                        
-                        currentCenterFreq = nextCenter; // Szybki update dla wizualizacji
-                        { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.centerFreq = nextCenter; }
-                        
-                        // Kolejkowanie skoku do urządzenia (debouncer)
+                        currentCenterFreq = nextCenter;
+                        {
+                            std::lock_guard<std::mutex> l(sharedData.mtx);
+                            sharedData.centerFreq = nextCenter;
+                        }
                         pendingCenterFreq = nextCenter;
                     } else {
                         double pctShift = (dx / layout.specW) * viewWidthPct;
@@ -1496,9 +1497,8 @@ int main() {
         }
 
         if (newRow2) {
-            std::copy_backward(waterfall.begin(), waterfall.end() - INTERNAL_WATERFALL_WIDTH * 4, waterfall.end());
-            std::copy(row.begin(), row.end(), waterfall.begin());
-            wTex.update(waterfall.data());
+            currentWaterfallY = (currentWaterfallY - 1 + WATERFALL_HEIGHT_PX) % WATERFALL_HEIGHT_PX;
+            wTex.update(row.data(), sf::Vector2u(INTERNAL_WATERFALL_WIDTH, 1), sf::Vector2u(0, (unsigned int)currentWaterfallY));
         }
 
         window.clear(sf::Color::Black);
@@ -1609,7 +1609,7 @@ int main() {
         window.draw(fillArea, states);
         window.draw(outline);
 
-        wSpr.setTextureRect(sf::IntRect({0, 0}, {INTERNAL_WATERFALL_WIDTH, (int)layout.waterfallH}));
+        wSpr.setTextureRect(sf::IntRect({0, currentWaterfallY}, {INTERNAL_WATERFALL_WIDTH, (int)layout.waterfallH}));
         float scaleX = layout.specW / (float)INTERNAL_WATERFALL_WIDTH;
         wSpr.setScale({scaleX, 1.0f});
         window.draw(wSpr);
