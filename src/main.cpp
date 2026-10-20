@@ -387,6 +387,27 @@ int main() {
             newSource->setHardwareOption("mw_notch", hwState.mwNotch ? 1 : 0);
             newSource->setHardwareOption("bias_t", hwState.biasT ? 1 : 0);
         }
+        else if (sourceIdx == 3) {
+            // Sound card / line-in used as a baseband source
+            auto audioIn = std::make_shared<AudioCaptureSource>();
+            std::vector<uint32_t> audioRates = audioIn->getAvailableSampleRatesValues();
+            if (rateIdx < 0 || rateIdx >= (int)audioRates.size()) rateIdx = 0;
+            targetRate = audioRates.empty() ? 48000 : audioRates[rateIdx];
+            ddRate->setOptions(audioIn->getAvailableSampleRatesText());
+            ddRate->setSelection(rateIdx);
+            success = audioIn->open(deviceID, targetRate);
+            newSource = audioIn;
+
+            // Baseband signal: no hardware centre frequency, show 0 Hz (same as file playback)
+            currentCenterFreq = 0;
+            freqVFO.setFrequency(0);
+            {
+                std::lock_guard<std::mutex> l(sharedData.mtx);
+                sharedData.tunedFreqPercent = 0.5;
+                sharedData.viewCenterPct = 0.5;
+                sharedData.centerFreq = 0;
+            }
+        }
         else if (sourceIdx == 4) {
             targetRate = (rateIdx < (int)RTL_RATES_VAL.size()) ? RTL_RATES_VAL[rateIdx] : 2048000;
             auto tcp = std::make_shared<RtlTcpSource>();
