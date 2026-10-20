@@ -149,7 +149,7 @@ jobs:
         SDR_LIB="$GITHUB_WORKSPACE/deps/sdrplay/lib/macos"
 
         export CXXFLAGS="-I$SDR_INC -mmacosx-version-min=15.0"
-        export LDFLAGS="-L/opt/homebrew/lib -L$SDR_LIB -lsdrplay_api -mmacosx-version-min=15.0"
+        export LDFLAGS="-L/opt/homebrew/lib -L$SDR_LIB -lsdrplay_api -mmacosx-version-min=15.0 -Wl,-headerpad_max_install_names"
 
         ./build.sh --enable-sdrplay
 
