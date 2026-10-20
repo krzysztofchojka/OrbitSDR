@@ -81,7 +81,13 @@ int main() {
     }
 
     sf::Font font;
-    if (!font.openFromFile("/System/Library/Fonts/Helvetica.ttc") && !font.openFromFile("C:/Windows/Fonts/arial.ttf") && !font.openFromFile("arial.ttf")) {
+    if (!font.openFromFile("/System/Library/Fonts/Helvetica.ttc") &&
+        !font.openFromFile("C:/Windows/Fonts/arial.ttf") &&
+        !font.openFromFile("/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf") &&
+        !font.openFromFile("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf") &&
+        !font.openFromFile("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf") &&
+        !font.openFromFile("/usr/share/fonts/TTF/DejaVuSans.ttf") &&
+        !font.openFromFile("arial.ttf")) {
         std::cerr << "Font not found!\n";
     }
 
