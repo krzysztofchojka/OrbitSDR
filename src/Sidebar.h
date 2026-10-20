@@ -170,8 +170,14 @@ public:
     }
 
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) {
-        if (TextInput::currentFocus && ev.is<sf::Event::MouseButtonPressed>()
-            && !TextInput::currentFocus->isMouseOver(win)) {
+        // 1. Priority: Dropdowns (always rendered on top)
+        if (Dropdown::currentActive) {
+            Dropdown::currentActive->handleEvent(ev, win);
+            recalculateLayout();
+            return true;
+        }
+
+        if (TextInput::currentFocus && ev.is<sf::Event::MouseButtonPressed>() && !TextInput::currentFocus->isMouseOver(win)) {
             TextInput::currentFocus->blur();
         }
         // 1. Priority: Dropdowns (always rendered on top)

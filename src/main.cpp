@@ -1037,10 +1037,14 @@ int main() {
     if (savedSourceIdx != 0) {
         ddSourceType->setSelection(savedSourceIdx);
         if (savedSourceIdx == 4) {
+            currentSourceType = 4;
+            updateRadioControls(4);
             ddRate->setOptions({"1.4 MSps", "1.8 MSps", "2.048 MSps", "2.4 MSps", "3.2 MSps"});
             ddRate->setSelection(2);
+            refreshSourceUI();
+        } else {
+            ddSourceType->onChange(savedSourceIdx);
         }
-        refreshSourceUI();
     }
 
     std::string savedRecPath = settingsMgr.getString("rec_path", "");
