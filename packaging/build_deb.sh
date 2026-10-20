@@ -92,4 +92,4 @@ dpkg-deb --root-owner-group --build "$PKG" "$OUT"
 echo "---- package info ----"
 dpkg-deb --info "$OUT"
 echo "---- package contents (top level) ----"
-dpkg-deb --contents "$OUT" | head -40
+dpkg-deb --contents "$OUT" | head -40 || true
