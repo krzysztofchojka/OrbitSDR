@@ -1,3 +1,10 @@
+#ifdef _WIN32
+  #ifndef NOMINMAX
+  #define NOMINMAX
+  #endif
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+#endif
 #define MINIAUDIO_IMPLEMENTATION
 #include <SFML/Graphics.hpp>
 #include <SFML/Window/Clipboard.hpp>
@@ -148,7 +155,7 @@ int main() {
 
     auto modSource = sidebar.addModule("Source / Input");
     auto ddSourceType = std::make_shared<Dropdown>(SIDEBAR_W - 40, 25.0f, font);
-    ddSourceType->setOptions({"File Source", "RTL-SDR", "SDRPlay", "Sound Card (Line-In)"});
+    ddSourceType->setOptions({"File Source", "RTL-SDR", "SDRPlay", "Sound Card (Line-In)", "RTL-TCP (Network)"});
     modSource->addWidget(std::make_shared<Label>("Source Type:", font));
     modSource->addWidget(ddSourceType);
 
@@ -158,6 +165,10 @@ int main() {
 
     auto ddRate = std::make_shared<Dropdown>(SIDEBAR_W - 40, 25.0f, font);
     ddRate->setOptions({"None"});
+    auto lblHost = std::make_shared<Label>("Server (host:port):", font);
+    auto txtHost = std::make_shared<TextInput>(SIDEBAR_W - 40, 25.0f, font);
+    txtHost->setText(settingsMgr.getString("rtltcp_host", "127.0.0.1:1234"));
+    auto btnConnect = std::make_shared<SdrButton>(SIDEBAR_W - 40, 25, "Connect", font);
 
     auto modRadio = sidebar.addModule("Radio Control");
     auto slGain = std::make_shared<Slider>(SIDEBAR_W - 40, 0.0f, 50.0f, 0.0f, "RF Gain (dB)", font);
@@ -172,7 +183,7 @@ int main() {
         sharedData.rfGain = v;
         std::stringstream ss;
         ss << std::fixed << std::setprecision(1);
-        if (currentSourceType == 1) {
+        if (currentSourceType == 1 || currentSourceType == 4) {
             ss << "RF Gain: " << v << " dB";
         } else {
             ss << "RF Gain (dB): " << (int)v;
@@ -237,7 +248,7 @@ int main() {
             modRadio->addWidget(slGain);
             modRadio->addWidget(chkAgc);
         }
-        if (sourceIdx == 1) {
+        if (sourceIdx == 1 || sourceIdx == 4) {
             modRadio->addWidget(lblDirectSamp);
             modRadio->addWidget(ddDirectSamp);
             modRadio->addWidget(chkBiasT);
@@ -357,24 +368,25 @@ int main() {
             newSource->setHardwareOption("mw_notch", hwState.mwNotch ? 1 : 0);
             newSource->setHardwareOption("bias_t", hwState.biasT ? 1 : 0);
 
-        } else if (sourceIdx == 3) {
-            targetRate = 48000;
-            auto audioIn = std::make_shared<AudioCaptureSource>();
-            ddRate->setOptions(audioIn->getAvailableSampleRatesText());
-            ddRate->setSelection(0);
-            success = audioIn->open(deviceID, targetRate);
-            newSource = audioIn;
+        } else if (sourceIdx == 4) {
+            targetRate = (rateIdx < (int)RTL_RATES_VAL.size()) ? RTL_RATES_VAL[rateIdx] : 2048000;
+            auto tcp = std::make_shared<RtlTcpSource>();
+            ddRate->setOptions(tcp->getAvailableSampleRatesText());
+            ddRate->setSelection(rateIdx);
+            success = tcp->open(deviceID, targetRate);   // deviceID = "host:port"
+            newSource = tcp;
 
-            currentCenterFreq = 0;
+            if (currentCenterFreq < 1000000) currentCenterFreq = 97800000;
             freqVFO.setFrequency(currentCenterFreq);
-            {
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                sharedData.tunedFreqPercent = 0.5;
-                sharedData.viewCenterPct = 0.5;
-                sharedData.centerFreq = 0;
-            }
-            slGain->setEnabled(false);
-            chkAgc->checked = false;
+            newSource->setCenterFrequency(currentCenterFreq);
+            { std::lock_guard<std::mutex> l(sharedData.mtx);
+              sharedData.tunedFreqPercent = 0.5; sharedData.viewCenterPct = 0.5;
+              sharedData.centerFreq = currentCenterFreq; }
+
+            slGain->setLimits(0.0f, 49.6f);
+            slGain->setText("RF Gain: AGC");
+            newSource->setHardwareOption("direct_sampling", hwState.directSampling);
+            newSource->setHardwareOption("bias_t", hwState.biasT ? 1 : 0);
         }
 
         if (!success && sourceIdx != 0) {
@@ -419,6 +431,12 @@ int main() {
                 ddRate->setOptions({shortName, "[ Change File... ]"});
             }
             modSource->addWidget(ddRate);
+        } else if (ddSourceType->selectedIndex == 4) {
+            modSource->addWidget(lblHost);
+            modSource->addWidget(txtHost);
+            modSource->addWidget(btnConnect);
+            modSource->addWidget(std::make_shared<Label>("Sample Rate:", font));
+            modSource->addWidget(ddRate);
         } else {
             modSource->addWidget(lblDevice);
             modSource->addWidget(ddDevice);
@@ -438,7 +456,11 @@ int main() {
                 doOpenSource(0, "", 0, path);
                 refreshSourceUI();
             } else refreshSourceUI();
-        } else {
+        } else if (idx == 4) {
+            ddRate->setOptions({"1.4 MSps", "1.8 MSps", "2.048 MSps", "2.4 MSps", "3.2 MSps"});
+            ddRate->setSelection(2);
+            refreshSourceUI();      // pokazuje pole host:port, łączy dopiero przycisk Connect
+        }else {
             cachedDevices.clear();
             std::vector<std::string> names;
             if (idx == 1) cachedDevices = RtlSdrSource::getDeviceList();
@@ -496,6 +518,13 @@ int main() {
         }
     };
 
+    btnConnect->onClick = [&]() {
+        std::string addr = txtHost->getText();
+        if (addr.empty()) return;
+        doOpenSource(4, addr, ddRate->selectedIndex, "");
+    };
+    txtHost->onSubmit = [&](const std::string&) { if (btnConnect->onClick) btnConnect->onClick(); };
+
     ddRate->onChange = [&](int idx) {
         if (ddSourceType->selectedIndex == 0) {
             std::string currentOpt = "";
@@ -505,7 +534,10 @@ int main() {
                 if (!path.empty()) doOpenSource(0, "", 0, path);
                 else refreshSourceUI();
             }
-        } else if (ddSourceType->selectedIndex != 0 && !cachedDevices.empty()) {
+        } else if (ddSourceType->selectedIndex == 4) {
+            std::string addr = txtHost->getText();
+            if (currentSourceType == 4 && !addr.empty()) doOpenSource(4, addr, idx, "");
+        }else if (ddSourceType->selectedIndex != 0 && !cachedDevices.empty()) {
             doOpenSource(ddSourceType->selectedIndex, cachedDevices[ddDevice->selectedIndex].id, idx, "");
         }
     };
@@ -974,6 +1006,10 @@ int main() {
     int savedSourceIdx = settingsMgr.getInt("source_type", 0);
     if (savedSourceIdx != 0) {
         ddSourceType->setSelection(savedSourceIdx);
+        if (savedSourceIdx == 4) {
+            ddRate->setOptions({"1.4 MSps", "1.8 MSps", "2.048 MSps", "2.4 MSps", "3.2 MSps"});
+            ddRate->setSelection(2);
+        }
         refreshSourceUI();
     }
 
@@ -2059,6 +2095,7 @@ int main() {
     saveMgr.set("hw_bias_t", hwState.biasT);
     saveMgr.set("hw_direct_samp", hwState.directSampling);
     saveMgr.set("hw_antenna", hwState.antennaIndex);
+    saveMgr.set("rtltcp_host", txtHost->getText());
     {
         std::lock_guard<std::mutex> l(sharedData.mtx);
         saveMgr.set("rec_path", sharedData.recPath);

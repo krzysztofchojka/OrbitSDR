@@ -1,6 +1,7 @@
 #pragma once
 
 #include <SFML/Graphics.hpp>
+#include <SFML/Window/Clipboard.hpp>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -282,6 +283,83 @@ public:
     }
 };
 inline Dropdown* Dropdown::currentActive = nullptr;
+
+class TextInput : public Widget {
+public:
+    sf::RectangleShape box;
+    sf::Text text;
+    std::string value;
+    bool focused = false;
+    float w, h;
+    std::function<void(const std::string&)> onSubmit;
+    static TextInput* currentFocus;
+
+    TextInput(float _w, float _h, const sf::Font& font) : text(font, "", 24), w(_w), h(_h) {
+        text.setScale({0.5f, 0.5f});
+        box.setSize({w, h});
+        box.setOutlineThickness(1);
+        updateStyle();
+    }
+    void updateStyle() override {
+        box.setFillColor(Theme::BgDark);
+        box.setOutlineColor(focused ? Theme::Accent : sf::Color(80, 80, 80));
+        text.setFillColor(Theme::Text);
+    }
+    float getHeight() const override { return h + 5.0f; }
+    void setPosition(float x, float y) override {
+        box.setPosition({x, y});
+        text.setPosition({x + 5, y + 4});
+    }
+    void setText(const std::string& s) { value = s; }
+    std::string getText() const { return value; }
+    void blur() { focused = false; if (currentFocus == this) currentFocus = nullptr; updateStyle(); }
+
+    bool isMouseOver(const sf::RenderWindow& win) const override {
+        return box.getGlobalBounds().contains(win.mapPixelToCoords(sf::Mouse::getPosition(win)));
+    }
+
+    void appendFiltered(const std::string& s) {
+        for (char c : s) if (c >= 32 && c < 127 && value.size() < 64) value += c;
+    }
+
+    bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
+        if (const auto* mb = ev.getIf<sf::Event::MouseButtonPressed>()) {
+            if (mb->button == sf::Mouse::Button::Left) {
+                if (isMouseOver(win)) {
+                    if (currentFocus && currentFocus != this) currentFocus->blur();
+                    focused = true; currentFocus = this; updateStyle();
+                    return true;
+                } else if (focused) blur();
+            }
+            return false;
+        }
+        if (!focused) return false;
+        if (const auto* te = ev.getIf<sf::Event::TextEntered>()) {
+            if (te->unicode >= 32 && te->unicode < 127) appendFiltered(std::string(1, (char)te->unicode));
+            return true;
+        }
+        if (const auto* kp = ev.getIf<sf::Event::KeyPressed>()) {
+            if (kp->code == sf::Keyboard::Key::Backspace) { if (!value.empty()) value.pop_back(); }
+            else if (kp->code == sf::Keyboard::Key::Enter) { blur(); if (onSubmit) onSubmit(value); }
+            else if (kp->code == sf::Keyboard::Key::V && (kp->control || kp->system)) {
+                appendFiltered(sf::Clipboard::getString().toAnsiString());
+            }
+            return true;
+        }
+        return false;
+    }
+
+    void draw(sf::RenderWindow& win) override {
+        win.draw(box);
+        std::string disp = value;
+        if (disp.size() > 28) disp = ".." + disp.substr(disp.size() - 26);
+        if (focused) disp += "|";
+        sf::Text t = text;
+        t.setString(disp);
+        win.draw(t);
+    }
+};
+inline TextInput* TextInput::currentFocus = nullptr;
 
 class Label : public Widget { sf::Text text; public: 
     Label(std::string c, const sf::Font& f, int s=12, sf::Color cl=sf::Color::White) : text(f, c, s * 2) { 

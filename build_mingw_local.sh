@@ -53,6 +53,7 @@ g++ -std=c++17 -O3 \
     -o "$OUT_FILE" \
     -L"$SFML_PATH/lib" \
     -L"$SDR_LIB" \
+    -lcomdlg32 -lole32 -lws2_32 \
     -lsfml-graphics -lsfml-window -lsfml-system -lsfml-audio \
     -lrtlsdr -lsdrplay_api \
     -lcomdlg32 -lole32

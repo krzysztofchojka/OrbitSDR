@@ -767,3 +767,5 @@ public:
     std::vector<std::string> getAvailableSampleRatesText() override { return {"48.0 kHz"}; }
     std::vector<uint32_t> getAvailableSampleRatesValues() override { return {48000}; }
 };
+
+#include "RtlTcpSource.h"

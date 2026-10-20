@@ -170,6 +170,10 @@ public:
     }
 
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) {
+        if (TextInput::currentFocus && ev.is<sf::Event::MouseButtonPressed>()
+            && !TextInput::currentFocus->isMouseOver(win)) {
+            TextInput::currentFocus->blur();
+        }
         // 1. Priority: Dropdowns (always rendered on top)
         if (Dropdown::currentActive) {
             for (auto& mod : modules) {
@@ -199,7 +203,7 @@ public:
         bool isRelease = ev.is<sf::Event::MouseButtonReleased>();
 
         // ZAWSZE propaguj zdarzenie puszczenia myszy, żeby widgety mogły się odblokować
-        if (isMouseInside || isRelease) {
+        if (isMouseInside || isRelease || TextInput::currentFocus) {
             if (isMouseInside && !isRelease) captured = true;
             for (auto& mod : modules) {
                 if (mod->handleEvent(ev, win)) {
