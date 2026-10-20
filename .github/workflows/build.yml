@@ -216,27 +216,31 @@ jobs:
         EOF
 
         # 4. Bundle ALL dynamic libraries (SFML, rtlsdr, libusb, freetype, SDRplay...) into Frameworks
-        # The SDRplay library is found via a search folder under the exact name the binary expects.
+        # The binary references the SDRplay lib by a bare name ("libsdrplay_api.so.3"), which
+        # dylibbundler cannot resolve. So first repoint it to the real file (absolute path).
         SDR_DEP=$(otool -L OrbitSDR.app/Contents/MacOS/OrbitSDR | awk '/sdrplay/ {print $1; exit}')
-        mkdir -p sdrsearch
         if [ -n "$SDR_DEP" ]; then
-          cp deps/sdrplay/lib/macos/libsdrplay_api.dylib "sdrsearch/$(basename "$SDR_DEP")"
+          mkdir -p sdrlib
+          cp deps/sdrplay/lib/macos/libsdrplay_api.dylib "sdrlib/$(basename "$SDR_DEP")"
+          install_name_tool -change "$SDR_DEP" "$PWD/sdrlib/$(basename "$SDR_DEP")" OrbitSDR.app/Contents/MacOS/OrbitSDR
         fi
 
         dylibbundler -cd -of -b \
           -x OrbitSDR.app/Contents/MacOS/OrbitSDR \
           -d OrbitSDR.app/Contents/Frameworks/ \
           -p @executable_path/../Frameworks/ \
-          -s sdrsearch \
           -s /opt/homebrew/lib
 
         # 5. Show what macOS versions the binary and libs require (for the log)
-        for f in OrbitSDR.app/Contents/MacOS/OrbitSDR OrbitSDR.app/Contents/Frameworks/*.dylib; do
+        otool -L OrbitSDR.app/Contents/MacOS/OrbitSDR
+        for f in OrbitSDR.app/Contents/MacOS/OrbitSDR OrbitSDR.app/Contents/Frameworks/*; do
           echo "$(basename "$f"): minos $(otool -l "$f" | awk '/LC_BUILD_VERSION/ {b=1} b && /minos/ {print $2; exit}')"
         done
 
         # 6. Sign (ad-hoc), libs first, then the app
-        codesign --force --sign - OrbitSDR.app/Contents/Frameworks/*.dylib
+        for f in OrbitSDR.app/Contents/Frameworks/*; do
+          codesign --force --sign - "$f"
+        done
         codesign --force --deep --sign - OrbitSDR.app
 
     - name: Zip and Upload
