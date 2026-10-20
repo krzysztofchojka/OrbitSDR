@@ -92,15 +92,23 @@ jobs:
           cp orbitsdr OrbitSDR_Linux/OrbitSDR
           cp icon.png OrbitSDR_Linux/ || true
           cp bandplan.json OrbitSDR_Linux/ || true
-          # Użycie -P zachowuje dowiązania symboliczne (rozwiązuje błąd .so.3.0)
-          cp -P sfml/lib/*.so* OrbitSDR_Linux/libs/
-          cp -P deps/sdrplay/lib/linux/*.so* OrbitSDR_Linux/libs/
-          # Dodanie systemowej biblioteki RTL-SDR, aby działało out-of-the-box
-          cp -P /usr/lib/x86_64-linux-gnu/librtlsdr.so* OrbitSDR_Linux/libs/ || true
-          cat > OrbitSDR_Linux/OrbitSDR_Run.sh <<EOF
+          
+          # Kopiujemy pliki fizycznie (-L), rozwiązując problem znikających symlinków w ZIP
+          cp -L sfml/lib/*.so* OrbitSDR_Linux/libs/
+          cp -L deps/sdrplay/lib/linux/*.so* OrbitSDR_Linux/libs/
+          cp -L /usr/lib/x86_64-linux-gnu/librtlsdr.so* OrbitSDR_Linux/libs/ || true
+          
+          # KLUCZOWE: Gwarantujemy, że plik o nazwie .so.3 fizycznie istnieje w folderze libs
+          for f in OrbitSDR_Linux/libs/libsdrplay_api.so*; do
+            cp -L "$f" OrbitSDR_Linux/libs/libsdrplay_api.so.3 || true
+            break
+          done
+          
+          cat > OrbitSDR_Linux/OrbitSDR_Run.sh << 'EOF'
           #!/bin/bash
-          cd "\$(dirname "\$0")"
-          export LD_LIBRARY_PATH="\$LD_LIBRARY_PATH:./libs"
+          cd "$(dirname "$0")"
+          chmod +x ./OrbitSDR 2>/dev/null || true
+          export LD_LIBRARY_PATH="$(pwd)/libs:$LD_LIBRARY_PATH"
           ./OrbitSDR
           EOF
           chmod +x OrbitSDR_Linux/OrbitSDR_Run.sh

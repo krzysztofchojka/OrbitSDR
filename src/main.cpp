@@ -436,7 +436,12 @@ int main() {
             cachedDevices.clear();
             std::vector<std::string> names;
             if (idx == 1) cachedDevices = RtlSdrSource::getDeviceList();
-            else if (idx == 2) cachedDevices = SdrPlaySource::getDeviceList();
+            else if (idx == 2) {
+                cachedDevices = SdrPlaySource::getDeviceList();
+                if (cachedDevices.empty()) {
+                    showPopup("SDRPlay Info", "No SDRPlay device found or SDRPlay API Service is not installed.\n\nIf you want to use SDRPlay, please install the official API from:\nhttps://www.sdrplay.com/downloads/");
+                }
+            }
             else if (idx == 3) cachedDevices = AudioCaptureSource::getDeviceList();
 
             for(auto& d : cachedDevices) names.push_back(d.name);
