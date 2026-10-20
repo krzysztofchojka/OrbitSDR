@@ -665,37 +665,48 @@ public:
 class AudioCaptureSource : public IQSource {
     ma_context context;
     ma_device device;
+    bool contextReady = false;
     bool isInitialized = false;
     RingBuffer<Complex> ringBuffer;
     uint32_t sampleRate = 48000;
     std::atomic<bool> running{false};
+    std::vector<Complex> scratch; // only touched from the audio callback thread
 
     static void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
+        (void)pOutput;
         AudioCaptureSource* src = (AudioCaptureSource*)pDevice->pUserData;
-        if (!src->running) return;
-        
+        if (!src || !src->running || !pInput || frameCount == 0) return;
+
+        // Keep latency bounded: if the DSP thread is not keeping up (or the capture clock
+        // runs slightly faster than the playback clock), drop input instead of growing forever.
+        if (src->ringBuffer.available() + frameCount > (size_t)(src->sampleRate / 2)) return;
+
         const float* in = (const float*)pInput;
-        std::vector<Complex> chunk(frameCount);
-        int channels = pDevice->capture.channels;
-        
+        int channels = (int)pDevice->capture.channels;
+        if (channels < 1) channels = 1;
+
+        if (src->scratch.size() < frameCount) src->scratch.resize(frameCount);
+
         for (ma_uint32 i = 0; i < frameCount; i++) {
-            // Miksowanie ewentualnego stereo do mono
-            float mono = (channels == 2) ? (in[i * 2] + in[i * 2 + 1]) * 0.5f : in[i];
-            
-            // Wkładamy sygnał audio w część rzeczywistą (I). Część urojona (Q) = 0
-            chunk[i] = Complex(mono, 0.0);
+            // Mix all channels down to mono
+            float mono = 0.0f;
+            for (int c = 0; c < channels; c++) mono += in[i * channels + c];
+            mono /= (float)channels;
+
+            // Audio goes into the real part (I). Imaginary part (Q) = 0
+            src->scratch[i] = Complex(mono, 0.0);
         }
-        src->ringBuffer.push(chunk.data(), frameCount);
+        src->ringBuffer.push(src->scratch.data(), frameCount);
     }
 
 public:
     AudioCaptureSource() : ringBuffer(8 * 1024 * 1024) {
-        ma_context_init(NULL, 0, NULL, &context);
+        contextReady = (ma_context_init(NULL, 0, NULL, &context) == MA_SUCCESS);
     }
-    
-    ~AudioCaptureSource() { 
-        close(); 
-        ma_context_uninit(&context); 
+
+    ~AudioCaptureSource() {
+        close();
+        if (contextReady) ma_context_uninit(&context);
     }
 
     static std::vector<SDRDeviceItem> getDeviceList() {
@@ -706,12 +717,12 @@ public:
             ma_uint32 playbackCount;
             ma_device_info* pCaptureInfos;
             ma_uint32 captureCount;
-            
+
             if (ma_context_get_devices(&ctx, &pPlaybackInfos, &playbackCount, &pCaptureInfos, &captureCount) == MA_SUCCESS) {
                 for (ma_uint32 i = 0; i < captureCount; i++) {
                     SDRDeviceItem item;
                     item.name = pCaptureInfos[i].name;
-                    item.id = std::to_string(i); // Zapisujemy indeks jako ID
+                    item.id = std::to_string(i); // The index is used as the ID
                     list.push_back(item);
                 }
             }
@@ -722,11 +733,12 @@ public:
 
     bool open(std::string id, uint32_t requestedRate = 0) override {
         close();
+        if (!contextReady) return false;
         sampleRate = (requestedRate > 0) ? requestedRate : 48000;
 
         ma_device_config config = ma_device_config_init(ma_device_type_capture);
         config.capture.format = ma_format_f32;
-        config.capture.channels = 2; // Zawsze bierzemy 2 kanały i robimy mix do mono ręcznie
+        config.capture.channels = 2; // Always request 2 channels and mix down to mono manually
         config.sampleRate = sampleRate;
         config.dataCallback = data_callback;
         config.pUserData = this;
@@ -742,11 +754,18 @@ public:
             if (ma_context_get_devices(&context, &pPlaybackInfos, &playbackCount, &pCaptureInfos, &captureCount) == MA_SUCCESS) {
                 if (devIdx < (int)captureCount) {
                     config.capture.pDeviceID = &pCaptureInfos[devIdx].id;
+                } else {
+                    return false; // device list changed since it was enumerated
                 }
             }
         }
 
-        if (ma_device_init(&context, &config, &device) != MA_SUCCESS) return false;
+        if (ma_device_init(&context, &config, &device) != MA_SUCCESS) {
+            // Some devices refuse stereo capture (e.g. mono-only microphones). Retry with mono.
+            config.capture.channels = 1;
+            if (ma_device_init(&context, &config, &device) != MA_SUCCESS) return false;
+        }
+        ringBuffer.clear();
         isInitialized = true;
         return true;
     }
@@ -759,11 +778,24 @@ public:
         }
     }
 
-    void start() override { if (isInitialized && !running) { running = true; ma_device_start(&device); } }
-    void stop() override { if (isInitialized && running) { running = false; ma_device_stop(&device); } }
-    int read(Complex* buffer, int count) override { return ringBuffer.pop(buffer, count); }
+    void start() override {
+        if (isInitialized && !running) {
+            ringBuffer.clear(); // never play back stale audio captured before the pause
+            running = true;
+            if (ma_device_start(&device) != MA_SUCCESS) running = false;
+        }
+    }
+
+    void stop() override {
+        if (isInitialized && running) {
+            running = false;
+            ma_device_stop(&device);
+        }
+    }
+
+    int read(Complex* buffer, int count) override { return (int)ringBuffer.pop(buffer, count); }
     double getSampleRate() override { return sampleRate; }
-    
+
     std::vector<std::string> getAvailableSampleRatesText() override { return {"48.0 kHz"}; }
     std::vector<uint32_t> getAvailableSampleRatesValues() override { return {48000}; }
 };
