@@ -3,8 +3,8 @@
 #include <vector>
 #include <mutex>
 #include <iostream>
-#include <algorithm> // dla std::copy, std::min
-#include <cstring>   // dla memcpy (opcjonalnie, ale std::copy jest bezpieczniejsze dla obiektów)
+#include <algorithm> // for std::copy, std::min
+#include <cstring>   // for memcpy (optional, std::copy is safer for objects)
 
 // Thread-safe FIFO ring buffer optimization
 template <typename T>
@@ -23,7 +23,7 @@ public:
     void push(const T* data, size_t count) {
         std::lock_guard<std::mutex> lock(mtx);
         
-        // OPTYMALIZACJA: Kopiowanie blokowe zamiast pętli po elemencie
+        // OPTIMISATION: block copy instead of a per-element loop
         size_t firstChunk = std::min(count, capacity - head);
         std::copy(data, data + firstChunk, buffer.begin() + head);
         
@@ -33,18 +33,18 @@ public:
 
         size_t next_head = (head + count) % capacity;
 
-        // Wykrywanie przepełnienia (prosta heurystyka dla bufora kołowego)
-        // W pełnym buforze kołowym "head" mógłby przeskoczyć "tail".
-        // Tutaj dla wydajności przy SDR zakładamy, że jeśli writer jest szybszy,
-        // to po prostu przesuwamy tail (tracimy stare dane), żeby nie blokować.
+        // Overflow detection (simple ring buffer heuristic)
+        // In a full ring buffer "head" could overtake "tail".
+        // For SDR throughput we assume that if the writer is faster,
+        // we simply move tail on (dropping old data) instead of blocking.
         
         size_t availableSpace = (tail > head) ? (tail - head) : (capacity - (head - tail));
-        // Uwaga: To jest uproszczone zarządzanie przepełnieniem dla strumieniowania.
-        // Jeśli nadpisaliśmy tail, musimy go przesunąć.
+        // Note: this is simplified overflow handling for streaming.
+        // If we overwrote tail, it has to move.
         
-        // Bardziej konserwatywne podejście do tail w prostym buforze:
-        // Jeśli zapisaliśmy więcej danych niż było miejsca, tail musi "uciec".
-        // (W implementacji stricte atomowej byłoby to trudniejsze, tu mamy mutex).
+        // A more conservative approach to tail in a simple buffer:
+        // if we wrote more data than there was room for, tail has to "run ahead".
+        // (Harder in a strictly lock-free implementation; here we have a mutex.)
         
         head = next_head;
     }
@@ -61,7 +61,7 @@ public:
 
         size_t toRead = std::min(count, available);
 
-        // OPTYMALIZACJA: Kopiowanie blokowe
+        // OPTIMISATION: block copy
         size_t firstChunk = std::min(toRead, capacity - tail);
         std::copy(buffer.begin() + tail, buffer.begin() + tail + firstChunk, out);
 

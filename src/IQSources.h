@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <sstream>
 #include "RingBuffer.h"
+#include "Decimator.h"
 #include "NativeDialogs.h" 
 
 #include <rtl-sdr.h>
@@ -20,6 +21,31 @@
 #endif
 
 using Complex = std::complex<double>;
+
+// --- SAMPLE RATE LISTS ---
+// Rates below the minimum hardware rate are produced in software: the radio runs
+// at a base rate and the samples are decimated right after they are received.
+inline const uint32_t RTL_DECIM_BASE_RATE = 2048000;
+inline const uint32_t RTL_MIN_HW_RATE = 1400000;
+inline const std::vector<uint32_t> RTL_SAMPLE_RATES = {
+    1400000, 1800000, 2048000, 2400000, 3200000,
+    1024000, 512000, 256000, 128000
+};
+inline const std::vector<std::string> RTL_SAMPLE_RATES_TXT = {
+    "1.4 MSps", "1.8 MSps", "2.048 MSps", "2.4 MSps", "3.2 MSps",
+    "1.024 MSps (decim)", "512 kSps (decim)", "256 kSps (decim)", "128 kSps (decim)"
+};
+
+inline const uint32_t SDRPLAY_DECIM_BASE_RATE = 2000000;
+inline const uint32_t SDRPLAY_MIN_HW_RATE = 2000000;
+inline const std::vector<uint32_t> SDRPLAY_SAMPLE_RATES = {
+    2000000, 4000000, 6000000, 8000000, 10000000,
+    1000000, 500000, 250000, 125000
+};
+inline const std::vector<std::string> SDRPLAY_SAMPLE_RATES_TXT = {
+    "2.0 MSps", "4.0 MSps", "6.0 MSps", "8.0 MSps", "10.0 MSps",
+    "1.0 MSps (decim)", "500 kSps (decim)", "250 kSps (decim)", "125 kSps (decim)"
+};
 
 struct SDRDeviceItem {
     std::string name;
@@ -45,23 +71,23 @@ public:
     virtual void seek(double percent) {}
     virtual double getProgress() { return 0.0; }
 
-    // --- NOWOŚĆ: Wykrywanie zapętlenia ---
-    // Zwraca true tylko raz, w momencie gdy plik wrócił na początek
+    // --- Loop detection ---
+    // Returns true only once, at the moment the file wrapped back to the start
     virtual bool didLoop() { return false; }
 };
 
 // --- ROBUST FILE SOURCE (WAV Parser) ---
 class FileSource : public IQSource {
     std::ifstream file;
-    uint64_t dataStart = 0;     // Gdzie fizycznie zaczynają się dane
-    uint64_t dataLength = 0;    // Długość danych w bajtach (liczona z pliku, nie z nagłówka)
+    uint64_t dataStart = 0;     // Where the sample data physically starts
+    uint64_t dataLength = 0;    // Data length in bytes (taken from the file size, not the header)
     uint32_t sampleRate = 0;
     uint16_t bitsPerSample = 16;
     uint16_t channels = 2;
-    uint64_t currentBytePos = 0; // Aktualna pozycja względem dataStart
+    uint64_t currentBytePos = 0; // Current position relative to dataStart
     bool active = false;
     
-    // Flaga zapętlenia
+    // Loop flag
     bool looped = false;
 
 public:
@@ -70,7 +96,7 @@ public:
         file.open(path, std::ios::binary);
         if (!file.is_open()) return false;
 
-        // 1. Sprawdź RIFF
+        // 1. Check RIFF
         char id[4];
         file.read(id, 4);
         if (strncmp(id, "RIFF", 4) != 0) return false;
@@ -79,7 +105,7 @@ public:
         file.read(id, 4);
         if (strncmp(id, "WAVE", 4) != 0) return false;
 
-        // 2. Szukaj chunków 'fmt ' i 'data'
+        // 2. Look for the 'fmt ' and 'data' chunks
         bool foundFmt = false;
         bool foundData = false;
 
@@ -110,7 +136,7 @@ public:
                 bitsPerSample = bps;
                 foundFmt = true;
 
-                // Jeśli chunk fmt jest większy niż standardowe 16 bajtów (np. ma extension), pomiń resztę
+                // If the fmt chunk is larger than the standard 16 bytes (e.g. has an extension), skip the rest
                 int bytesRead = 16;
                 if (chunkSize > bytesRead) {
                     file.seekg(chunkSize - bytesRead, std::ios::cur);
@@ -119,28 +145,28 @@ public:
             else if (strncmp(chunkID, "data", 4) == 0) {
                 dataStart = file.tellg();
                 foundData = true;
-                // Nie polegamy na chunkSize z nagłówka, bo dla plików >4GB jest on błędny.
-                // Obliczamy rozmiar fizycznie.
+                // Don't rely on the header chunkSize, it is wrong for files >4GB.
+                // Compute the size from the actual file.
                 
-                // Zapisz aktualną pozycję
+                // Remember the current position
                 std::streampos current = file.tellg();
                 file.seekg(0, std::ios::end);
                 std::streampos end = file.tellg();
                 dataLength = (uint64_t)end - (uint64_t)current;
                 
-                // Wróć na początek danych
+                // Go back to the start of the data
                 file.seekg(current);
-                break; // Mamy wszystko, przestajemy skanować
+                break; // Got everything, stop scanning
             }
             else {
-                // Nieznany chunk (LIST, bext, JUNK itp.) - pomiń go
+                // Unknown chunk (LIST, bext, JUNK etc.) - skip it
                 file.seekg(chunkSize, std::ios::cur);
             }
         }
 
         if (!foundFmt || !foundData) return false;
 
-        // Walidacja formatu
+        // Format validation
         if (channels != 2) {
             std::cerr << "[FileSource] Error: Only Stereo (2 channel) files supported currently." << std::endl;
             return false;
@@ -161,14 +187,14 @@ public:
     int read(Complex* out, int count) override {
         if (!file.is_open()) return 0;
         
-        // Reset flagi zapętlenia na początku odczytu
+        // Reset the loop flag at the start of each read
         looped = false;
 
-        // Oblicz ile bajtów czytać
+        // Work out how many bytes to read
         int bytesPerSampleTotal = (bitsPerSample / 8) * channels;
         int bytesToRead = count * bytesPerSampleTotal;
         
-        // Bufor na surowe bajty
+        // Buffer for the raw bytes
         std::vector<uint8_t> rawBuf(bytesToRead);
         file.read((char*)rawBuf.data(), bytesToRead);
         int bytesRead = (int)file.gcount();
@@ -176,18 +202,18 @@ public:
 
         currentBytePos += bytesRead;
 
-        // Loop - zapętlanie
+        // Loop back to the start
         if (file.eof() || bytesRead < bytesToRead) {
             file.clear();
             file.seekg(dataStart);
             currentBytePos = 0;
-            // Ustaw flagę zapętlenia - main.cpp to odczyta i zresetuje dekoder
+            // Set the loop flag - the DSP worker reads it and resets the decoder
             looped = true; 
         }
 
-        // KONWERSJA DO FLOAT
+        // CONVERSION TO FLOAT
         if (bitsPerSample == 16) {
-            // Standard 16-bit SIGNED (SDRPlay, Airspy, większość WAV)
+            // Standard 16-bit SIGNED (SDRPlay, Airspy, most WAV files)
             const double scale = 1.0 / 32768.0;
             int16_t* ptr = (int16_t*)rawBuf.data();
             for (int i = 0; i < samplesRead; i++) {
@@ -198,8 +224,8 @@ public:
             }
         }
         else if (bitsPerSample == 8) {
-            // 8-bit UNSIGNED (RTL-SDR raw, niektóre WAV)
-            // Zakres 0..255, środek 127.5 lub 128
+            // 8-bit UNSIGNED (raw RTL-SDR, some WAV files)
+            // Range 0..255, midpoint 127.5 or 128
             const double scale = 1.0 / 127.5;
             uint8_t* ptr = rawBuf.data();
             for (int i = 0; i < samplesRead; i++) {
@@ -209,7 +235,7 @@ public:
             }
         }
         else if (bitsPerSample == 24) {
-             // 24-bit SIGNED packed (rzadkie, ale HDSDR to robi)
+             // 24-bit SIGNED packed (rare, but HDSDR writes it)
              const double scale = 1.0 / 8388608.0;
              uint8_t* ptr = rawBuf.data();
              for(int i=0; i < samplesRead; i++) {
@@ -219,7 +245,7 @@ public:
              }
         }
         else if (bitsPerSample == 32) {
-            // 32-bit FLOAT (często używane w SDR# IQ Rec)
+            // 32-bit FLOAT (commonly used by SDR# IQ Rec)
             float* ptr = (float*)rawBuf.data();
             for(int i=0; i<samplesRead; i++) {
                 out[i] = Complex(ptr[i*2], ptr[i*2+1]);
@@ -239,7 +265,7 @@ public:
         
         uint64_t targetByte = (uint64_t)(percent * dataLength);
         
-        // Wyrównanie do ramki (block align)
+        // Align to a whole frame (block align)
         int blockAlign = (bitsPerSample / 8) * channels;
         targetByte -= (targetByte % blockAlign);
 
@@ -249,7 +275,7 @@ public:
         file.seekg(dataStart + targetByte);
         currentBytePos = targetByte;
         
-        // Przy manualnym seekowaniu też warto zasygnalizować reset
+        // Signal a reset on manual seeking as well
         looped = true;
     }
 
@@ -270,20 +296,22 @@ class RtlSdrSource : public IQSource {
     std::thread worker;
     std::atomic<bool> running {false};
     RingBuffer<Complex> ringBuffer;
-    uint32_t sampleRate = 2048000;
+    uint32_t sampleRate = 2048000;   // sample rate seen by the app (after decimation)
+    uint32_t hwSampleRate = 2048000; // sample rate set on the radio
+    IQDecimator decimator;           // used only by the worker thread
     
-    // Używamy atomic, aby UI mogło bezpiecznie ustawiać żądania,
-    // a worker je aplikował w bezpiecznym momencie.
+    // Atomics let the UI post requests safely,
+    // and the worker applies them at a safe moment.
     std::atomic<long long> currentCenterFreq {100000000};
-    std::atomic<long long> pendingCenterFreq {0}; // 0 oznacza brak zmiany
+    std::atomic<long long> pendingCenterFreq {0}; // 0 means no change
     
     std::atomic<int> currentGain {-999};
-    std::atomic<int> pendingGain {-999}; // -999 oznacza brak zmiany
+    std::atomic<int> pendingGain {-999}; // -999 means no change
     
-    std::mutex hwMtx; // Chroni tylko dostęp do wskaźnika 'dev' przy open/close
+    std::mutex hwMtx; // Only guards the 'dev' pointer during open/close
     std::vector<int> availableGains;
 
-    // Bufor do odczytu z USB (wielokrotność 16k jest optymalna dla RTL)
+    // USB read buffer (a multiple of 16k is optimal for RTL)
     static const int USB_BUFFER_SIZE = 16 * 16384; 
 
 public:
@@ -308,16 +336,25 @@ public:
         
         if (rtlsdr_open(&dev, dev_index) < 0) return false;
         
-        if (requestedRate > 0) sampleRate = requestedRate; else sampleRate = 2048000;
+        if (requestedRate == 0) requestedRate = 2048000;
+        if (requestedRate < RTL_MIN_HW_RATE) {
+            // Low sample rate: run the radio at 2.048 MSps and decimate in software
+            hwSampleRate = RTL_DECIM_BASE_RATE;
+            decimator.setFactor(computeDecimationFactor(hwSampleRate, requestedRate));
+        } else {
+            hwSampleRate = requestedRate;
+            decimator.setFactor(1);
+        }
+        sampleRate = hwSampleRate / decimator.getFactor();
         
-        // Zamiast 0 (brak zmiany freq), ustawiamy aktualną, żeby worker ją wymusił
+        // Instead of 0 (no change), queue the current frequency so the worker forces it
         pendingCenterFreq = currentCenterFreq.load(); 
         
-        // Zamiast -999 (brak zmiany gainu), ustawiamy -1 (AGC).
+        // Instead of -999 (no change), queue -1 (AGC).
         pendingGain = -1; 
         
-        // Te wywołania bezpośrednie zostawiamy jako "fallback"
-        rtlsdr_set_sample_rate(dev, sampleRate);
+        // Direct calls kept as a fallback
+        rtlsdr_set_sample_rate(dev, hwSampleRate);
         rtlsdr_set_center_freq(dev, currentCenterFreq);
         rtlsdr_set_tuner_gain_mode(dev, 0);
         rtlsdr_set_agc_mode(dev, 1);
@@ -346,41 +383,42 @@ public:
             const float inv = 1.0f / 127.5f;
 
             while (running) {
-            // 1. Obsługa zmiany częstotliwości (Safe Tuning)
+            // 1. Handle frequency changes (safe tuning)
             long long newFreq = pendingCenterFreq.exchange(0);
             if (newFreq != 0) {
                 if (dev) {
-                    // Krótki oddech dla kontrolera USB/I2C po ostatnim transferze blokowym
+                    // Give the USB/I2C controller a short break after the last bulk transfer
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
                     
                     int r = rtlsdr_set_center_freq(dev, (uint32_t)newFreq);
                     if (r < 0) {
-                        // Jeśli tuner R820T/R828D był zajęty i odrzucił komendę, ponów próbę!
+                        // If the R820T/R828D tuner was busy and rejected the command, retry
                         std::this_thread::sleep_for(std::chrono::milliseconds(15));
                         rtlsdr_set_center_freq(dev, (uint32_t)newFreq);
                     }
                     
-                    // Resetujemy bufor sprzętowy USB oraz nasz bufor kołowy w RAMie
+                    // Reset the USB hardware buffer and our in-memory ring buffer
                     rtlsdr_reset_buffer(dev);
                     ringBuffer.clear();
+                    decimator.reset();
                 }
                 currentCenterFreq = newFreq;
             }
 
-                // 2. Obsługa zmiany wzmocnienia (Safe Gain)
+                // 2. Handle gain changes (safe gain)
                 int newGain = pendingGain.exchange(-999);
                 if (newGain != -999) {
                     if (dev) {
                         if (newGain == -1) {
-                            // Włączenie AGC z powrotem
+                            // Turn AGC back on
                             rtlsdr_set_tuner_gain_mode(dev, 0); 
                             rtlsdr_set_agc_mode(dev, 1);        
                         } else {
-                            // Wyłączenie AGC (przejście na tryb manualny)
+                            // Turn AGC off (manual mode)
                             rtlsdr_set_tuner_gain_mode(dev, 1); 
                             rtlsdr_set_agc_mode(dev, 0);        
                             
-                            // Znajdź najbliższy dostępny gain
+                            // Find the closest available gain
                             int targetGain = newGain * 10;
                             int bestGain = targetGain;
                             int minDiff = 100000;
@@ -393,13 +431,13 @@ public:
                             }
                             rtlsdr_set_tuner_gain(dev, bestGain);
                         }
-                        // Po zmianie Gainu również warto wyrzucić stare próbki
+                        // Drop stale samples after a gain change too
                         ringBuffer.clear();
                     }
                     currentGain = newGain;
                 }
 
-            // 3. Odczyt synchroniczny (blokuje na chwilę, ale bezpiecznie)
+            // 3. Synchronous read (blocks briefly, but safely)
             int n_read = 0;
             if (rtlsdr_read_sync(dev, buffer.data(), USB_BUFFER_SIZE, &n_read) < 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -410,20 +448,23 @@ public:
                 int samples = n_read / 2;
                 std::vector<Complex> converted(samples);
                 
-                // Konwersja 8-bit unsigned -> float complex
+                // Convert 8-bit unsigned -> float complex
                 for (int i = 0; i < samples; i++) {
                     converted[i] = Complex(
                         (buffer[i * 2] - 127.5f) * inv, 
                         (buffer[i * 2 + 1] - 127.5f) * inv
                     );
                 }
-                ringBuffer.push(converted.data(), samples);
+                size_t outCount = 0;
+                const Complex* out = decimator.process(converted.data(), (size_t)samples, outCount);
+                if (outCount > 0) ringBuffer.push(out, outCount);
             }
         }
     }
 
     void start() override {
         if (running) return;
+        decimator.reset();
         running = true;
         if (dev) rtlsdr_reset_buffer(dev);
         worker = std::thread(&RtlSdrSource::workerLoop, this);
@@ -458,8 +499,8 @@ public:
         else if (name == "bias_t") { rtlsdr_set_bias_tee(dev, value); }
     }
     
-    std::vector<std::string> getAvailableSampleRatesText() override { return {"1.4 MSps", "1.8 MSps", "2.048 MSps", "2.4 MSps", "3.2 MSps"}; }
-    std::vector<uint32_t> getAvailableSampleRatesValues() override { return {1400000, 1800000, 2048000, 2400000, 3200000}; }
+    std::vector<std::string> getAvailableSampleRatesText() override { return RTL_SAMPLE_RATES_TXT; }
+    std::vector<uint32_t> getAvailableSampleRatesValues() override { return RTL_SAMPLE_RATES; }
 };
 
 // --- SDRPLAY SOURCE ---
@@ -473,19 +514,21 @@ public:
 #endif
 
 class SdrPlaySource : public IQSource {
-    bool isSelected = false; bool isInitialized = false; RingBuffer<Complex> ringBuffer; double sampleRate = 2000000.0; long long centerFreq = 100000000; std::mutex hwMtx;
+    bool isSelected = false; bool isInitialized = false; RingBuffer<Complex> ringBuffer; double sampleRate = 2000000.0; double hwSampleRate = 2000000.0; long long centerFreq = 100000000; std::mutex hwMtx;
     sdrplay_api_DeviceT currentDevice; sdrplay_api_DeviceParamsT *deviceParams = NULL; sdrplay_api_CallbackFnsT cbFns; std::atomic<bool> running {false};
     static std::atomic<int> activeInstances;
+    IQDecimator decimator;              // used only by the stream callback
+    std::vector<Complex> cbBuf;
 
     static void StreamCallback(short *xi, short *xq, sdrplay_api_StreamCbParamsT *params, unsigned int numSamples, unsigned int reset, void *cbContext) {
         SdrPlaySource* self = (SdrPlaySource*)cbContext; if (!self->running) return;
-        Complex tempBuf[2048]; unsigned int processed = 0;
         const double scale = 1.0 / 32768.0;
-        while (processed < numSamples) {
-            unsigned int chunk = (numSamples - processed); if (chunk > 2048) chunk = 2048;
-            for (unsigned int i = 0; i < chunk; i++) { tempBuf[i] = Complex(xi[processed + i] * scale, xq[processed + i] * scale); }
-            self->ringBuffer.push(tempBuf, chunk); processed += chunk;
-        }
+        auto& buf = self->cbBuf;
+        buf.resize(numSamples);
+        for (unsigned int i = 0; i < numSamples; i++) buf[i] = Complex(xi[i] * scale, xq[i] * scale);
+        size_t outCount = 0;
+        const Complex* out = self->decimator.process(buf.data(), numSamples, outCount);
+        if (outCount > 0) self->ringBuffer.push(out, outCount);
     }
     static void EventCallback(sdrplay_api_EventT eventId, sdrplay_api_TunerSelectT tuner, sdrplay_api_EventParamsT *params, void *cbContext) {}
 
@@ -531,11 +574,20 @@ public:
         if (sdrplay_api_SelectDevice(&currentDevice) != sdrplay_api_Success) { activeInstances--; if(activeInstances == 0) sdrplay_api_Close(); return false; } 
         isSelected = true;
         if (sdrplay_api_GetDeviceParams(currentDevice.dev, &deviceParams) != sdrplay_api_Success) { close(); return false; }
-        if (requestedRate > 0) sampleRate = (double)requestedRate; else sampleRate = 2000000.0;
-        deviceParams->devParams->fsFreq.fsHz = sampleRate; deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)centerFreq;
+        if (requestedRate == 0) requestedRate = 2000000;
+        if (requestedRate < SDRPLAY_MIN_HW_RATE) {
+            // Low sample rate: run the radio at 2.0 MSps and decimate in software
+            hwSampleRate = (double)SDRPLAY_DECIM_BASE_RATE;
+            decimator.setFactor(computeDecimationFactor(SDRPLAY_DECIM_BASE_RATE, requestedRate));
+        } else {
+            hwSampleRate = (double)requestedRate;
+            decimator.setFactor(1);
+        }
+        sampleRate = hwSampleRate / decimator.getFactor();
+        deviceParams->devParams->fsFreq.fsHz = hwSampleRate; deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)centerFreq;
         deviceParams->rxChannelA->tunerParams.bwType = sdrplay_api_BW_1_536;
-        if (sampleRate > 2000000) deviceParams->rxChannelA->tunerParams.bwType = sdrplay_api_BW_5_000;
-        if (sampleRate > 8000000) deviceParams->rxChannelA->tunerParams.bwType = sdrplay_api_BW_8_000;
+        if (hwSampleRate > 2000000) deviceParams->rxChannelA->tunerParams.bwType = sdrplay_api_BW_5_000;
+        if (hwSampleRate > 8000000) deviceParams->rxChannelA->tunerParams.bwType = sdrplay_api_BW_8_000;
         deviceParams->rxChannelA->tunerParams.ifType = sdrplay_api_IF_Zero; 
         deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_50HZ; 
         return true;
@@ -553,7 +605,7 @@ public:
         } 
     }
 
-    void start() override { if (running || !isSelected) return; std::lock_guard<std::mutex> lock(hwMtx); if (deviceParams) { deviceParams->devParams->fsFreq.fsHz = sampleRate; deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)centerFreq; } memset(&cbFns, 0, sizeof(cbFns)); cbFns.StreamACbFn = StreamCallback; cbFns.EventCbFn = EventCallback; if (sdrplay_api_Init(currentDevice.dev, &cbFns, this) == sdrplay_api_Success) { isInitialized = true; running = true; } }
+    void start() override { if (running || !isSelected) return; std::lock_guard<std::mutex> lock(hwMtx); if (deviceParams) { deviceParams->devParams->fsFreq.fsHz = hwSampleRate; deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)centerFreq; } decimator.reset(); memset(&cbFns, 0, sizeof(cbFns)); cbFns.StreamACbFn = StreamCallback; cbFns.EventCbFn = EventCallback; if (sdrplay_api_Init(currentDevice.dev, &cbFns, this) == sdrplay_api_Success) { isInitialized = true; running = true; } }
     void stop() override { if (isInitialized) { running = false; sdrplay_api_Uninit(currentDevice.dev); isInitialized = false; } }
     int read(Complex* buffer, int count) override { return ringBuffer.pop(buffer, count); }
     double getSampleRate() override { return sampleRate; }
@@ -587,7 +639,7 @@ public:
     void setHardwareOption(std::string name, int value) override {
     std::lock_guard<std::mutex> lock(hwMtx);
     
-    // Zabezpieczenie przed edycją niezainicjalizowanej struktury
+    // Guard against editing an uninitialised structure
     if (!deviceParams) return;
 
     if (name == "antenna") {
@@ -642,15 +694,15 @@ public:
         }
     }
     else if (name == "mw_notch") {
-        // Tylko RSPduo w API 3.x posiada zmapowany ten konkretny przełącznik w strukturze.
+        // Only the RSPduo exposes this particular switch in the API 3.x structures.
         if (currentDevice.hwVer == SDRPLAY_RSPduo_ID) {
             deviceParams->rxChannelA->rspDuoTunerParams.tuner1AmNotchEnable = value ? 1 : 0;
             if (running) sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_RspDuo_Tuner1AmNotchControl, sdrplay_api_Update_Ext1_None);
         }
     }
 }
-    std::vector<std::string> getAvailableSampleRatesText() override { return {"2.0 MSps", "4.0 MSps", "6.0 MSps", "8.0 MSps", "10.0 MSps"}; }
-    std::vector<uint32_t> getAvailableSampleRatesValues() override { return {2000000, 4000000, 6000000, 8000000, 10000000}; }
+    std::vector<std::string> getAvailableSampleRatesText() override { return SDRPLAY_SAMPLE_RATES_TXT; }
+    std::vector<uint32_t> getAvailableSampleRatesValues() override { return SDRPLAY_SAMPLE_RATES; }
 };
 std::atomic<int> SdrPlaySource::activeInstances{0};
 

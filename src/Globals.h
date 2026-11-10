@@ -6,6 +6,7 @@
 #include <mutex>
 #include <memory>
 #include "Demodulator.h"
+#include "RDS_Decoder.h"
 #include "IQSources.h"
 #include "modules/Core/SDRModule.h"
 
@@ -19,8 +20,8 @@ inline const int SIDEBAR_W = 320;
 inline const int TUNING_LATENCY_MS = 50;
 inline const int GAIN_LATENCY_MS = 50;
 
-inline const std::vector<uint32_t> RTL_RATES_VAL = {1400000, 1800000, 2048000, 2400000, 3200000};
-inline const std::vector<uint32_t> SDRPLAY_RATES_VAL = {2000000, 4000000, 6000000, 8000000, 10000000};
+inline const std::vector<uint32_t>& RTL_RATES_VAL = RTL_SAMPLE_RATES;
+inline const std::vector<uint32_t>& SDRPLAY_RATES_VAL = SDRPLAY_SAMPLE_RATES;
 inline const std::vector<std::string> STEP_NAMES = {"None", "1 kHz", "5 kHz", "6.25k", "10 kHz", "12.5k", "25 kHz", "100 kHz"};
 inline const std::vector<long long> STEP_VALUES = {0, 1000, 5000, 6250, 10000, 12500, 25000, 100000};
 inline const std::vector<std::string> THEME_NAMES = {"Orbit Original", "Neon (Pink/Blue)", "Matrix (Green)", "Grayscale", "Orbit Plus (Aurora)"};
@@ -58,6 +59,8 @@ struct SharedData {
     std::vector<double> fftSpectrum; std::vector<uint8_t> waterfallRow; bool newWaterfallData = false; std::string currentFilename = "None"; float mouseX_spectrum = -1.0f; float mouseY_spectrum = -1.0f; bool isRecording = false; RecMode recMode = RecMode::AUDIO; std::string recPath = ""; std::string recStatus = "Idle";
     
     bool aprsEnabled = false;
+    bool rdsEnabled = false;
+    RdsInfo rds;               // latest RDS data, written by the DSP worker
     SDRModule* activeDecoder = nullptr;
     
     std::deque<AprsLastPacket> aprsHistory;
@@ -78,7 +81,7 @@ struct SharedData {
 
 struct LayoutState {
     float winW, winH, sidebarX, specW, specH, waterfallH;
-    float tuneBarH = 24.0f; // Wysokość czarnego paska strojenia
+    float tuneBarH = 24.0f; // Height of the black tuning bar
 };
 
 struct BandRegion {
@@ -88,14 +91,14 @@ struct BandRegion {
     sf::Color color;
 };
 
-// Prosty parser JSON wykorzystujący regex, niewymagający zewnętrznych bibliotek
+// Simple regex-based JSON parser, no external libraries needed
 inline std::vector<BandRegion> loadBandPlan(const std::string& filepath) {
     std::vector<BandRegion> bands;
     std::ifstream file(filepath);
     if (!file.is_open()) return bands;
 
     std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-    // Oczekiwany format w JSON: {"start": 144000000, "end": 146000000, "name": "2m Amateur", "color": "255,0,0"}
+    // Expected JSON format: {"start": 144000000, "end": 146000000, "name": "2m Amateur", "color": "255,0,0"}
     std::regex bandRegex("\"start\"\\s*:\\s*(\\d+).*?\"end\"\\s*:\\s*(\\d+).*?\"name\"\\s*:\\s*\"([^\"]+)\".*?\"color\"\\s*:\\s*\"(\\d+),(\\d+),(\\d+)\"");
     
     auto words_begin = std::sregex_iterator(content.begin(), content.end(), bandRegex);
@@ -113,4 +116,4 @@ inline std::vector<BandRegion> loadBandPlan(const std::string& filepath) {
     return bands;
 }
 
-inline std::vector<BandRegion> globalBandPlan; // Globalna zmienna do przechowania pasm
+inline std::vector<BandRegion> globalBandPlan; // Global storage for the band plan

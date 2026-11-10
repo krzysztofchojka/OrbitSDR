@@ -7,7 +7,7 @@
 #include <cstdio>
 
 #ifdef _WIN32
-    // --- FIX: Sprawdź czy NOMINMAX już istnieje ---
+    // --- FIX: check whether NOMINMAX is already defined ---
     #ifndef NOMINMAX
         #define NOMINMAX
     #endif

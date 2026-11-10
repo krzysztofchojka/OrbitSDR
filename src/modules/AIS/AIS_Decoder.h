@@ -12,7 +12,7 @@
 #define AIS_RATE 48000.0 
 #define SAMPLES_PER_BIT 5.0f
 
-// --- STRUKTURY DANYCH ---
+// --- DATA STRUCTURES ---
 struct AISMessage {
     int mmsi;
     std::string type;
@@ -21,7 +21,7 @@ struct AISMessage {
     bool crcOk;
 };
 
-// --- NARZĘDZIA (CRC, HEX) ---
+// --- HELPERS (CRC, HEX) ---
 namespace AisTools {
     static const uint16_t fcstab[256] = {
         0x0000, 0x1189, 0x2312, 0x329b, 0x4624, 0x57ad, 0x6536, 0x74bf, 0x8c48, 0x9dc1, 0xaf5a, 0xbed3, 0xca6c, 0xdbe5, 0xe97e, 0xf8f7,
@@ -71,7 +71,7 @@ struct IQ_AGC {
     }
 };
 
-// --- SILNIK KORELACJI I DEKODOWANIA ---
+// --- CORRELATION AND DECODING ENGINE ---
 class AISCorrelationDecoder {
 public:
     std::vector<float> buffer;
@@ -84,17 +84,17 @@ public:
     int onesCount = 0;
     std::vector<uint8_t> frameBits;
     
-    // Wzorzec preambuły (fala 2.4kHz przy próbkowaniu 48kHz = okres 20 próbek)
-    // 10 próbek High, 10 próbek Low
+    // Preamble template (a 2.4 kHz wave sampled at 48 kHz = 20-sample period)
+    // 10 samples high, 10 samples low
     std::vector<float> preambleTemplate;
 
     AISCorrelationDecoder() {
-        // Generujemy wzorzec 2.4kHz (idealna preambuła AIS w NRZI/FM)
+        // Build the 2.4 kHz template (ideal AIS preamble in NRZI/FM)
         for(int i=0; i<20; i++) {
             if(i < 10) preambleTemplate.push_back(1.0f);
             else preambleTemplate.push_back(-1.0f);
         }
-        buffer.reserve(48000); // 1 sekunda
+        buffer.reserve(48000); // 1 second
     }
 
     void reset() {
@@ -103,41 +103,41 @@ public:
         frameBits.clear();
     }
 
-    // Zwraca true jeśli zdekodowano ramkę
+    // Returns true if a frame was decoded
     bool pushSample(float sample, std::vector<uint8_t>& outBits) {
-        // Dodaj do bufora (okno przesuwne 20 próbek dla korelacji)
+        // Add to the buffer (20-sample sliding window for correlation)
         buffer.push_back(sample);
         
-        // Czyść bufor, żeby nie zjadł pamięci, ale zostaw margines na korelację
+        // Trim the buffer so it doesn't grow forever, but keep a margin for correlation
         if (!locked && buffer.size() > 40) {
             buffer.erase(buffer.begin(), buffer.begin() + (buffer.size() - 40));
         }
 
         if (locked) {
             samplesSinceLock++;
-            // Próbkuj co 5 próbek (środek bitu)
-            // Ale musimy trafić w środek. Skoro korelacja była na początku, to pierwszy bit jest w sampleSinceLock = 2.5 (zaokrąglamy do 2 lub 3)
+            // Sample every 5 samples (middle of the bit)
+            // We need to hit the middle. Since the correlation peaked at the start, the first bit is at sampleSinceLock = 2.5 (rounded to 2 or 3)
             if (samplesSinceLock % 5 == 2) {
                 // SAMPLE!
                 bool level = (sample > 0.0f);
                 return processBit(level, outBits);
             }
             
-            // Limit długości ramki (żeby nie wisiał w nieskończoność)
+            // Frame length limit (so it never hangs forever)
             if (bitsRead > 300) {
                 locked = false; // Timeout
             }
         } 
         else {
-            // Szukamy korelacji
+            // Look for the correlation peak
             if (buffer.size() >= 20) {
                 float score = 0.0f;
-                // Mnożymy ostatnie 20 próbek przez wzorzec
+                // Multiply the last 20 samples by the template
                 for(int i=0; i<20; i++) {
                     score += buffer[buffer.size() - 20 + i] * preambleTemplate[i];
                 }
                 
-                // Próg detekcji (doświadczalnie: 10.0 oznacza, że 10 próbek idealnie pasowało amplitudą 1.0)
+                // Detection threshold (empirical: 10.0 means 10 samples matched perfectly at amplitude 1.0)
                 if (score > 12.0f) {
                     locked = true;
                     samplesSinceLock = 0;
@@ -159,10 +159,10 @@ public:
 
         if (bit == 1) {
             onesCount++;
-            if (onesCount == 6) { // Flaga 0x7E (koniec ramki)
-                locked = false; // Koniec pakietu
+            if (onesCount == 6) { // 0x7E flag (end of frame)
+                locked = false; // End of packet
                 outBits = frameBits;
-                return true; // Mamy ramkę!
+                return true; // Got a frame!
             }
         } else {
             if (onesCount == 5) { onesCount = 0; return false; } // De-stuffing
@@ -183,7 +183,7 @@ private:
     float avgDc = 0.0f;
     float lpfState = 0.0f;
 
-    // DWIE GŁOWICE KORELACYJNE
+    // TWO CORRELATION HEADS
     AISCorrelationDecoder decNormal;
     AISCorrelationDecoder decInverted;
 
@@ -196,7 +196,7 @@ private:
 
 public:
     AISDecoder() : SDRModule("AIS Pro (Correlation)") {
-        // Inverted decoder potrzebuje odwróconego wzorca
+        // The inverted decoder needs an inverted template
         for(auto& v : decInverted.preambleTemplate) v *= -1.0f;
     }
     

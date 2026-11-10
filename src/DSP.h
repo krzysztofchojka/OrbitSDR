@@ -121,7 +121,7 @@ class DecimatingFIR {
 public:
     void configure(float cutoffHz, float sampleRate, int numTaps = 101) {
         if (sampleRate <= 0) return;
-        if (numTaps % 2 == 0) numTaps++; // Filtr musi być nieparzysty
+        if (numTaps % 2 == 0) numTaps++; // The filter length must be odd
         taps.resize(numTaps);
         buffer.assign(numTaps, {0,0});
         bufIdx = 0;
@@ -129,7 +129,7 @@ public:
         float fc = cutoffHz / sampleRate;
         float sum = 0.0f;
 
-        // Okno Blackmana + idealny filtr Sinc
+        // Blackman window + ideal sinc filter
         for (int i = 0; i < numTaps; i++) {
             if (i == numTaps / 2) {
                 taps[i] = 2.0f * (float)PI * fc;
@@ -140,7 +140,7 @@ public:
             taps[i] *= 0.42f - 0.5f * std::cos(2.0f * (float)PI * i / (numTaps - 1)) + 0.08f * std::cos(4.0f * (float)PI * i / (numTaps - 1));
             sum += taps[i];
         }
-        for (int i = 0; i < numTaps; i++) taps[i] /= sum; // Normalizacja
+        for (int i = 0; i < numTaps; i++) taps[i] /= sum; // Normalise
     }
 
     inline void push(Complex in) {

@@ -533,7 +533,7 @@ int main() {
         }
         else if (idx == 4) {
             if (!tcpConnected) {
-                ddRate->setOptions({"1.4 MSps", "1.8 MSps", "2.048 MSps", "2.4 MSps", "3.2 MSps"});
+                ddRate->setOptions(RTL_SAMPLE_RATES_TXT);
                 ddRate->setSelection(2);
             }
             refreshSourceUI();   // shows host:port, connection is made only by the Connect button
@@ -663,6 +663,10 @@ int main() {
     auto chkStereo = std::make_shared<Checkbox>("Stereo (WFM only)", font);
     chkStereo->onToggle = [&](bool b) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.stereoEnabled = b; };
     modDemod->addWidget(chkStereo);
+
+    auto chkRds = std::make_shared<Checkbox>("RDS (WFM only)", font);
+    chkRds->onToggle = [&](bool b) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.rdsEnabled = b; };
+    modDemod->addWidget(chkRds);
 
     Mode previousMode = Mode::NFM;
 
@@ -1016,6 +1020,10 @@ int main() {
     chkStereo->checked = savedStereo;
     chkStereo->onToggle(savedStereo);
 
+    bool savedRds = settingsMgr.getBool("rds", true);
+    chkRds->checked = savedRds;
+    chkRds->onToggle(savedRds);
+
     float savedGain = settingsMgr.getFloat("rf_gain", -1.0f);
     if (savedGain < 0) {
         chkAgc->checked = true;
@@ -1039,7 +1047,7 @@ int main() {
         if (savedSourceIdx == 4) {
             currentSourceType = 4;
             updateRadioControls(4);
-            ddRate->setOptions({"1.4 MSps", "1.8 MSps", "2.048 MSps", "2.4 MSps", "3.2 MSps"});
+            ddRate->setOptions(RTL_SAMPLE_RATES_TXT);
             ddRate->setSelection(2);
             refreshSourceUI();
         } else {
@@ -1136,6 +1144,8 @@ int main() {
         }
 
         bool aprsOn = false;
+        bool rdsOn = false;
+        RdsInfo rdsInfo;
         double tunePct = 0.5;
         Mode mode = Mode::NFM;
         float currentZoom = 1.0f;
@@ -1145,6 +1155,8 @@ int main() {
         {
             std::lock_guard<std::mutex> l(sharedData.mtx);
             aprsOn = sharedData.aprsEnabled;
+            rdsOn = sharedData.rdsEnabled;
+            rdsInfo = sharedData.rds;
             tunePct = sharedData.tunedFreqPercent;
             mode = sharedData.mode;
             currentZoom = sharedData.zoomLevel;
@@ -1763,6 +1775,101 @@ int main() {
             window.draw(centerLine);
         }
 
+        // --- RDS PANEL (top right corner of the spectrum) ---
+        if (rdsOn && mode == Mode::WFM && currentSource) {
+            const float pad = 10.0f;
+            const float panelW = std::min(440.0f, layout.specW - 20.0f);
+            const float panelX = layout.specW - panelW - 10.0f;
+            const float panelY = (float)TOP_BAR_H + 14.0f;
+            const float innerW = panelW - 2.0f * pad;
+            auto utf8 = [](const std::string& s) { return sf::String::fromUtf8(s.begin(), s.end()); };
+            auto makeText = [&](const sf::String& str, unsigned size, sf::Color col) {
+                sf::Text t(font, str, size);
+                t.setScale({0.5f, 0.5f});
+                t.setFillColor(col);
+                return t;
+            };
+
+            std::vector<sf::Text> rows;
+            std::vector<float> rowGap;
+            sf::Color dim(160, 160, 170);
+
+            if (!rdsInfo.hasData) {
+                bool rateOk = RDSDecoder::rateSupported(hwSampleRate);
+                rows.push_back(makeText(rateOk ? (rdsInfo.synced ? "RDS: receiving..." : "RDS: searching...")
+                                               : "RDS: sample rate too low (min. 125 kSps)", 26, dim));
+                rowGap.push_back(0.0f);
+            } else {
+                std::string ps = rdsInfo.ps;
+                sf::Text psText = makeText(utf8(ps), 52, sf::Color::White);
+                psText.setStyle(sf::Text::Bold);
+                rows.push_back(psText); rowGap.push_back(0.0f);
+
+                std::string line2 = rdsInfo.pty >= 0 ? std::string(rdsPtyName(rdsInfo.pty)) : std::string("");
+                if (rdsInfo.tp) line2 += "  |  TP";
+                if (rdsInfo.ta) line2 += "  |  TA";
+                if (!line2.empty()) { rows.push_back(makeText(line2, 26, Theme::Accent)); rowGap.push_back(6.0f); }
+
+                // RadioText, word-wrapped to at most 3 lines
+                if (!rdsInfo.radioText.empty()) {
+                    std::vector<std::string> words;
+                    std::stringstream ws(rdsInfo.radioText);
+                    for (std::string w; ws >> w; ) words.push_back(w);
+                    std::vector<std::string> lines;
+                    std::string cur;
+                    for (const auto& w : words) {
+                        std::string trial = cur.empty() ? w : cur + " " + w;
+                        if (cur.empty() || makeText(utf8(trial), 26, sf::Color::White).getGlobalBounds().size.x <= innerW) cur = trial;
+                        else { lines.push_back(cur); cur = w; }
+                    }
+                    if (!cur.empty()) lines.push_back(cur);
+                    if (lines.size() > 3) lines.resize(3);
+                    for (size_t i = 0; i < lines.size(); i++) {
+                        rows.push_back(makeText(utf8(lines[i]), 26, sf::Color(225, 225, 230)));
+                        rowGap.push_back(i == 0 ? 6.0f : 1.0f);
+                    }
+                }
+
+                std::string line4 = rdsInfo.clockTime;
+                if (!line4.empty()) line4 += "     ";
+                line4 += "Block errors: " + std::to_string((int)std::lround(rdsInfo.blockErrorRate * 100.0)) + "%";
+                rows.push_back(makeText(line4, 22, dim)); rowGap.push_back(6.0f);
+            }
+
+            float contentH = 0.0f;
+            for (size_t i = 0; i < rows.size(); i++) contentH += rowGap[i] + rows[i].getGlobalBounds().size.y + 4.0f;
+            float panelH = contentH + 2.0f * pad;
+
+            sf::RectangleShape rdsBg({panelW, panelH});
+            rdsBg.setPosition({panelX, panelY});
+            rdsBg.setFillColor(sf::Color(20, 20, 25, 225));
+            rdsBg.setOutlineColor(Theme::Accent);
+            rdsBg.setOutlineThickness(1.0f);
+            window.draw(rdsBg);
+
+            // Header: sync indicator + PI code
+            sf::CircleShape syncDot(4.0f);
+            syncDot.setFillColor(rdsInfo.synced ? sf::Color(60, 220, 90) : sf::Color(110, 110, 110));
+            syncDot.setPosition({panelX + panelW - pad - 8.0f, panelY + pad + 2.0f});
+            window.draw(syncDot);
+            if (rdsInfo.hasData) {
+                char piBuf[16];
+                std::snprintf(piBuf, sizeof(piBuf), "PI %04X", rdsInfo.pi);
+                sf::Text piText = makeText(piBuf, 26, dim);
+                piText.setPosition({panelX + panelW - pad - 16.0f - piText.getGlobalBounds().size.x, panelY + pad - 2.0f});
+                window.draw(piText);
+            }
+
+            float y = panelY + pad;
+            for (size_t i = 0; i < rows.size(); i++) {
+                y += rowGap[i];
+                sf::FloatRect lb = rows[i].getLocalBounds();
+                rows[i].setPosition({panelX + pad, y - lb.position.y * 0.5f});
+                window.draw(rows[i]);
+                y += rows[i].getGlobalBounds().size.y + 4.0f;
+            }
+        }
+
         if (aprsOn) {
             float aprsH = 200.0f;
             float overlayY = layout.winH - aprsH;
@@ -2111,6 +2218,7 @@ int main() {
     saveMgr.set("bandwidth", slBW->currentVal);
     saveMgr.set("squelch", slSq->currentVal);
     saveMgr.set("stereo", chkStereo->checked);
+    saveMgr.set("rds", chkRds->checked);
     saveMgr.set("rf_gain", sharedData.rfGain);
     saveMgr.set("source_type", ddSourceType->selectedIndex);
     saveMgr.set("hw_fm_notch", hwState.fmNotch);

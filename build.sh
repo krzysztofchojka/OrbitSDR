@@ -53,7 +53,7 @@ FINAL_INCLUDES="$FINAL_INCLUDES $CXXFLAGS"
 FINAL_LIBS="$FINAL_LIBS $LDFLAGS"
 
 echo "Compiling binary..."
-# Znajdź wszystkie pliki .cpp w src/modules
+# Find all .cpp files in src/modules
 MODULE_SOURCES=$(find src/modules -name "*.cpp")
 
 echo "Compiling with modules: $MODULE_SOURCES"
@@ -81,18 +81,18 @@ if [ "$IS_MACOS" = true ]; then
     cp "$OUT_FILE" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
     chmod +x "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
-    # --- NOWOŚĆ: Generowanie ikony .icns z icon.png ---
+    # --- Generate the .icns icon from icon.png ---
     if [ -f "icon.png" ]; then
         echo "Generating AppIcon.icns from icon.png..."
         
-        # Kopiujemy też PNG do Resources, żeby SFML mógł go załadować w kodzie (dla Docka)
+        # Also copy the PNG into Resources so SFML can load it at runtime (for the Dock)
         cp "icon.png" "$APP_BUNDLE/Contents/Resources/"
 
-        # Tworzymy tymczasowy folder iconset
+        # Create a temporary iconset folder
         ICONSET_DIR="OrbitSDR.iconset"
         mkdir -p "$ICONSET_DIR"
 
-        # Generujemy różne rozmiary wymagane przez macOS (używając sips)
+        # Generate the sizes macOS requires (using sips)
         sips -z 16 16     icon.png --out "${ICONSET_DIR}/icon_16x16.png" > /dev/null
         sips -z 32 32     icon.png --out "${ICONSET_DIR}/icon_16x16@2x.png" > /dev/null
         sips -z 32 32     icon.png --out "${ICONSET_DIR}/icon_32x32.png" > /dev/null
@@ -104,16 +104,16 @@ if [ "$IS_MACOS" = true ]; then
         sips -z 512 512   icon.png --out "${ICONSET_DIR}/icon_512x512.png" > /dev/null
         sips -z 1024 1024 icon.png --out "${ICONSET_DIR}/icon_512x512@2x.png" > /dev/null
 
-        # Konwertujemy folder iconset na plik .icns
+        # Convert the iconset folder into an .icns file
         iconutil -c icns "$ICONSET_DIR" -o "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
         
-        # Sprzątamy
+        # Clean up
         rm -rf "$ICONSET_DIR"
     else
         echo "WARNING: icon.png not found! App will have generic icon."
     fi
 
-    # Kopiowanie bandplan.json do Resources
+    # Copy bandplan.json into Resources
     if [ -f "bandplan.json" ]; then
         cp "bandplan.json" "$APP_BUNDLE/Contents/Resources/"
     fi
@@ -124,7 +124,7 @@ if [ "$IS_MACOS" = true ]; then
         install_name_tool -change "libsdrplay_api.so.3" "@executable_path/../Frameworks/libsdrplay_api.so.3" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
     fi
 
-    # Create Info.plist (Zaktualizowany o wpis CFBundleIconFile)
+    # Create Info.plist (includes the CFBundleIconFile entry)
     cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -154,7 +154,7 @@ EOF
     # Signing with Entitlements
     echo "Signing app..."
 
-    # Generowanie pliku Entitlements dla mikrofonu
+    # Generate the Entitlements file for microphone access
     cat > entitlements.plist <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -170,20 +170,20 @@ EOF
         codesign --force --sign - "$APP_BUNDLE/Contents/Frameworks/"* 2>/dev/null
     fi
 
-    # Podpisanie aplikacji z uwzględnieniem Entitlements
+    # Sign the app with the Entitlements
     codesign --force --deep --entitlements entitlements.plist --sign - "$APP_BUNDLE"
 
-    # Sprzątanie
+    # Clean up
     rm entitlements.plist
     echo "Bundle created: $APP_BUNDLE"
 
 else
     # --- LINUX LOGIC ---
-    # Na Linuxie po prostu kopiujemy png obok binarki, żeby kod C++ mógł go załadować
+    # On Linux just copy the png next to the binary so the C++ code can load it
     if [ -f "icon.png" ]; then
         cp "icon.png" "icon.png" # Dummy copy just to be explicit, logic handled in C++
     fi
-    # Kopiowanie bandplan.json
+    # Copy bandplan.json
     if [ -f "bandplan.json" ]; then
         cp "bandplan.json" "bandplan.json"
     fi

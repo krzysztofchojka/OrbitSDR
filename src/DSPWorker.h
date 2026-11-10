@@ -6,6 +6,7 @@
 #include "AudioSink.h"
 #include "Demodulator.h"
 #include "APRS_Decoder.h"
+#include "RDS_Decoder.h"
 #include "InspectorDSP.h"
 #include "WavWriter.h"
 #include "Settings.h"
@@ -13,12 +14,15 @@
 
 inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio) {
     #ifdef _WIN32
-        // Zapobiega zrzucaniu wątku DSP na wolne rdzenie E-Core w Windows 11
+        // Stops Windows 11 from moving the DSP thread onto slow E-cores
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     #endif
     Demodulator demod(2000000, AUDIO_RATE);
     APRSDecoder aprsDecoder(AUDIO_RATE);
     InspectorDSP inspector;
+    RDSDecoder rdsDecoder;
+    long long rdsRefFreqHz = 0;    // tuned frequency the current RDS data belongs to
+    bool rdsWasActive = false;
 
     aprsDecoder.onMessage = [&](std::string msg) {
         std::string ts = getTimestamp();
@@ -71,6 +75,8 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
         std::string rPath;
         float sqThr;
         bool stereo;
+        bool rdsOn;
+        long long centerHz;
         double seekReq = -1.0;
         int themeID = 0;
         float currentZoom = 1.0f;
@@ -97,6 +103,8 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
             aprsActive = shared.aprsEnabled;
             sqThr = shared.squelchThreshold;
             stereo = shared.stereoEnabled;
+            rdsOn = shared.rdsEnabled;
+            centerHz = shared.centerFreq;
             themeID = shared.waterfallTheme;
             currentZoom = shared.zoomLevel;
             viewCenter = shared.viewCenterPct;
@@ -171,6 +179,20 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
         int chunkSize = std::clamp((int)(sr / 20.0), 4096, 262144);
         if (iqBuffer.size() != chunkSize) iqBuffer.resize(chunkSize);
 
+        // RDS runs only in WFM mode. Its data belongs to one station, so it is
+        // cleared whenever the receiver moves to a different frequency.
+        const bool rdsActive = rdsOn && mode == Mode::WFM && RDSDecoder::rateSupported(sr);
+        demod.mpxTapEnabled = rdsActive;
+        if (rdsActive) {
+            long long tunedHz = centerHz + (long long)((targetFreqPct - 0.5) * sr);
+            rdsDecoder.setSampleRate(sr);
+            if (!rdsWasActive || std::llabs(tunedHz - rdsRefFreqHz) > 25000) {
+                rdsDecoder.reset();
+                rdsRefFreqHz = tunedHz;
+            }
+        }
+        rdsWasActive = rdsActive;
+
         int readCount = src->read(iqBuffer.data(), chunkSize);
         if (src->didLoop()) {
             demod.clear();
@@ -203,6 +225,7 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
 
             if (play) {
                 auto audioData = demod.process(chunkToProcess, freqOffset, bw, mode, stereo);
+                if (rdsActive && !demod.mpxTap.empty()) rdsDecoder.process(demod.mpxTap.data(), demod.mpxTap.size());
 
                 if (aprsActive) {
                     std::vector<float> mono;
@@ -221,13 +244,13 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                 static float squelchEnv = 1.0f;
                 if (sqThr > -99.0f) {
                     if (smoothedRssi < sqThr) {
-                        squelchEnv *= 0.9f; // Miękkie zamykanie (fade-out)
+                        squelchEnv *= 0.9f; // Soft close (fade-out)
                     } else {
-                        squelchEnv = 1.0f;  // Błyskawiczne otwieranie
+                        squelchEnv = 1.0f;  // Instant open
                     }
-                    if (squelchEnv < 0.001f) squelchEnv = 0.0f; // Pełna matematyczna cisza w głośniku
+                    if (squelchEnv < 0.001f) squelchEnv = 0.0f; // True digital silence on the speaker
                     
-                    // Przemnóż próbki przez obwiednię
+                    // Multiply the samples by the envelope
                     for (auto& s : audioData) {
                         s *= squelchEnv;
                     }
@@ -260,7 +283,7 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                     viewStartPct = 1.0 - visibleFraction;
                 }
 
-                // Wodospad - używamy precyzji float, by nie obcinać resztek do krawędzi FFT
+                // Waterfall - use float precision so partial bins at the FFT edges aren't cut off
                 float exactStartBin = viewStartPct * FFT_SIZE;
                 float exactEndBin = viewEndPct * FFT_SIZE;
                 float exactVisibleBins = exactEndBin - exactStartBin;
@@ -298,6 +321,7 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                         shared.fftSpectrum = visibleSpectrum;
                         shared.waterfallRow = tempRow;
                         shared.newWaterfallData = true;
+                        shared.rds = rdsActive ? rdsDecoder.getInfo() : RdsInfo();
                         waterfallTimer.restart();
                     }
                 }

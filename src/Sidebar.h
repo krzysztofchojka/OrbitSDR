@@ -208,7 +208,7 @@ public:
         bool isMouseInside = (m.x > x && m.x < x + width && m.y > y && m.y < y + height);
         bool isRelease = ev.is<sf::Event::MouseButtonReleased>();
 
-        // ZAWSZE propaguj zdarzenie puszczenia myszy, żeby widgety mogły się odblokować
+        // ALWAYS propagate mouse release so widgets can unlock themselves
         if (isMouseInside || isRelease || TextInput::currentFocus) {
             if (isMouseInside && !isRelease) captured = true;
             for (auto& mod : modules) {

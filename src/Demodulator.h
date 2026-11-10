@@ -56,7 +56,7 @@ public:
     Complex currentPhasor = Complex(1.0, 0.0);
     DecimatingFIR channelFir;
 
-    // Zmienne NCO dla metody Weavera
+    // NCO state for the Weaver method
     Complex ssbNcoPhase = Complex(1.0, 0.0);
     Complex ssbNcoStep = Complex(1.0, 0.0);
     Complex ssbRestorePhase = Complex(1.0, 0.0);
@@ -91,6 +91,11 @@ public:
 
     Biquad notchL, notchR, cutoffL, cutoffR, audioCutoff;
     bool filtersConfigured = false;
+
+    // Optional copy of the WFM multiplex signal (at sampleRateIn) for the RDS decoder.
+    // Filled by process() while mpxTapEnabled is set and the mode is WFM.
+    bool mpxTapEnabled = false;
+    std::vector<float> mpxTap;
 
     void clear() {
         audioLpfState = 0.0f;
@@ -131,7 +136,10 @@ public:
 
     std::vector<float> process(const std::vector<Complex>& rawIQ, double freqOffset, double bandwidthHz, Mode mode, bool stereoEnabled) {
         std::vector<float> audioOut;
+        mpxTap.clear();
         if (rawIQ.empty()) return audioOut;
+        const bool tapMpx = mpxTapEnabled && mode == Mode::WFM;
+        if (tapMpx) mpxTap.reserve(rawIQ.size());
 
         if (sampleRateIn != lastSampleRateCheck || bandwidthHz != lastBandwidth || mode != lastMode) {
             updatePLLParams();
@@ -157,7 +165,7 @@ public:
             if (audioAlpha > 1.0f) audioAlpha = 1.0f;
         }
 
-        // Europejska De-emfaza (50us)
+        // European de-emphasis (50 us)
         float deemphAlpha = 0.0f;
         if (sampleRateIn > 0) deemphAlpha = 1.0f - std::exp(-1.0f / (sampleRateIn * 50e-6));
 
@@ -168,10 +176,10 @@ public:
                 cutoffL.configureLowPass(15500.0f, (float)sampleRateIn, 0.707f);
                 cutoffR.configureLowPass(15500.0f, (float)sampleRateIn, 0.707f);
 
-                // Parametry dla wąskich emisji
+                // Parameters for narrow modes
                 float firCutoff = bandwidthHz / 2.0f;
                 if (firCutoff < 100.0f) firCutoff = 100.0f;
-                channelFir.configure(firCutoff, (float)sampleRateOut, 101); // Działa na zdecymowanym sygnale!
+                channelFir.configure(firCutoff, (float)sampleRateOut, 101); // Runs on the decimated signal!
                 audioCutoff.configureLowPass(2700.0f, (float)sampleRateOut);
 
                 if (mode == Mode::USB) {
@@ -216,8 +224,9 @@ public:
                 Complex phaseDiff = processedSample * std::conj(lastSample);
                 lastSample = processedSample;
                 float mpxSignal = std::arg(phaseDiff);
+                if (tapMpx) mpxTap.push_back(mpxSignal);
                 
-                // MUTE dla bardzo słabego sygnału FM - usuwa "ciche trzaski" ze szumu
+                // MUTE very weak FM signals - removes quiet crackle from noise
                 float rfMag = std::abs(processedSample);
                 if (rfMag < 0.005f) mpxSignal *= (rfMag / 0.005f);
 
@@ -226,7 +235,7 @@ public:
                 if (stereoEnabled) {
                     float pilotRef = std::sin(pllPhase);
                     float pilotI = mpxSignal * pilotRef;
-                    float pilotQ = mpxSignal * std::cos(pllPhase); // Do oceny blokady
+                    float pilotQ = mpxSignal * std::cos(pllPhase); // Used to estimate the lock
                     
                     pllFreq += pllBeta * pilotI;
                     if (pllFreq < pllMin) pllFreq = pllMin;
@@ -236,7 +245,7 @@ public:
                     if(pllPhase > 2.0*PI) pllPhase -= 2.0*PI;
                     else if(pllPhase < 0.0) pllPhase += 2.0*PI;
 
-                    // Ocena jakości sygnału Stereo - Stereo Blend
+                    // Stereo signal quality estimate - stereo blend
                     wfmPilotLevel = 0.999f * wfmPilotLevel + 0.001f * std::abs(pilotQ);
                     
                     if (wfmPilotLevel > 0.003f) {
@@ -273,7 +282,7 @@ public:
             }
             // --- NARROWBAND PATH (AM/NFM/SSB) ---
             else {
-                // 1. Filtracja antyaliasingowa (Boxcar) i redukcja do 48 kHz
+                // 1. Anti-alias filtering (boxcar) and reduction to 48 kHz
                 nbSum += sample;
                 nbCount++;
                 nbResampleAcc += 1.0;
@@ -292,14 +301,14 @@ public:
                     Complex filtered = {0,0};
 
                     if (mode == Mode::LSB || mode == Mode::USB) {
-                        // Weaver: Przesunięcie pasma do 0 Hz
+                        // Weaver: shift the band to 0 Hz
                         decimated *= ssbNcoPhase;
                         ssbNcoPhase *= ssbNcoStep;
 
                         channelFir.push(decimated);
                         filtered = channelFir.compute();
 
-                        // Weaver: Przesunięcie powrotne
+                        // Weaver: shift back
                         filtered *= ssbRestorePhase;
                         ssbRestorePhase *= ssbRestoreStep;
 
@@ -309,7 +318,7 @@ public:
                             audioNcoNormCounter = 0;
                         }
                     } else {
-                        // AM i NFM po prostu przechodzą przez FIR
+                        // AM and NFM just pass through the FIR
                         channelFir.push(decimated);
                         filtered = channelFir.compute();
                     }

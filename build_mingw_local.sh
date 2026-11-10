@@ -78,7 +78,7 @@ else
     exit 1
 fi
 
-# Bezpieczne kopiowanie WSZYSTKICH systemowych DLLi (w tym libwinpthread-1.dll)
+# Safely copy ALL required system DLLs (including libwinpthread-1.dll)
 echo "Searching for MinGW system DLL files..."
 for dll in $(ldd "$OUT_FILE" | grep "/ucrt64" | awk '{print $3}'); do
     echo "Copying to build: $(basename "$dll")"
@@ -98,7 +98,7 @@ if curl -sSL -f -o rtlsdr_v4.zip "$RTL_ZIP_URL" || wget -q -O rtlsdr_v4.zip "$RT
     echo "Download successful. Injecting ONLY librtlsdr.dll into $BUILD_DIR..."
     unzip -q -o rtlsdr_v4.zip
     
-    # Podmieniamy TYLKO jedną bibliotekę
+    # Replace ONLY this one library
     cp "$RTL_ZIP_DIR/librtlsdr.dll" "$BUILD_DIR/"
     
     # Cleanup

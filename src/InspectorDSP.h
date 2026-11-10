@@ -27,7 +27,7 @@ public:
         if (decimation < 1) decimation = 1;
 
         // 2. Configure NCO (Mixer) to shift frequency to 0 Hz
-        // Dla SSB (USB/LSB) dodajemy kompensację szerokości pasma, aby zrekompensować przesunięcie wstęgi.
+        // For SSB (USB/LSB) add a bandwidth offset to compensate for the sideband shift.
         double ssbTuneOffset = targetFreqOffset;
         if (shared.mode == Mode::USB) ssbTuneOffset += shared.bandwidth / 2.0;
         else if (shared.mode == Mode::LSB) ssbTuneOffset -= shared.bandwidth / 2.0;

@@ -21,7 +21,7 @@ public:
 
     virtual void init(const ModuleContext& ctx) = 0;
     
-    // --- NOWOŚĆ: Metoda do resetowania stanu DSP (bez przeładowania GUI) ---
+    // --- Resets the DSP state (without reloading the GUI) ---
     virtual void reset() {} 
 
     virtual void processAudio(const std::vector<float>& audio) {}

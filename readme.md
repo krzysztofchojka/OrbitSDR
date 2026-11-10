@@ -18,13 +18,14 @@ Please note that this project is in a very early stage of development. It is cur
   - Sound card as baseband source.
 - **Baseband Player:** Play raw IQ `.wav` files with a seekable timeline slider to analyze recordings (for now only 16-bit PCM is supported).
 - **Integrated APRS:** Built-in AX.25 packet decoder with a live dashboard for messages and GPS telemetry (more digital modes planned).
+- **RDS:** Decodes Radio Data System on WFM broadcasts: station name (PS), RadioText, PI code, programme type (PTY), TP/TA flags and clock time.
 - **Recording:** Record both demodulated Audio or raw Baseband IQ data.
 - **Smooth UX:** Responsive waterfall with drag-to-tune, axis panning, and frequency snapping.
 - **Demodulation:** Supports AM, NFM, LSB/USB, and WFM Stereo.
 
 ### To-Do / Known Limitations
 
-- **Decoders:** Currently only APRS (AX.25) is supported, more digital decoders will be added in future updates.
+- **Decoders:** Currently APRS (AX.25) and RDS are supported, more digital decoders will be added in future updates.
 - Add support for 32-bit Float baseband recordings.
 
 ---

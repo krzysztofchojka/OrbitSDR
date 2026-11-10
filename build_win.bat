@@ -1,24 +1,24 @@
 @echo off
-title Kompilacja OrbitSDR (MinGW)
+title OrbitSDR build (MinGW)
 
-:: Domyslna sciezka instalacji MSYS2 (zmien, jesli zainstalowales w innym miejscu)
+:: Default MSYS2 install path (change it if you installed MSYS2 elsewhere)
 set MSYS2_DIR=C:\msys64
 
 if not exist "%MSYS2_DIR%\msys2_shell.cmd" (
-    echo BLAD: Nie znaleziono instalacji MSYS2 w folderze %MSYS2_DIR%.
-    echo Otworz plik run_build.bat w notatniku i popraw zmienna MSYS2_DIR.
+    echo ERROR: MSYS2 installation not found in %MSYS2_DIR%.
+    echo Open build_win.bat in a text editor and fix the MSYS2_DIR variable.
     pause
     exit /b 1
 )
 
-echo Uruchamianie srodowiska MSYS2 UCRT64...
+echo Starting the MSYS2 UCRT64 environment...
 echo.
 
-:: Flagi msys2_shell.cmd:
-:: -ucrt64   : wymusza srodowisko UCRT64
-:: -defterm  : uzywa domyslnego terminala zamiast otwierac nowe okno MinTTY
-:: -no-start : uruchamia w tym samym oknie, zeby zachowac logi po zakonczeniu
-:: -here     : ustawia katalog roboczy na ten, w ktorym znajduje sie plik .bat
-:: -c        : przekazuje komende do wykonania w bashu i czeka na reakcje na koncu
+:: msys2_shell.cmd flags:
+:: -ucrt64   : force the UCRT64 environment
+:: -defterm  : use the default terminal instead of opening a new MinTTY window
+:: -no-start : run in the same window so the logs stay visible afterwards
+:: -here     : use the folder containing this .bat as the working directory
+:: -c        : run the given command in bash and wait for a key press at the end
 
-"%MSYS2_DIR%\msys2_shell.cmd" -ucrt64 -defterm -no-start -here -c "./build_mingw_local.sh; echo ''; read -n 1 -s -r -p 'Kompilacja zakonczona. Nacisnij dowolny klawisz, aby zamknac...'"
+"%MSYS2_DIR%\msys2_shell.cmd" -ucrt64 -defterm -no-start -here -c "./build_mingw_local.sh; echo ''; read -n 1 -s -r -p 'Build finished. Press any key to close...'"

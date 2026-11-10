@@ -15,7 +15,7 @@
   #ifndef NOMINMAX
   #define NOMINMAX
   #endif
-  #include <winsock2.h>   // musi być PRZED windows.h (patrz main.cpp)
+  #include <winsock2.h>   // must come BEFORE windows.h (see main.cpp)
   #include <ws2tcpip.h>
   typedef SOCKET sock_t;
   #define SOCK_INVALID INVALID_SOCKET
@@ -40,31 +40,33 @@
   #endif
 #endif
 
-// Klient protokołu rtl_tcp (https://github.com/osmocom/rtl-sdr -> rtl_tcp.c)
-//  - po połączeniu serwer wysyła 12 bajtów: "RTL0" + tuner_type(BE32) + gain_count(BE32)
-//  - komendy klient->serwer: 5 bajtów [cmd][param BE32]
-//  - dane serwer->klient: IQ 8-bit unsigned, przeplot I,Q,I,Q...
+// rtl_tcp protocol client (https://github.com/osmocom/rtl-sdr -> rtl_tcp.c)
+//  - after connecting the server sends 12 bytes: "RTL0" + tuner_type(BE32) + gain_count(BE32)
+//  - client->server commands: 5 bytes [cmd][param BE32]
+//  - server->client data: 8-bit unsigned IQ, interleaved I,Q,I,Q...
 class RtlTcpSource : public IQSource {
     enum Cmd : uint8_t {
         CMD_FREQ = 0x01, CMD_SAMPLERATE = 0x02, CMD_GAIN_MODE = 0x03,
         CMD_GAIN = 0x04, CMD_AGC_MODE = 0x08, CMD_DIRECT_SAMPLING = 0x09,
-        CMD_BIAS_TEE = 0x0E   // tylko nowsze wersje rtl_tcp, starsze zignorują
+        CMD_BIAS_TEE = 0x0E   // only newer rtl_tcp versions, older ones ignore it
     };
 
     sock_t sock = SOCK_INVALID;
     std::thread worker;
-    std::atomic<bool> running {false};   // wątek odbiorczy żyje
-    std::atomic<bool> active {false};    // play/pause (przy pauzie dane są wyrzucane)
+    std::atomic<bool> running {false};   // receive thread is alive
+    std::atomic<bool> active {false};    // play/pause (data is discarded while paused)
     std::atomic<bool> connectionLost {false};
     std::mutex sendMtx;
     RingBuffer<Complex> ringBuffer;
-    uint32_t sampleRate = 2048000;
+    uint32_t sampleRate = 2048000;   // sample rate seen by the app (after decimation)
+    uint32_t hwSampleRate = 2048000; // sample rate requested from the server
+    IQDecimator decimator;           // used only by the receive thread
     uint32_t tunerType = 0, gainCount = 0;
     std::atomic<long long> centerFreq {100000000};
 
     static const int BUF = 65536;
 
-    // ---------- helpery sieciowe ----------
+    // ---------- network helpers ----------
     static bool initSockets() {
 #ifdef _WIN32
         static bool ok = []() { WSADATA w; return WSAStartup(MAKEWORD(2, 2), &w) == 0; }();
@@ -139,21 +141,23 @@ class RtlTcpSource : public IQSource {
     void workerLoop() {
         std::vector<uint8_t> buf(BUF + 1);
         std::vector<Complex> conv(BUF / 2 + 1);
-        size_t carry = 0;                       // ewentualny nieparzysty bajt z poprzedniego recv
+        size_t carry = 0;                       // possible odd byte left over from the previous recv
         const double inv = 1.0 / 127.5;
         while (running) {
             int n = recv(sock, (char*)buf.data() + carry, BUF, 0);
             if (n > 0) {
-                if (!active) { carry = 0; continue; }   // pauza: opróżniamy gniazdo
+                if (!active) { carry = 0; continue; }   // paused: drain the socket
                 size_t total = carry + (size_t)n;
                 size_t samples = total / 2;
                 for (size_t i = 0; i < samples; i++)
                     conv[i] = Complex((buf[2 * i] - 127.5) * inv, (buf[2 * i + 1] - 127.5) * inv);
-                ringBuffer.push(conv.data(), samples);
+                size_t outCount = 0;
+                const Complex* out = decimator.process(conv.data(), samples, outCount);
+                if (outCount > 0) ringBuffer.push(out, outCount);
                 carry = total % 2;
                 if (carry) buf[0] = buf[total - 1];
             } else if (n == 0) {
-                connectionLost = true; break;           // serwer zamknął połączenie
+                connectionLost = true; break;           // server closed the connection
             } else {
                 if (wouldTimeout()) continue;
                 connectionLost = true; break;
@@ -165,7 +169,7 @@ public:
     RtlTcpSource() : ringBuffer(4 * 1024 * 1024) {}
     ~RtlTcpSource() { close(); }
 
-    // id = "host" albo "host:port" (domyślnie 1234)
+    // id = "host" or "host:port" (default 1234)
     bool open(std::string id, uint32_t requestedRate = 0) override {
         close();
         if (!initSockets()) return false;
@@ -189,7 +193,7 @@ public:
 #ifdef SO_NOSIGPIPE
         setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, (const char*)&one, sizeof(one));
 #endif
-        // --- nagłówek 12 B ("RTL0") ---
+        // --- 12-byte header ("RTL0") ---
         setRecvTimeout(sock, 500);
         uint8_t hdr[12]; int got = 0;
         auto t0 = std::chrono::steady_clock::now();
@@ -205,8 +209,18 @@ public:
         tunerType = ((uint32_t)hdr[4] << 24) | (hdr[5] << 16) | (hdr[6] << 8) | hdr[7];
         gainCount = ((uint32_t)hdr[8] << 24) | (hdr[9] << 16) | (hdr[10] << 8) | hdr[11];
 
-        sampleRate = requestedRate > 0 ? requestedRate : 2048000;
-        sendCmd(CMD_SAMPLERATE, sampleRate);
+        if (requestedRate == 0) requestedRate = 2048000;
+        if (requestedRate < RTL_MIN_HW_RATE) {
+            // Low sample rate: run the server at 2.048 MSps and decimate in software
+            hwSampleRate = RTL_DECIM_BASE_RATE;
+            decimator.setFactor(computeDecimationFactor(hwSampleRate, requestedRate));
+        } else {
+            hwSampleRate = requestedRate;
+            decimator.setFactor(1);
+        }
+        decimator.reset();
+        sampleRate = hwSampleRate / decimator.getFactor();
+        sendCmd(CMD_SAMPLERATE, hwSampleRate);
         sendCmd(CMD_FREQ, (uint32_t)centerFreq.load());
         sendCmd(CMD_GAIN_MODE, 0);   // auto
         sendCmd(CMD_AGC_MODE, 1);
@@ -252,7 +266,7 @@ public:
         } else {
             sendCmd(CMD_GAIN_MODE, 1);
             sendCmd(CMD_AGC_MODE, 0);
-            sendCmd(CMD_GAIN, (uint32_t)(db * 10));   // w 0.1 dB, jak w librtlsdr
+            sendCmd(CMD_GAIN, (uint32_t)(db * 10));   // in 0.1 dB units, as in librtlsdr
         }
         ringBuffer.clear();
     }
@@ -263,9 +277,9 @@ public:
     }
 
     std::vector<std::string> getAvailableSampleRatesText() override {
-        return {"1.4 MSps", "1.8 MSps", "2.048 MSps", "2.4 MSps", "3.2 MSps"};
+        return RTL_SAMPLE_RATES_TXT;
     }
     std::vector<uint32_t> getAvailableSampleRatesValues() override {
-        return {1400000, 1800000, 2048000, 2400000, 3200000};
+        return RTL_SAMPLE_RATES;
     }
 };

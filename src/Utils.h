@@ -78,50 +78,50 @@ inline sf::Color getHeatmap(float v, int theme) {
     std::uint8_t r=0,g=0,b=0;
     
     if (theme == 0) {
-        // 1. Magia kontrastu: krzywa gamma "zgniatająca" szumy tła
-        // Wartości bliskie zera ciemnieją mocniej, sygnały pozostają jasne
+        // 1. Contrast trick: a gamma curve that "squashes" the background noise
+        // Values near zero get darker, signals stay bright
         v = std::pow(v, 1.2f); 
         
-        // 2. Wielostopniowa paleta kolorów
-        if (v < 0.2f) { // Czarne tło -> Ciemny granat
+        // 2. Multi-stop colour palette
+        if (v < 0.2f) { // Black background -> dark navy
             float t = v / 0.2f;
             r = 0; g = 0; b = static_cast<std::uint8_t>(t * 120);
-        } else if (v < 0.4f) { // Granat -> Jasnoniebieski
+        } else if (v < 0.4f) { // Dark navy -> light blue
             float t = (v - 0.2f) / 0.2f;
             r = 0; g = static_cast<std::uint8_t>(t * 150); b = 120 + static_cast<std::uint8_t>(t * 135);
-        } else if (v < 0.6f) { // Jasnoniebieski -> Żółto-Zielony
+        } else if (v < 0.6f) { // Light blue -> yellow-green
             float t = (v - 0.4f) / 0.2f;
             r = static_cast<std::uint8_t>(t * 180); g = 150 + static_cast<std::uint8_t>(t * 105); b = 255 - static_cast<std::uint8_t>(t * 200);
-        } else if (v < 0.8f) { // Żółto-Zielony -> Czysty Żółty
+        } else if (v < 0.8f) { // Yellow-green -> pure yellow
             float t = (v - 0.6f) / 0.2f;
             r = 180 + static_cast<std::uint8_t>(t * 75); g = 255; b = 55 - static_cast<std::uint8_t>(t * 55);
-        } else if (v < 0.95f) { // Żółty -> Czerwony (Mocne sygnały)
+        } else if (v < 0.95f) { // Yellow -> red (strong signals)
             float t = (v - 0.8f) / 0.15f;
             r = 255; g = 255 - static_cast<std::uint8_t>(t * 220); b = 0;
-        } else { // Czerwony -> Biały (Absolutne przesterowanie na czubkach)
+        } else { // Red -> white (full overload at the peaks)
             float t = (v - 0.95f) / 0.05f;
             r = 255; g = 35 + static_cast<std::uint8_t>(t * 220); b = static_cast<std::uint8_t>(t * 255);
         }
     } 
-    else if (theme == 1 || theme == 4) { // INTELIGENTNY NEON (Synthwave z ciemnym tłem)
+    else if (theme == 1 || theme == 4) { // SMART NEON (synthwave with a dark background)
         v = std::pow(v, 1.2f); 
         
-        if (v < 0.2f) { // Szum tła: Czarny -> Ciemny granat (uspokojone tło)
+        if (v < 0.2f) { // Background noise: black -> dark navy (calm background)
             float t = v / 0.2f;
             r = 0; g = 0; b = static_cast<std::uint8_t>(t * 120);
-        } else if (v < 0.4f) { // Słabe sygnały: Ciemny granat -> Elektryczna Purpura
+        } else if (v < 0.4f) { // Weak signals: dark navy -> electric purple
             float t = (v - 0.2f) / 0.2f;
             r = static_cast<std::uint8_t>(t * 150); g = 0; b = 120 + static_cast<std::uint8_t>(t * 80);
-        } else if (v < 0.6f) { // Średnie sygnały: Purpura -> Gorąca Magenta (Hot Pink)
+        } else if (v < 0.6f) { // Medium signals: purple -> hot magenta (hot pink)
             float t = (v - 0.4f) / 0.2f;
             r = 150 + static_cast<std::uint8_t>(t * 105); g = 0; b = 200 - static_cast<std::uint8_t>(t * 50);
-        } else if (v < 0.8f) { // Mocne sygnały: Magenta -> Neonowy Pomarańcz
+        } else if (v < 0.8f) { // Strong signals: magenta -> neon orange
             float t = (v - 0.6f) / 0.2f;
             r = 255; g = static_cast<std::uint8_t>(t * 120); b = 150 - static_cast<std::uint8_t>(t * 150);
-        } else if (v < 0.95f) { // Bardzo mocne: Pomarańcz -> Jasny Żółto-Biały
+        } else if (v < 0.95f) { // Very strong: orange -> light yellow-white
             float t = (v - 0.8f) / 0.15f;
             r = 255; g = 120 + static_cast<std::uint8_t>(t * 100); b = static_cast<std::uint8_t>(t * 100);
-        } else { // Przesterowanie/Piki: Żółto-Biały -> Czysta Biel
+        } else { // Overload/peaks: yellow-white -> pure white
             float t = (v - 0.95f) / 0.05f;
             r = 255; g = 220 + static_cast<std::uint8_t>(t * 35); b = 100 + static_cast<std::uint8_t>(t * 155);
         }
@@ -158,7 +158,7 @@ inline void drawGrid(sf::RenderWindow& window, const sf::Font& font, float x, fl
         float normPos = (float)((f - startFreq) / visibleSpan);
         float xPos = x + normPos * w;
         
-        // Przedłużamy linię, aby weszła jako "znacznik" na czarny pasek
+        // Extend the line so it shows as a tick mark on the black bar
         sf::RectangleShape line({1, h + 8}); 
         line.setPosition(sf::Vector2f(xPos, y));
         line.setFillColor(sf::Color(80, 80, 80, 100));

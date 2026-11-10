@@ -80,7 +80,7 @@ if curl -sSL -f -o rtlsdr_v4.zip "$RTL_ZIP_URL" || wget -q -O rtlsdr_v4.zip "$RT
     echo "Download successful. Injecting ONLY librtlsdr.dll..."
     unzip -q -o rtlsdr_v4.zip
     
-    # Podmieniamy TYLKO jedną bibliotekę, resztę zostawiamy systemową!
+    # Replace ONLY this one library, keep the rest from the system!
     cp "$RTL_ZIP_DIR/librtlsdr.dll" .
     
     # Cleanup
