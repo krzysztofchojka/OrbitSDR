@@ -61,6 +61,28 @@ class RtlTcpSource : public IQSource {
     uint32_t sampleRate = 2048000;   // sample rate seen by the app (after decimation)
     uint32_t hwSampleRate = 2048000; // sample rate requested from the server
     IQDecimator decimator;           // used only by the receive thread
+    RtlSoftAgc agc;                  // guarded by agcMtx (UI thread sets the mode, receive thread steps)
+    std::mutex agcMtx;
+
+    // rtl_tcp doesn't send the gain table; these are librtlsdr's tables per tuner type
+    static std::vector<int> tunerGains(uint32_t tuner) {
+        if (tuner == 5 || tuner == 6)   // R820T / R828D
+            return {0, 9, 14, 27, 37, 77, 87, 125, 144, 157, 166, 197, 207, 229, 254, 280, 297,
+                    328, 338, 364, 372, 386, 402, 421, 434, 439, 445, 480, 496};
+        if (tuner == 1)                 // E4000
+            return {-10, 15, 40, 65, 90, 115, 140, 165, 190, 215, 240, 290, 340, 420};
+        return {};
+    }
+
+    // AGC mode: software AGC when the gain table is known, else the tuner's own AGC.
+    // The RTL2832 digital AGC stays off (it overloads the ADC, see RtlSoftAgc).
+    void startAgc() {
+        std::lock_guard<std::mutex> l(agcMtx);
+        agc.start();
+        sendCmd(CMD_AGC_MODE, 0);
+        if (agc.enabled) { sendCmd(CMD_GAIN_MODE, 1); sendCmd(CMD_GAIN, (uint32_t)agc.gain()); }
+        else sendCmd(CMD_GAIN_MODE, 0);
+    }
     uint32_t tunerType = 0, gainCount = 0;
     std::atomic<long long> centerFreq {100000000};
 
@@ -148,6 +170,10 @@ class RtlTcpSource : public IQSource {
             if (n > 0) {
                 if (!active) { carry = 0; continue; }   // paused: drain the socket
                 size_t total = carry + (size_t)n;
+                {
+                    std::lock_guard<std::mutex> l(agcMtx);
+                    if (agc.analyse(buf.data(), total)) sendCmd(CMD_GAIN, (uint32_t)agc.gain());
+                }
                 size_t samples = total / 2;
                 for (size_t i = 0; i < samples; i++)
                     conv[i] = Complex((buf[2 * i] - 127.5) * inv, (buf[2 * i + 1] - 127.5) * inv);
@@ -222,8 +248,12 @@ public:
         sampleRate = hwSampleRate / decimator.getFactor();
         sendCmd(CMD_SAMPLERATE, hwSampleRate);
         sendCmd(CMD_FREQ, (uint32_t)centerFreq.load());
-        sendCmd(CMD_GAIN_MODE, 0);   // auto
-        sendCmd(CMD_AGC_MODE, 1);
+        {
+            std::lock_guard<std::mutex> l(agcMtx);
+            agc.gains = tunerGains(tunerType);
+            agc.index = -1;
+        }
+        startAgc();
 
         connectionLost = false;
         running = true;
@@ -252,6 +282,12 @@ public:
     double getSampleRate() override { return (double)sampleRate; }
     bool isHardware() override { return true; }
     bool isConnectionLost() const { return connectionLost; }
+    float getAutoGainDb() override { int g = agc.gainTenths; return g < 0 ? -1.0f : g / 10.0f; }
+    float getOverloadFraction() override { return agc.overload; }
+    int getAgcStep() override { return agc.currentStep; }
+    int getAgcStepCount() override { std::lock_guard<std::mutex> l(agcMtx); return (int)agc.gains.size(); }
+    void setAgcMaxStep(int step) override { agc.maxStep = step; }
+    bool isAgcLimited() override { return agc.maxStep >= 0 && agc.currentStep >= 0; }
 
     void setCenterFrequency(long long hz) override {
         centerFreq = hz;
@@ -261,9 +297,9 @@ public:
 
     void setGain(int db) override {
         if (db == -1) {
-            sendCmd(CMD_GAIN_MODE, 0);
-            sendCmd(CMD_AGC_MODE, 1);
+            startAgc();
         } else {
+            { std::lock_guard<std::mutex> l(agcMtx); agc.stop(); }
             sendCmd(CMD_GAIN_MODE, 1);
             sendCmd(CMD_AGC_MODE, 0);
             sendCmd(CMD_GAIN, (uint32_t)(db * 10));   // in 0.1 dB units, as in librtlsdr

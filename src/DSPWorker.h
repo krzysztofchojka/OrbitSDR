@@ -8,6 +8,8 @@
 #include "APRS_Decoder.h"
 #include "RDS_Decoder.h"
 #include "AudioLeveler.h"
+#include "RdsGainOptimizer.h"
+#include <chrono>
 #include "InspectorDSP.h"
 #include "WavWriter.h"
 #include "Settings.h"
@@ -23,6 +25,10 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
     InspectorDSP inspector;
     RDSDecoder rdsDecoder;
     AudioLeveler leveler;
+    RdsGainOptimizer rdsGainOpt;
+    bool rdsGainOptActive = false;
+    IQSource* lastSrc = nullptr;
+    const auto dspStart = std::chrono::steady_clock::now();
     long long rdsRefFreqHz = 0;    // tuned frequency the current RDS data belongs to
     bool rdsWasActive = false;
 
@@ -191,6 +197,8 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
             if (!rdsWasActive || std::llabs(tunedHz - rdsRefFreqHz) > 25000) {
                 rdsDecoder.reset();
                 rdsRefFreqHz = tunedHz;
+                rdsGainOpt.reset();               // new station: start again from the plain AGC
+                src->setAgcMaxStep(-1);
             }
         }
         rdsWasActive = rdsActive;
@@ -232,6 +240,21 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                 }
                 auto audioData = demod.process(chunkToProcess, freqOffset, bw, mode, stereo);
                 if (rdsActive && !demod.mpxTap.empty()) rdsDecoder.process(demod.mpxTap.data(), demod.mpxTap.size());
+
+                // RDS assisted gain: while the software AGC runs, tune its gain limit for the
+                // lowest RDS block error rate (see RdsGainOptimizer)
+                if (src.get() != lastSrc) { rdsGainOpt.reset(); lastSrc = src.get(); }   // another radio
+                const int agcStep = src->getAgcStep();
+                if (rdsActive && agcStep >= 0) {
+                    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - dspStart).count();
+                    const RdsInfo ri = rdsDecoder.getInfo();
+                    src->setAgcMaxStep(rdsGainOpt.update(now, ri.synced, ri.blockErrorRate, agcStep, src->getAgcStepCount()));
+                    rdsGainOptActive = true;
+                } else if (rdsGainOptActive) {
+                    rdsGainOpt.reset();
+                    src->setAgcMaxStep(-1);
+                    rdsGainOptActive = false;
+                }
 
                 if (aprsActive) {
                     std::vector<float> mono;

@@ -71,6 +71,17 @@ public:
     virtual void seek(double percent) {}
     virtual double getProgress() { return 0.0; }
 
+    // Current gain chosen by the software AGC in dB, or a negative value if not available
+    virtual float getAutoGainDb() { return -1.0f; }
+    // Recent fraction of ADC samples at full scale (0 = no overload)
+    virtual float getOverloadFraction() { return 0.0f; }
+    // Software AGC gain steps (for the RDS assisted tuning): the current step (-1 = AGC off),
+    // the number of steps, and the highest step the AGC may use (-1 = no limit)
+    virtual int getAgcStep() { return -1; }
+    virtual int getAgcStepCount() { return 0; }
+    virtual void setAgcMaxStep(int /*step*/) {}
+    virtual bool isAgcLimited() { return false; }
+
     // --- Loop detection ---
     // Returns true only once, at the moment the file wrapped back to the start
     virtual bool didLoop() { return false; }
@@ -290,6 +301,71 @@ public:
     std::vector<uint32_t> getAvailableSampleRatesValues() override { return {0}; }
 };
 
+// --- SOFTWARE AGC FOR 8-BIT RTL-SDR SAMPLES ---
+// The RTL2832 digital AGC (and the tuner's own AGC) happily drive the 8-bit ADC into
+// clipping on strong broadcast stations. The audio survives that, but weak parts of the
+// signal such as the RDS subcarrier get buried in the intermodulation products.
+// This AGC steps the tuner gain so the samples stay clear of full scale: down quickly
+// when samples clip, up slowly when the level is low. The target level is kept low
+// (RMS 0.06 .. 0.18 of full scale): with several strong local FM stations the tuner
+// itself produces intermodulation well before the ADC clips. The 8-bit ADC still has
+// about 40 dB of headroom above its quantisation noise at these levels.
+class RtlSoftAgc {
+public:
+    std::vector<int> gains;        // available tuner gains in 0.1 dB, ascending
+    int index = -1;
+    bool enabled = false;
+    std::atomic<float> overload {0.0f};   // smoothed fraction of clipped samples
+    std::atomic<int> gainTenths {-1};     // current gain for the UI
+    std::atomic<int> currentStep {-1};    // current index into 'gains', -1 = AGC off
+    std::atomic<int> maxStep {-1};        // highest index allowed (set by the RDS assisted tuning)
+
+    void start() {
+        enabled = !gains.empty();
+        if (!enabled) return;
+        if (index < 0) index = (int)gains.size() / 2;   // start in the middle of the range
+        holdoff = 1;
+        gainTenths = gains[index];
+        currentStep = index;
+    }
+    void stop() { enabled = false; gainTenths = -1; currentStep = -1; maxStep = -1; }
+
+    // Looks at a buffer of interleaved 8-bit I/Q bytes. Returns true when the gain should change.
+    bool analyse(const uint8_t* b, size_t n) {
+        if (n == 0) return false;
+        size_t clipped = 0;
+        double sum = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            const uint8_t v = b[i];
+            if (v <= 1 || v >= 254) clipped++;
+            const double x = (v - 127.5) / 127.5;
+            sum += x * x;
+        }
+        const float clipFrac = (float)clipped / (float)n;
+        const float rms = (float)std::sqrt(sum / n);
+        overload = 0.7f * overload.load() + 0.3f * clipFrac;
+        if (!enabled) return false;
+        if (holdoff > 0) { holdoff--; return false; }
+
+        int next = index;
+        if (clipFrac > 0.0001f || rms > 0.18f) next = index - (clipFrac > 0.01f ? 3 : 1);
+        else if (clipped == 0 && rms < 0.06f) next = index + 1;
+        const int limit = maxStep;
+        if (limit >= 0 && next > limit) next = limit;   // limit from the RDS assisted tuning
+        next = std::clamp(next, 0, (int)gains.size() - 1);
+        if (next == index) return false;
+        index = next;
+        holdoff = 2;   // let the new gain settle before judging again
+        gainTenths = gains[index];
+        currentStep = index;
+        return true;
+    }
+    int gain() const { return gains[index]; }
+
+private:
+    int holdoff = 0;
+};
+
 // --- RTL-SDR SOURCE ---
 class RtlSdrSource : public IQSource {
     rtlsdr_dev_t* dev = nullptr;
@@ -310,6 +386,7 @@ class RtlSdrSource : public IQSource {
     
     std::mutex hwMtx; // Only guards the 'dev' pointer during open/close
     std::vector<int> availableGains;
+    RtlSoftAgc agc;   // used only by the worker thread (its atomics are read by the UI)
 
     // USB read buffer (a multiple of 16k is optimal for RTL)
     static const int USB_BUFFER_SIZE = 16 * 16384; 
@@ -357,7 +434,7 @@ public:
         rtlsdr_set_sample_rate(dev, hwSampleRate);
         rtlsdr_set_center_freq(dev, currentCenterFreq);
         rtlsdr_set_tuner_gain_mode(dev, 0);
-        rtlsdr_set_agc_mode(dev, 1);
+        rtlsdr_set_agc_mode(dev, 0);   // the RTL2832 digital AGC overloads the ADC (see RtlSoftAgc)
         rtlsdr_reset_buffer(dev);
         
         int count = rtlsdr_get_tuner_gains(dev, NULL);
@@ -365,6 +442,8 @@ public:
             availableGains.resize(count); 
             rtlsdr_get_tuner_gains(dev, availableGains.data()); 
         }
+        agc.gains = availableGains;
+        std::sort(agc.gains.begin(), agc.gains.end());
         return true;
     }
 
@@ -410,11 +489,18 @@ public:
                 if (newGain != -999) {
                     if (dev) {
                         if (newGain == -1) {
-                            // Turn AGC back on
-                            rtlsdr_set_tuner_gain_mode(dev, 0); 
-                            rtlsdr_set_agc_mode(dev, 1);        
+                            // AGC: software AGC on the tuner gain (manual gain mode underneath)
+                            rtlsdr_set_agc_mode(dev, 0);
+                            agc.start();
+                            if (agc.enabled) {
+                                rtlsdr_set_tuner_gain_mode(dev, 1);
+                                rtlsdr_set_tuner_gain(dev, agc.gain());
+                            } else {
+                                rtlsdr_set_tuner_gain_mode(dev, 0);   // no gain table: tuner AGC
+                            }
                         } else {
-                            // Turn AGC off (manual mode)
+                            // Manual gain
+                            agc.stop();
                             rtlsdr_set_tuner_gain_mode(dev, 1); 
                             rtlsdr_set_agc_mode(dev, 0);        
                             
@@ -445,6 +531,9 @@ public:
             }
 
             if (n_read > 0) {
+                // Software AGC: small gain steps, the samples are not thrown away
+                if (agc.analyse(buffer.data(), (size_t)n_read) && dev) rtlsdr_set_tuner_gain(dev, agc.gain());
+
                 int samples = n_read / 2;
                 std::vector<Complex> converted(samples);
                 
@@ -483,6 +572,12 @@ public:
     
     double getSampleRate() override { return (double)sampleRate; }
     bool isHardware() override { return true; }
+    float getAutoGainDb() override { int g = agc.gainTenths; return g < 0 ? -1.0f : g / 10.0f; }
+    float getOverloadFraction() override { return agc.overload; }
+    int getAgcStep() override { return agc.currentStep; }
+    int getAgcStepCount() override { return (int)agc.gains.size(); }
+    void setAgcMaxStep(int step) override { agc.maxStep = step; }
+    bool isAgcLimited() override { return agc.maxStep >= 0 && agc.currentStep >= 0; }
     
     void setCenterFrequency(long long hz) override {
         pendingCenterFreq = hz;

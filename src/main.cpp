@@ -82,7 +82,16 @@ int main() {
 
     sf::ContextSettings settings;
     settings.antiAliasingLevel = 8;
-    sf::RenderWindow window(sf::VideoMode::getDesktopMode(), "OrbitSDR", sf::Style::Default, sf::State::Windowed, settings);
+    // Open at 85 % of the screen, centred. A window as large as the screen would hide its
+    // bottom part (timeline, status bar) behind the taskbar / dock.
+    const sf::VideoMode desktop = sf::VideoMode::getDesktopMode();
+    const sf::Vector2u startSize{ desktop.size.x * 85 / 100, desktop.size.y * 85 / 100 };
+    sf::RenderWindow window(sf::VideoMode(startSize), "OrbitSDR", sf::Style::Default, sf::State::Windowed, settings);
+    window.setPosition({ (int)(desktop.size.x - startSize.x) / 2, (int)(desktop.size.y - startSize.y) / 2 });
+#ifdef _WIN32
+    // On Windows start maximised: the system fits the window into the area above the taskbar
+    ShowWindow((HWND)window.getNativeHandle(), SW_MAXIMIZE);
+#endif
     window.setFramerateLimit(60);
 
     // Icon: looked up next to the executable and in ../Resources (macOS bundle)
@@ -245,6 +254,16 @@ int main() {
     };
 
     chkAgc->onToggle = [&](bool b) {
+        if (!b) {
+            // Switching to manual: carry on from the gain the AGC had chosen, and show it as manual
+            float agcGain = -1.0f;
+            {
+                std::lock_guard<std::mutex> l(sourceMtx);
+                if (currentSource) agcGain = currentSource->getAutoGainDb();
+            }
+            if (agcGain >= 0.0f) slGain->setValueSilent(agcGain);
+            slGain->onChange(slGain->currentVal);   // updates the label and queues the gain
+        }
         std::lock_guard<std::mutex> l(sharedData.mtx);
         sharedData.rfGain = b ? -1.0f : slGain->currentVal;
         slGain->setEnabled(!b);
@@ -785,11 +804,11 @@ int main() {
     };
     modDecoders->addWidget(chkAprs);
 
-    btnCopyAprs->onClick = [&](){
+    /*btnCopyAprs->onClick = [&](){
         std::lock_guard<std::mutex> l(sharedData.mtx);
         sf::Clipboard::setString(sharedData.lastAprs.raw);
     };
-    modDecoders->addWidget(btnCopyAprs);
+    modDecoders->addWidget(btnCopyAprs);*/
 
     chkAIS->onToggle = [&](bool b) {
         std::lock_guard<std::mutex> l(sharedData.mtx);
@@ -1198,13 +1217,30 @@ int main() {
         bool isHw = false;
         double hwSampleRate = 2e6;
         double prog = 0.0;
+        float autoGainDb = -1.0f;
+        float adcOverload = 0.0f;
+        bool agcLimitedByRds = false;
         {
             std::lock_guard<std::mutex> l(sourceMtx);
             if (currentSource) {
                 isHw = currentSource->isHardware();
                 hwSampleRate = currentSource->getSampleRate();
                 prog = currentSource->getProgress();
+                autoGainDb = currentSource->getAutoGainDb();
+                adcOverload = currentSource->getOverloadFraction();
+                agcLimitedByRds = currentSource->isAgcLimited();
             }
+        }
+
+        // Show the gain the software AGC has chosen next to the RF gain slider
+        if (chkAgc->checked) {
+            std::string agcText = "RF Gain: AGC";
+            if (autoGainDb >= 0.0f) {
+                char b[64];
+                std::snprintf(b, sizeof(b), agcLimitedByRds ? "RF Gain: AGC (%.1f dB, tuned for RDS)" : "RF Gain: AGC (%.1f dB)", autoGainDb);
+                agcText = b;
+            }
+            if (slGain->label.getString() != agcText) slGain->setText(agcText);
         }
 
         // RTL-TCP: detect that the server dropped the connection and reset the UI
@@ -2174,53 +2210,62 @@ int main() {
             drawLED("REC", sharedData.isRecording, sf::Color(255, 50, 50));
             drawLED("HW", isHw, sf::Color(50, 255, 100));
 
-            float meterW = 400.0f;
-            float meterX = (layout.specW / 2.0f) - (meterW / 2.0f);
-
-            int centerBin = std::clamp((int)(tunePct * spectrum.size()), 0, (int)spectrum.size() - 1);
-            float currentPower = spectrum.empty() ? -127.0f : spectrum[centerBin];
-
-            float minPwr = -127.0f;
-            float maxPwr = -20.0f;
-            float fillPct = std::clamp((currentPower - minPwr) / (maxPwr - minPwr), 0.0f, 1.0f);
-
-            sf::RectangleShape sBg({meterW, 12.0f});
-            sBg.setPosition({meterX, statusY + 20.0f});
-            sBg.setFillColor(sf::Color(20, 20, 20));
-            window.draw(sBg);
-
-            float fillW = meterW * fillPct;
-            float s9ThresholdW = meterW * ((-73.0f - minPwr) / (maxPwr - minPwr));
-            (void)s9ThresholdW;
-
-            sf::RectangleShape sFill({fillW, 12.0f});
-            sFill.setPosition({meterX, statusY + 20.0f});
-            sFill.setFillColor(currentPower > -73.0f ? sf::Color(255, 60, 60) : sf::Color(60, 255, 60));
-            window.draw(sFill);
-
-            int sUnit = std::clamp(std::round((currentPower + 127.0f) / 6.0f), 0.0f, 9.0f);
-            std::string sTextStr = "S" + std::to_string(sUnit);
-            if (currentPower > -73.0f) {
-                int plusDb = std::round(currentPower - (-73.0f));
-                sTextStr = "S9+" + std::to_string(plusDb) + "dB";
+            // --- SIGNAL METER ---
+            // The spectrum levels are relative to the ADC full scale (dBFS) and change with the
+            // RF gain, so they can't be shown as calibrated dBm or S units. Instead the meter
+            // shows how far the tuned signal is above the noise floor (SNR).
+            const float meterW = 260.0f;
+            const float meterX = (layout.specW / 2.0f) - (meterW / 2.0f);
+            float snrDb = -1.0f;
+            double signalDb = -127.0;
+            const double viewW = viewEndPct - viewStartPct;
+            if (!spectrum.empty() && viewW > 0.0 && tunePct >= viewStartPct && tunePct <= viewEndPct) {
+                const int n = (int)spectrum.size();
+                std::vector<double> sorted(spectrum.begin(), spectrum.end());
+                const size_t q = sorted.size() / 5;   // noise floor: 20th percentile of the visible bins
+                std::nth_element(sorted.begin(), sorted.begin() + q, sorted.end());
+                const double floorDb = sorted[q];
+                const double half = std::max(slBW->currentVal / hwSampleRate, 1.0 / n) / 2.0;
+                int b0 = (int)(((tunePct - half) - viewStartPct) / viewW * n);
+                int b1 = (int)(((tunePct + half) - viewStartPct) / viewW * n);
+                b0 = std::clamp(b0, 0, n - 1);
+                b1 = std::clamp(b1, b0, n - 1);
+                for (int b = b0; b <= b1; b++) signalDb = std::max(signalDb, spectrum[b]);
+                snrDb = (float)std::max(0.0, signalDb - floorDb);
             }
 
-            std::stringstream pwrFmt;
-            pwrFmt << std::fixed << std::setprecision(1) << currentPower << " dBm";
-
-            sf::Text sValTxt(font, sTextStr + " / " + pwrFmt.str(), 24);
+            sf::RectangleShape sBg({meterW, 8.0f});
+            sBg.setPosition({meterX, statusY + 22.0f});
+            sBg.setFillColor(sf::Color(20, 20, 22));
+            window.draw(sBg);
+            if (snrDb > 0.0f) {
+                sf::RectangleShape sFill({meterW * std::clamp(snrDb / 60.0f, 0.0f, 1.0f), 8.0f});
+                sFill.setPosition({meterX, statusY + 22.0f});
+                sFill.setFillColor(Theme::AccentDim);
+                window.draw(sFill);
+            }
+            for (int db = 10; db < 60; db += 10) {   // a tick every 10 dB
+                sf::RectangleShape tick({1.0f, 8.0f});
+                tick.setPosition({meterX + meterW * db / 60.0f, statusY + 22.0f});
+                tick.setFillColor(sf::Color(70, 70, 75));
+                window.draw(tick);
+            }
+            char meterTxt[64];
+            if (snrDb >= 0.0f) std::snprintf(meterTxt, sizeof(meterTxt), "SNR %.0f dB   (%.0f dBFS)", snrDb, signalDb);
+            else std::snprintf(meterTxt, sizeof(meterTxt), "SNR --");
+            sf::Text sValTxt(font, meterTxt, 22);
             sValTxt.setScale({0.5f, 0.5f});
-            sValTxt.setPosition({meterX, statusY + 2.0f});
-            sValTxt.setFillColor(Theme::Accent);
+            sValTxt.setPosition({meterX, statusY + 5.0f});
+            sValTxt.setFillColor(sf::Color(170, 170, 180));
             window.draw(sValTxt);
 
-            for (int s = 1; s <= 9; s += 2) {
-                float markerDb = -127.0f + (s * 6.0f);
-                float mPct = (markerDb - minPwr) / (maxPwr - minPwr);
-                sf::RectangleShape tick({2.0f, 4.0f});
-                tick.setPosition({meterX + (meterW * mPct), statusY + 16.0f});
-                tick.setFillColor(sf::Color(150, 150, 150));
-                window.draw(tick);
+            // The ADC clips: the signal is distorted (weak signals and RDS suffer first)
+            if (adcOverload > 0.0002f) {
+                sf::Text ov(font, "ADC OVERLOAD - lower the RF gain", 22);
+                ov.setScale({0.5f, 0.5f});
+                ov.setPosition({meterX + meterW + 16.0f, statusY + 14.0f});
+                ov.setFillColor(sf::Color(255, 150, 60));
+                window.draw(ov);
             }
         }
 
