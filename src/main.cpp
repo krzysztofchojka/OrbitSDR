@@ -35,6 +35,8 @@
 // Custom Decoders
 #include "modules/Core/SDRModule.h"
 #include "modules/AIS/AIS_Decoder.h"
+#include "modules/ImageDecoders/SSTV_Module.h"
+#include "modules/ImageDecoders/WEFAX_Module.h"
 
 int main() {
     #ifdef _WIN32
@@ -132,6 +134,25 @@ int main() {
     modules.push_back(std::move(aisMod));
     AISDecoder* ptrAIS = (AISDecoder*)modules[0].get();
 
+    // Image decoders save their pictures into the picture folder: the one chosen by the
+    // user, or OrbitSDR inside the system Pictures folder
+    std::string pictureDirCustom = settingsMgr.getString("picture_path", "");
+    std::string pictureDirDefault = getDefaultPicturesPath();
+    auto pictureDir = [&]() { return pictureDirCustom.empty() ? pictureDirDefault : pictureDirCustom; };
+    auto setPictureDir = [&](const std::string& d) { pictureDirCustom = d; };
+    auto sstvMod = std::make_unique<SSTVModule>();
+    sstvMod->init(ctx);
+    sstvMod->saveDir = pictureDir;
+    sstvMod->setSaveDir = setPictureDir;
+    SSTVModule* ptrSSTV = sstvMod.get();
+    modules.push_back(std::move(sstvMod));
+    auto wefaxMod = std::make_unique<WEFAXModule>();
+    wefaxMod->init(ctx);
+    wefaxMod->saveDir = pictureDir;
+    wefaxMod->setSaveDir = setPictureDir;
+    WEFAXModule* ptrWEFAX = wefaxMod.get();
+    modules.push_back(std::move(wefaxMod));
+
     auto cursorArrow = sf::Cursor::createFromSystem(sf::Cursor::Type::Arrow);
     auto cursorHand = sf::Cursor::createFromSystem(sf::Cursor::Type::Hand);
     auto cursorSizeH = sf::Cursor::createFromSystem(sf::Cursor::Type::SizeHorizontal);
@@ -152,7 +173,15 @@ int main() {
     btnPlay.setColor(sf::Color(116, 57, 57));
     SdrButton btnMute(40, 40, "M", font);
 
-    Slider volSlider(150, 0.0f, 4.0f, 1.0f, "Volume", font);
+    // Volume slider: the position maps to -40 .. +8 dB, so the low levels are easy to set
+    auto volumeGain = [](float pos) { return pos <= 0.001f ? 0.0f : std::pow(10.0f, (pos * 48.0f - 40.0f) / 20.0f); };
+    auto volumeText = [](float pos) {
+        if (pos <= 0.001f) return std::string("Volume: muted");
+        char b[32]; std::snprintf(b, sizeof(b), "Volume: %+.0f dB", pos * 48.0f - 40.0f); return std::string(b);
+    };
+    float savedVolPos = std::clamp(settingsMgr.getFloat("volume_pos", 0.7f), 0.0f, 1.0f);
+    Slider volSlider(150, 0.0f, 1.0f, savedVolPos, volumeText(savedVolPos), font);
+    float lastVolPos = -1.0f;
     Slider timeSlider(100, 0.0f, 1.0f, 0.0f, "Timeline", font);
 
     Sidebar sidebar(SIDEBAR_W, font);
@@ -160,7 +189,7 @@ int main() {
     auto modDecoders = sidebar.addModule("Decoders");
     auto chkAprs = std::make_shared<Checkbox>("Enable APRS (144.800)", font);
     auto btnCopyAprs = std::make_shared<SdrButton>(200, 25, "Copy Last Packet", font);
-    auto chkAIS = std::make_shared<Checkbox>("Enable AIS (162.025)", font);
+    auto chkAIS = std::make_shared<Checkbox>("Enable AIS (161.975 / 162.025)", font);
 
     auto btnNFM = std::make_shared<SdrButton>(36, 25, "NFM", font);
     auto btnAM  = std::make_shared<SdrButton>(36, 25, "AM", font);
@@ -819,6 +848,69 @@ int main() {
 
     modDecoders->addWidget(chkAIS);
 
+    // --- Image decoders (SSTV, WEFAX) ---
+    // Only one decoder runs at a time. SSTV keeps the current mode (NFM for VHF,
+    // USB for HF); WEFAX switches to USB and restores the previous mode afterwards.
+    auto chkSSTV = std::make_shared<Checkbox>("Enable SSTV", font);
+    auto chkWEFAX = std::make_shared<Checkbox>("Enable WEFAX (HF fax, USB)", font);
+    Mode wefaxPrevMode = Mode::USB;
+
+    auto restoreMode = [&](Mode m) {
+        if (m == Mode::NFM) setMode(Mode::NFM, btnNFM.get());
+        else if (m == Mode::AM) setMode(Mode::AM, btnAM.get());
+        else if (m == Mode::WFM) setMode(Mode::WFM, btnWFM.get());
+        else if (m == Mode::RAW) setMode(Mode::RAW, btnRAW.get());
+        else if (m == Mode::USB) setMode(Mode::USB, btnUSB.get());
+        else if (m == Mode::LSB) setMode(Mode::LSB, btnLSB.get());
+        else setMode(Mode::OFF, btnOFF.get());
+    };
+    auto setPanelDecoder = [&](SDRModule* mod, bool on) {
+        std::lock_guard<std::mutex> l(sharedData.mtx);
+        if (on) { sharedData.activeDecoder = mod; mod->enabled = true; }
+        else { if (sharedData.activeDecoder == mod) sharedData.activeDecoder = nullptr; mod->enabled = false; }
+    };
+    auto disableSstv = [&]() {
+        if (!chkSSTV->checked) return;
+        chkSSTV->checked = false;
+        setPanelDecoder(ptrSSTV, false);
+    };
+    auto disableWefax = [&]() {
+        if (!chkWEFAX->checked) return;
+        chkWEFAX->checked = false;
+        setPanelDecoder(ptrWEFAX, false);
+        restoreMode(wefaxPrevMode);
+    };
+    auto disableAprsAis = [&]() {
+        if (chkAprs->checked) { chkAprs->checked = false; chkAprs->onToggle(false); }
+        if (chkAIS->checked) { chkAIS->checked = false; chkAIS->onToggle(false); }
+    };
+
+    chkSSTV->onToggle = [&](bool b) {
+        if (b) { disableAprsAis(); disableWefax(); }
+        setPanelDecoder(ptrSSTV, b);
+    };
+    chkWEFAX->onToggle = [&](bool b) {
+        if (b) {
+            disableAprsAis(); disableSstv();
+            { std::lock_guard<std::mutex> l(sharedData.mtx); wefaxPrevMode = sharedData.mode; }
+            if (currentSourceType == 3) setMode(Mode::RAW, btnRAW.get());   // sound card input already is audio
+            else setMode(Mode::USB, btnUSB.get());
+            setPanelDecoder(ptrWEFAX, true);
+        } else {
+            setPanelDecoder(ptrWEFAX, false);
+            restoreMode(wefaxPrevMode);
+        }
+    };
+    // Turning APRS or AIS on switches the image decoders off
+    {
+        auto aprsToggle = chkAprs->onToggle;
+        chkAprs->onToggle = [=](bool b) { if (b) { disableSstv(); disableWefax(); } aprsToggle(b); };
+        auto aisToggle = chkAIS->onToggle;
+        chkAIS->onToggle = [=](bool b) { if (b) { disableSstv(); disableWefax(); } aisToggle(b); };
+    }
+    modDecoders->addWidget(chkSSTV);
+    modDecoders->addWidget(chkWEFAX);
+
     auto modDisp = sidebar.addModule("Display");
     auto slMinDb = std::make_shared<Slider>(SIDEBAR_W - 40, -140.0f, -20.0f, -90.0f, "Min dB", font);
     slMinDb->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.minDb = v; };
@@ -1020,6 +1112,12 @@ int main() {
     chkStereo->checked = savedStereo;
     chkStereo->onToggle(savedStereo);
 
+    ptrSSTV->applySettings(settingsMgr.getBool("sstv_auto_slant", true), settingsMgr.getFloat("sstv_slant", 0.0f),
+                           settingsMgr.getBool("sstv_auto_save", false));
+    ptrWEFAX->applySettings(settingsMgr.getInt("wefax_lpm", 120), settingsMgr.getInt("wefax_ioc", 576),
+                            settingsMgr.getBool("wefax_apt", true), settingsMgr.getFloat("wefax_slant", 0.0f),
+                            settingsMgr.getBool("wefax_auto_save", false));
+
     bool savedRds = settingsMgr.getBool("rds", true);
     chkRds->checked = savedRds;
     chkRds->onToggle(savedRds);
@@ -1127,9 +1225,11 @@ int main() {
         if (!ddSourceType->isOpen && !ddRate->isOpen && !ddDevice->isOpen) freqVFO.update(window);
         volSlider.update(window);
 
-        if (std::abs(volSlider.currentVal - sharedData.volume) > 0.01f) {
+        if (std::abs(volSlider.currentVal - lastVolPos) > 0.0005f) {
+            lastVolPos = volSlider.currentVal;
+            volSlider.setText(volumeText(lastVolPos));
             std::lock_guard<std::mutex> l(sharedData.mtx);
-            sharedData.volume = volSlider.currentVal;
+            sharedData.volume = volumeGain(lastVolPos);
         }
 
         if (currentSourceType == 0) {
@@ -1231,6 +1331,16 @@ int main() {
             gainDebouncer.restart();
         }
 
+        // Decoder panel at the bottom of the waterfall. With a file source the timeline
+        // stays below it, so it can still be used.
+        const float timelineStripH = (currentSourceType == 0) ? 40.0f : 0.0f;
+        float decoderPanelTop = layout.winH;   // winH = no panel
+        {
+            SDRModule* dm = nullptr;
+            { std::lock_guard<std::mutex> l(sharedData.mtx); dm = sharedData.activeDecoder; }
+            if (dm && dm->enabled) decoderPanelTop = layout.winH - dm->panelHeight(layout.winH) - timelineStripH;
+        }
+
         while (const std::optional<sf::Event> ev = window.pollEvent()) {
             if (ev->is<sf::Event::Closed>()) window.close();
 
@@ -1260,6 +1370,13 @@ int main() {
             }
 
             if (sidebar.handleEvent(*ev, window)) continue;
+
+            // Decoder panel at the bottom of the waterfall (SSTV / WEFAX controls, picture scrolling)
+            {
+                SDRModule* panelMod = nullptr;
+                { std::lock_guard<std::mutex> l(sharedData.mtx); panelMod = sharedData.activeDecoder; }
+                if (panelMod && panelMod->enabled && panelMod->handleEvent(*ev, window)) continue;
+            }
 
             bool topBarHandled = false;
             if (volSlider.handleEvent(*ev, window)) topBarHandled = true;
@@ -1494,7 +1611,8 @@ int main() {
                     }
                 }
 
-                if (!overAprs && m.x >= 0 && m.x < layout.specW && m.y >= TOP_BAR_H && m.y < (TOP_BAR_H + layout.specH + layout.waterfallH)) {
+                const bool overDecoderPanel = (m.y >= decoderPanelTop && m.y < layout.winH - timelineStripH);
+                if (!overAprs && !overDecoderPanel && m.x >= 0 && m.x < layout.specW && m.y >= TOP_BAR_H && m.y < (TOP_BAR_H + layout.specH + layout.waterfallH)) {
                     std::lock_guard<std::mutex> l(sharedData.mtx);
                     sharedData.mouseX_spectrum = m.x;
                     sharedData.mouseY_spectrum = m.y - TOP_BAR_H;
@@ -2015,8 +2133,14 @@ int main() {
         }
 
         if (decoderUI && decoderUI->enabled) {
-            float tableH = 250.0f;
-            float tableY = layout.winH - tableH;
+            float tableH = decoderUI->panelHeight(layout.winH);
+            float tableY = layout.winH - tableH - timelineStripH;
+            if (timelineStripH > 0.0f) {   // background for the timeline below the panel
+                sf::RectangleShape strip({layout.specW, timelineStripH});
+                strip.setPosition({0, layout.winH - timelineStripH});
+                strip.setFillColor(sf::Color(30, 30, 35));
+                window.draw(strip);
+            }
             decoderUI->draw(window, 0, tableY, layout.specW, tableH);
         }
         else {
@@ -2219,6 +2343,16 @@ int main() {
     saveMgr.set("squelch", slSq->currentVal);
     saveMgr.set("stereo", chkStereo->checked);
     saveMgr.set("rds", chkRds->checked);
+    saveMgr.set("picture_path", pictureDirCustom);
+    saveMgr.set("volume_pos", volSlider.currentVal);
+    saveMgr.set("sstv_auto_slant", ptrSSTV->getAutoSlant());
+    saveMgr.set("sstv_slant", ptrSSTV->getSlantPpm());
+    saveMgr.set("sstv_auto_save", ptrSSTV->getAutoSave());
+    saveMgr.set("wefax_lpm", ptrWEFAX->getLpm());
+    saveMgr.set("wefax_ioc", ptrWEFAX->getIoc());
+    saveMgr.set("wefax_apt", ptrWEFAX->getAutoApt());
+    saveMgr.set("wefax_slant", ptrWEFAX->getSlantPpm());
+    saveMgr.set("wefax_auto_save", ptrWEFAX->getAutoSave());
     saveMgr.set("rf_gain", sharedData.rfGain);
     saveMgr.set("source_type", ddSourceType->selectedIndex);
     saveMgr.set("hw_fm_notch", hwState.fmNotch);

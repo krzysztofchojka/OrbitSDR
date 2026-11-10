@@ -1,302 +1,279 @@
 #pragma once
+
 #include "../Core/SDRModule.h"
-#include "../../DSP.h" 
-#include <deque>
-#include <vector>
-#include <complex>
-#include <iostream>
-#include <algorithm>
+#include "AisCore.h"
+#include <SFML/Graphics.hpp>
 #include <mutex>
-#include <cmath>
+#include <deque>
+#include <chrono>
+#include <cstdio>
+#include <algorithm>
 
-#define AIS_RATE 48000.0 
-#define SAMPLES_PER_BIT 5.0f
-
-// --- DATA STRUCTURES ---
-struct AISMessage {
-    int mmsi;
-    std::string type;
-    std::string info;
-    std::string shipName;
-    bool crcOk;
-};
-
-// --- HELPERS (CRC, HEX) ---
-namespace AisTools {
-    static const uint16_t fcstab[256] = {
-        0x0000, 0x1189, 0x2312, 0x329b, 0x4624, 0x57ad, 0x6536, 0x74bf, 0x8c48, 0x9dc1, 0xaf5a, 0xbed3, 0xca6c, 0xdbe5, 0xe97e, 0xf8f7,
-        0x1081, 0x0108, 0x3393, 0x221a, 0x56a5, 0x472c, 0x75b7, 0x643e, 0x9cc9, 0x8d40, 0xbfdb, 0xae52, 0xdaed, 0xcb64, 0xf9ff, 0xe876,
-        0x2102, 0x308b, 0x0210, 0x1399, 0x6726, 0x76af, 0x4434, 0x55bd, 0xad4a, 0xbcc3, 0x8e58, 0x9fd1, 0xeb6e, 0xfae7, 0xc87c, 0xd9f5,
-        0x3183, 0x200a, 0x1291, 0x0318, 0x77a7, 0x662e, 0x54b5, 0x453c, 0xbdcb, 0xac42, 0x9ed9, 0x8f50, 0xfbef, 0xea66, 0xd8fd, 0xc974,
-        0x4204, 0x538d, 0x6116, 0x709f, 0x0420, 0x15a9, 0x2732, 0x36bb, 0xce4c, 0xdfc5, 0xed5e, 0xfcd7, 0x8868, 0x99e1, 0xab7a, 0xbaf3,
-        0x5285, 0x430c, 0x7197, 0x601e, 0x14a1, 0x0528, 0x37b3, 0x263a, 0xdecd, 0xcf44, 0xfddf, 0xec56, 0x98e9, 0x8960, 0xbbfb, 0xaa72,
-        0x6306, 0x728f, 0x4014, 0x519d, 0x2522, 0x34ab, 0x0630, 0x17b9, 0xef4e, 0xfec7, 0xcc5c, 0xddd5, 0xa96a, 0xb8e3, 0x8a78, 0x9bf1,
-        0x7387, 0x620e, 0x5095, 0x411c, 0x35a3, 0x242a, 0x16b1, 0x0738, 0xffcf, 0xee46, 0xdcdd, 0xcd54, 0xb9eb, 0xa862, 0x9af9, 0x8b70,
-        0x8408, 0x9581, 0xa71a, 0xb693, 0xc22c, 0xd3a5, 0xe13e, 0xf0b7, 0x0840, 0x19c9, 0x2b52, 0x3adb, 0x4e64, 0x5fed, 0x6d76, 0x7cff,
-        0x9489, 0x8500, 0xb79b, 0xa612, 0xd2ad, 0xc324, 0xf1bf, 0xe036, 0x18c1, 0x0948, 0x3bd3, 0x2a5a, 0x5ee5, 0x4f6c, 0x7df7, 0x6c7e,
-        0xa50a, 0xb483, 0x8618, 0x9791, 0xe32e, 0xf2a7, 0xc03c, 0xd1b5, 0x2942, 0x38cb, 0x0a50, 0x1bd9, 0x6f66, 0x7eef, 0x4c74, 0x5dfd,
-        0xb58b, 0xa402, 0x9699, 0x8710, 0xf3af, 0xe226, 0xd0bd, 0xc134, 0x39c3, 0x284a, 0x1ad1, 0x0b58, 0x7fe7, 0x6e6e, 0x5cf5, 0x4d7c,
-        0xc60c, 0xd785, 0xe51e, 0xf497, 0x8028, 0x91a1, 0xa33a, 0xb2b3, 0x4a44, 0x5bcd, 0x6956, 0x78df, 0x0c60, 0x1de9, 0x2f72, 0x3efb,
-        0xd68d, 0xc704, 0xf59f, 0xe416, 0x90a9, 0x8120, 0xb3bb, 0xa232, 0x5ac5, 0x4b4c, 0x79d7, 0x685e, 0x1ce1, 0x0d68, 0x3ff3, 0x2e7a,
-        0xe70e, 0xf687, 0xc41c, 0xd595, 0xa12a, 0xb0a3, 0x8238, 0x93b1, 0x6b46, 0x7acf, 0x4854, 0x59dd, 0x2d62, 0x3ceb, 0x0e70, 0x1ff9,
-        0xf78f, 0xe606, 0xd49d, 0xc514, 0xb1ab, 0xa022, 0x92b9, 0x8330, 0x7bc7, 0x6a4e, 0x58d5, 0x495c, 0x3de3, 0x2c6a, 0x1ef1, 0x0f78
-    };
-    inline bool checkFCS(const std::vector<uint8_t>& bits) {
-        if (bits.size() < 16) return false;
-        uint16_t fcs = 0xFFFF; uint8_t currentByte = 0; int bitCount = 0;
-        for (uint8_t bit : bits) {
-            currentByte >>= 1; if (bit) currentByte |= 0x80; bitCount++;
-            if (bitCount == 8) { fcs = (fcs >> 8) ^ fcstab[(fcs ^ currentByte) & 0xff]; bitCount = 0; currentByte = 0; }
-        }
-        return (fcs == 0xf0b8);
-    }
-    inline uint32_t getBits(const std::vector<uint8_t>& b, int start, int len) {
-        uint32_t r = 0; for(int i=0; i<len; ++i) if(start + i < (int)b.size()) r = (r << 1) | b[start + i]; return r;
-    }
-    inline std::string getStr(const std::vector<uint8_t>& b, int start, int len) {
-        std::string res = ""; const char* map = "@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^- !\"#$%&'()*+,-./0123456789:;<=>?";
-        for(int i=0; i<len; i+=6) { uint8_t val = (uint8_t)getBits(b, start+i, 6); if (val < 64) res += map[val]; }
-        res.erase(std::find_if(res.rbegin(), res.rend(), [](unsigned char ch) { return !std::isspace(ch) && ch != '@'; }).base(), res.end());
-        return res;
-    }
-}
-
-// --- AGC ---
-struct IQ_AGC {
-    float gain = 1.0f; float targetLevel = 0.8f; float maxGain = 30000.0f; float attack = 0.15f; float decay = 0.02f; 
-    std::complex<float> process(std::complex<float> in) {
-        float mag = std::abs(in);
-        if (mag > 0.0000001f) { float error = targetLevel - (mag * gain); if (error < 0) gain += error * attack; else gain += error * decay; } else { gain += decay; }
-        if (gain > maxGain) gain = maxGain; if (gain < 1.0f) gain = 1.0f; return in * gain;
-    }
-};
-
-// --- CORRELATION AND DECODING ENGINE ---
-class AISCorrelationDecoder {
-public:
-    std::vector<float> buffer;
-    bool locked = false;
-    int samplesSinceLock = 0;
-    int bitsRead = 0;
-    
-    // NRZI State
-    bool lastLevel = false;
-    int onesCount = 0;
-    std::vector<uint8_t> frameBits;
-    
-    // Preamble template (a 2.4 kHz wave sampled at 48 kHz = 20-sample period)
-    // 10 samples high, 10 samples low
-    std::vector<float> preambleTemplate;
-
-    AISCorrelationDecoder() {
-        // Build the 2.4 kHz template (ideal AIS preamble in NRZI/FM)
-        for(int i=0; i<20; i++) {
-            if(i < 10) preambleTemplate.push_back(1.0f);
-            else preambleTemplate.push_back(-1.0f);
-        }
-        buffer.reserve(48000); // 1 second
-    }
-
-    void reset() {
-        buffer.clear();
-        locked = false;
-        frameBits.clear();
-    }
-
-    // Returns true if a frame was decoded
-    bool pushSample(float sample, std::vector<uint8_t>& outBits) {
-        // Add to the buffer (20-sample sliding window for correlation)
-        buffer.push_back(sample);
-        
-        // Trim the buffer so it doesn't grow forever, but keep a margin for correlation
-        if (!locked && buffer.size() > 40) {
-            buffer.erase(buffer.begin(), buffer.begin() + (buffer.size() - 40));
-        }
-
-        if (locked) {
-            samplesSinceLock++;
-            // Sample every 5 samples (middle of the bit)
-            // We need to hit the middle. Since the correlation peaked at the start, the first bit is at sampleSinceLock = 2.5 (rounded to 2 or 3)
-            if (samplesSinceLock % 5 == 2) {
-                // SAMPLE!
-                bool level = (sample > 0.0f);
-                return processBit(level, outBits);
-            }
-            
-            // Frame length limit (so it never hangs forever)
-            if (bitsRead > 300) {
-                locked = false; // Timeout
-            }
-        } 
-        else {
-            // Look for the correlation peak
-            if (buffer.size() >= 20) {
-                float score = 0.0f;
-                // Multiply the last 20 samples by the template
-                for(int i=0; i<20; i++) {
-                    score += buffer[buffer.size() - 20 + i] * preambleTemplate[i];
-                }
-                
-                // Detection threshold (empirical: 10.0 means 10 samples matched perfectly at amplitude 1.0)
-                if (score > 12.0f) {
-                    locked = true;
-                    samplesSinceLock = 0;
-                    bitsRead = 0;
-                    onesCount = 0;
-                    frameBits.clear();
-                    lastLevel = (sample > 0); // Init NRZI
-                    // std::cout << "[AIS] SYNC FOUND! Score: " << score << std::endl;
-                }
-            }
-        }
-        return false;
-    }
-
-    bool processBit(bool level, std::vector<uint8_t>& outBits) {
-        bitsRead++;
-        int bit = (level != lastLevel) ? 0 : 1; // NRZI Decode
-        lastLevel = level;
-
-        if (bit == 1) {
-            onesCount++;
-            if (onesCount == 6) { // 0x7E flag (end of frame)
-                locked = false; // End of packet
-                outBits = frameBits;
-                return true; // Got a frame!
-            }
-        } else {
-            if (onesCount == 5) { onesCount = 0; return false; } // De-stuffing
-            onesCount = 0;
-        }
-
-        frameBits.push_back(bit);
-        return false;
-    }
-};
+// =====================================================================
+//  AIS decoder module (ship tracking on VHF 161.975 / 162.025 MHz).
+//
+//  Works on the raw IQ samples, independent of the audio demodulator.
+//  When both AIS channels fit into the received bandwidth they are
+//  decoded at the same time; otherwise the tuned frequency is decoded.
+//  The panel shows a table of the ships heard and the latest messages.
+// =====================================================================
 
 class AISDecoder : public SDRModule {
-private:
-    Channelizer channelA; 
-    IQ_AGC agc; 
-    
-    std::complex<float> lastSample = {1.0f, 0.0f}; 
-    float avgDc = 0.0f;
-    float lpfState = 0.0f;
+    static constexpr long long AIS1_HZ = 161975000;
+    static constexpr long long AIS2_HZ = 162025000;
 
-    // TWO CORRELATION HEADS
-    AISCorrelationDecoder decNormal;
-    AISCorrelationDecoder decInverted;
+    struct Rx {
+        ais::Channel channel;
+        ais::Decoder decoder;
+        bool active = false;
+        double offsetHz = 0.0;
+        int frames = 0;
+    };
+    Rx rx[2];
+    std::vector<float> disc, power;
 
-    std::deque<AISMessage> log; 
-    std::vector<float> scope; 
-    std::mutex mtx; 
-    const sf::Font* fontRef = nullptr;
-    double lastSr = 0; 
-    int debugCounter = 0;
+    std::mutex mtx;
+    std::map<uint32_t, ais::Vessel> vessels;
+    std::deque<std::string> recentMessages;
+    long long centerHz = 0;
+    std::string channelInfo = "Waiting for signal...";
+    std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
+
+    const sf::Font* font = nullptr;
+    sf::FloatRect panelRect, tableRect;
+    float scrollRows = 0.0f;
+    std::shared_ptr<SdrButton> btnClear;
+
+    double now() const {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
+    }
+
+    sf::Text text(const std::string& s, unsigned size, sf::Color c) const {
+        sf::Text t(*font, sf::String::fromUtf8(s.begin(), s.end()), size);
+        t.setScale({0.5f, 0.5f});
+        t.setFillColor(c);
+        return t;
+    }
+
+    static std::string fmtCoord(double v, bool lat) {
+        if ((lat && v > 90.0) || (!lat && v > 180.0)) return "-";
+        char b[24];
+        std::snprintf(b, sizeof(b), "%.5f%c", std::abs(v), lat ? (v >= 0 ? 'N' : 'S') : (v >= 0 ? 'E' : 'W'));
+        return b;
+    }
 
 public:
-    AISDecoder() : SDRModule("AIS Pro (Correlation)") {
-        // The inverted decoder needs an inverted template
-        for(auto& v : decInverted.preambleTemplate) v *= -1.0f;
+    AISDecoder() : SDRModule("AIS") {
+        for (int i = 0; i < 2; i++) {
+            rx[i].decoder.sharedVessels = &vessels;
+            rx[i].decoder.onMessage = [this, i](const ais::Message& m) {
+                // Called from processIQ with mtx held
+                rx[i].frames++;
+                char head[48];
+                std::snprintf(head, sizeof(head), "%s %09u  ", i == 0 ? "A" : "B", m.mmsi);
+                recentMessages.push_front(head + m.summary);
+                if (recentMessages.size() > 30) recentMessages.pop_back();
+            };
+        }
     }
-    
-    void init(const ModuleContext& ctx) override { fontRef = &ctx.font; }
+
+    void init(const ModuleContext& ctx) override {
+        font = &ctx.font;
+        btnClear = std::make_shared<SdrButton>(120.0f, 24.0f, "Clear list", *font);
+        btnClear->onClick = [this]() {
+            std::lock_guard<std::mutex> l(mtx);
+            vessels.clear(); recentMessages.clear();
+            rx[0].frames = rx[1].frames = 0;
+        };
+    }
 
     void reset() override {
-        lastSr = 0; channelA = Channelizer(); agc = IQ_AGC(); 
-        lastSample = {1.0f, 0.0f}; avgDc = 0.0f; lpfState = 0.0f;
-        decNormal.reset(); decInverted.reset();
-        { std::lock_guard<std::mutex> l(mtx); scope.clear(); }
-        std::cout << "[AIS] State Reset" << std::endl;
+        std::lock_guard<std::mutex> l(mtx);
+        for (auto& r : rx) r.decoder.reset();
     }
 
-    void handleMessage(std::vector<uint8_t> bits, bool inv) {
-        if (AisTools::checkFCS(bits)) {
-            if (bits.size() > 16) bits.resize(bits.size() - 16);
-            int msgType = AisTools::getBits(bits, 0, 6);
-            int mmsi = AisTools::getBits(bits, 8, 30);
-            
-            AISMessage m; 
-            m.mmsi = mmsi; 
-            m.type = "Type " + std::to_string(msgType);
-            m.crcOk = true;
-            m.info = "SOG: ?"; 
-            
-            if (msgType >= 1 && msgType <= 3) {
-                float speed = AisTools::getBits(bits, 50, 10) / 10.0f;
-                m.info = "SOG: " + std::to_string(speed) + " kn";
-            } else if (msgType == 5) {
-                m.shipName = AisTools::getStr(bits, 112, 120);
-                m.info = m.shipName;
-            }
+    float panelHeight(float windowHeight) const override {
+        return std::clamp(windowHeight * 0.38f, 260.0f, 460.0f);
+    }
 
-            if (inv) m.type += " [INV]";
-            
-            std::lock_guard<std::mutex> l(mtx);
-            log.push_front(m); 
-            if(log.size() > 15) log.pop_back();
-            std::cout << "\033[1;32m>>> CORRELATION MATCH: MMSI " << m.mmsi << "\033[0m" << std::endl;
+    void setRadioFrequency(long long hz) override {
+        std::lock_guard<std::mutex> l(mtx);
+        centerHz = hz;
+    }
+
+    void processIQ(const std::vector<std::complex<double>>& iq, double sampleRate, double tunedOffset) override {
+        if (!enabled || iq.empty() || sampleRate <= 0.0) return;
+        std::lock_guard<std::mutex> l(mtx);
+
+        // Which channels can be received? Both AIS channels if they fit into the
+        // band (with room for the +-9 kHz channel filter), else the tuned frequency.
+        const double usable = sampleRate / 2.0 - 15000.0;
+        bool in1 = centerHz > 0 && std::abs((double)(AIS1_HZ - centerHz)) < usable;
+        bool in2 = centerHz > 0 && std::abs((double)(AIS2_HZ - centerHz)) < usable;
+        if (in1 || in2) {
+            rx[0].active = in1; rx[0].offsetHz = (double)(AIS1_HZ - centerHz);
+            rx[1].active = in2; rx[1].offsetHz = (double)(AIS2_HZ - centerHz);
+            channelInfo = std::string("AIS 1 (161.975): ") + (in1 ? "on" : "out of band") +
+                          "   AIS 2 (162.025): " + (in2 ? "on" : "out of band");
         } else {
-            // std::cout << "[CRC FAIL] Len: " << bits.size() << std::endl;
+            rx[0].active = true; rx[0].offsetHz = tunedOffset;
+            rx[1].active = false;
+            channelInfo = "Tuned frequency only (tune ~162.000 MHz for both)";
+        }
+
+        const double t = now();
+        for (auto& r : rx) {
+            if (!r.active) continue;
+            r.channel.configure(sampleRate, r.offsetHz);
+            disc.clear(); power.clear();
+            r.channel.process(iq.data(), iq.size(), disc, power);
+            r.decoder.clockSeconds = t;
+            r.decoder.process(disc.data(), power.data(), disc.size());
         }
     }
 
-    void processIQ(const std::vector<std::complex<double>>& iqIn, double sampleRate, double tunedOffset) override {
-        if (!enabled) return;
-        if (std::abs(sampleRate - lastSr) > 100.0) {
-            lastSr = sampleRate; channelA.configure(sampleRate, AIS_RATE); 
-            std::cout << "[AIS] Correlator Configured. Rate: 48000" << std::endl;
+    bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
+        if (!enabled) return false;
+        if (btnClear && btnClear->handleEvent(ev, win)) return true;
+        sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
+        if (const auto* sc = ev.getIf<sf::Event::MouseWheelScrolled>()) {
+            if (!panelRect.contains(m)) return false;
+            if (tableRect.contains(m)) scrollRows = std::max(0.0f, scrollRows - sc->delta * 3.0f);
+            return true;
         }
-        channelA.setCenter(tunedOffset, sampleRate);
-        std::complex<float> baseband;
-        for (const auto& s : iqIn) {
-            if (channelA.process(s, baseband)) {
-                baseband *= 50.0f; 
-                baseband = agc.process(baseband); 
-                runDemod(baseband);
-            }
-        }
-    }
-
-    void runDemod(std::complex<float> sample) {
-        // FM Demod
-        std::complex<float> d = sample * std::conj(lastSample);
-        lastSample = sample;
-        float fm = std::arg(d); 
-        avgDc = 0.99f * avgDc + 0.01f * fm; 
-        float rawVal = fm - avgDc;
-        lpfState += 0.6f * (rawVal - lpfState);
-        float val = lpfState;
-
-        // Scope
-        { std::lock_guard<std::mutex> l(mtx); scope.push_back(val * 2.0f); if (scope.size() > 500) scope.erase(scope.begin(), scope.begin() + (scope.size() - 500)); }
-
-        // --- PUSH TO CORRELATORS ---
-        std::vector<uint8_t> bits;
-        if (decNormal.pushSample(val, bits)) handleMessage(bits, false);
-        if (decInverted.pushSample(val, bits)) handleMessage(bits, true);
+        if (ev.getIf<sf::Event::MouseButtonPressed>() && panelRect.contains(m)) return true;
+        return false;
     }
 
     void draw(sf::RenderWindow& win, float x, float y, float w, float h) override {
-        if (!enabled) return;
-        sf::RectangleShape bg({w, h}); bg.setPosition({x, y}); bg.setFillColor(sf::Color(20, 25, 30, 230)); 
-        bg.setOutlineColor(Theme::Accent); bg.setOutlineThickness(1); win.draw(bg);
-        sf::Text title(*fontRef, "AIS PRO (Correlation Engine)", 16); title.setPosition({x + 10, y + 5}); title.setFillColor(Theme::Accent); win.draw(title);
-        float scopeH = 60.0f; float scopeY = y + h - scopeH - 10;
-        sf::RectangleShape scopeBg({w - 20, scopeH}); scopeBg.setPosition({x + 10, scopeY}); scopeBg.setFillColor(sf::Color(0, 0, 0, 100)); win.draw(scopeBg);
-        std::lock_guard<std::mutex> lock(mtx);
-        if (!scope.empty()) {
-            sf::VertexArray line(sf::PrimitiveType::LineStrip, scope.size());
-            for (size_t i = 0; i < scope.size(); i++) {
-                float val = scope[i]; float px = x + 10 + (i * (w - 20) / 500.0f); float py = scopeY + (scopeH / 2) - (val * (scopeH / 2));
-                py = std::clamp(py, scopeY, scopeY + scopeH); line[i].position = {px, py}; line[i].color = sf::Color::Green;
-            }
-            win.draw(line);
+        if (!enabled || !font) return;
+        panelRect = sf::FloatRect({x, y}, {w, h});
+
+        std::vector<ais::Vessel> list;
+        std::deque<std::string> msgs;
+        std::string info;
+        int frames = 0;
+        {
+            std::lock_guard<std::mutex> l(mtx);
+            for (auto& kv : vessels) list.push_back(kv.second);
+            msgs = recentMessages;
+            info = channelInfo;
+            frames = rx[0].frames + rx[1].frames;
         }
-        float listY = y + 35.0f;
-        for (const auto& m : log) {
-            std::string line = "[" + m.type + "] " + std::to_string(m.mmsi) + " " + m.shipName + " " + m.info;
-            sf::Text t(*fontRef, line, 14); t.setPosition({x + 10, listY}); t.setFillColor(sf::Color::White); win.draw(t); listY += 18.0f; if (listY > scopeY) break;
+        std::sort(list.begin(), list.end(), [](const ais::Vessel& a, const ais::Vessel& b) { return a.lastSeen > b.lastSeen; });
+        const double t = now();
+
+        sf::RectangleShape bg({w, h});
+        bg.setPosition({x, y});
+        bg.setFillColor(sf::Color(20, 22, 27, 245));
+        bg.setOutlineColor(Theme::Accent);
+        bg.setOutlineThickness(1.0f);
+        win.draw(bg);
+
+        const float pad = 8.0f;
+        const float sideW = 330.0f;
+        tableRect = sf::FloatRect({x + pad, y + pad}, {w - sideW - 2 * pad, h - 2 * pad});
+
+        // --- ship table ---
+        struct Col { const char* name; float w; };
+        const Col cols[] = { {"MMSI", 78}, {"Name", 150}, {"Call", 62}, {"Type", 100}, {"Latitude", 82},
+                             {"Longitude", 86}, {"SOG", 46}, {"COG", 46}, {"Seen", 50}, {"Msgs", 40} };
+        float cx = tableRect.position.x;
+        const float rowH = 16.0f;
+        for (const Col& c : cols) {
+            sf::Text th = text(c.name, 22, Theme::Accent);
+            th.setStyle(sf::Text::Bold);
+            th.setPosition({cx, tableRect.position.y});
+            if (cx + c.w <= tableRect.position.x + tableRect.size.x) win.draw(th);
+            cx += c.w;
+        }
+        const float bodyY = tableRect.position.y + rowH + 4.0f;
+        const int visibleRows = std::max(1, (int)((tableRect.size.y - rowH - 4.0f) / rowH));
+        scrollRows = std::min(scrollRows, (float)std::max(0, (int)list.size() - visibleRows));
+        const int first = (int)scrollRows;
+
+        if (list.empty()) {
+            sf::Text e = text("No ships received yet", 26, sf::Color(110, 110, 120));
+            e.setPosition({tableRect.position.x, bodyY + 4.0f});
+            win.draw(e);
+        }
+        for (int r = 0; r < visibleRows && first + r < (int)list.size(); r++) {
+            const ais::Vessel& v = list[first + r];
+            const float ry = bodyY + r * rowH;
+            if (r % 2 == 0) {
+                sf::RectangleShape stripe({tableRect.size.x, rowH});
+                stripe.setPosition({tableRect.position.x, ry});
+                stripe.setFillColor(sf::Color(255, 255, 255, 8));
+                win.draw(stripe);
+            }
+            char b[16];
+            std::string cells[10];
+            std::snprintf(b, sizeof(b), "%09u", v.mmsi); cells[0] = b;
+            cells[1] = v.name.empty() ? "-" : v.name;
+            cells[2] = v.callsign.empty() ? "-" : v.callsign;
+            cells[3] = v.shipType.empty() ? "-" : v.shipType;
+            cells[4] = fmtCoord(v.lat, true);
+            cells[5] = fmtCoord(v.lon, false);
+            if (v.sog >= 0) { std::snprintf(b, sizeof(b), "%.1f", v.sog); cells[6] = b; } else cells[6] = "-";
+            if (v.cog >= 0) { std::snprintf(b, sizeof(b), "%.0f", v.cog); cells[7] = b; } else cells[7] = "-";
+            int age = (int)std::max(0.0, t - v.lastSeen);
+            if (age < 60) std::snprintf(b, sizeof(b), "%ds", age); else std::snprintf(b, sizeof(b), "%dm", age / 60);
+            cells[8] = b;
+            cells[9] = std::to_string(v.messages);
+            const bool fresh = age < 120;
+            float px = tableRect.position.x;
+            for (int c = 0; c < 10; c++) {
+                if (px + cols[c].w > tableRect.position.x + tableRect.size.x) break;
+                std::string s = cells[c];
+                if (c == 1 && s.size() > 20) s = s.substr(0, 19) + ".";
+                if (c == 3 && s.size() > 14) s = s.substr(0, 13) + ".";
+                sf::Text td = text(s, 22, fresh ? sf::Color(225, 225, 230) : sf::Color(130, 130, 140));
+                td.setPosition({px, ry});
+                win.draw(td);
+                px += cols[c].w;
+            }
+        }
+        if ((int)list.size() > visibleRows) {
+            float trackH = tableRect.size.y - rowH - 4.0f;
+            float thumbH = std::max(16.0f, trackH * visibleRows / (float)list.size());
+            float maxFirst = (float)(list.size() - visibleRows);
+            sf::RectangleShape thumb({4.0f, thumbH});
+            thumb.setPosition({tableRect.position.x + tableRect.size.x - 6.0f, bodyY + (trackH - thumbH) * (first / maxFirst)});
+            thumb.setFillColor(sf::Color(200, 200, 200, 140));
+            win.draw(thumb);
+        }
+
+        // --- side column: status and latest messages ---
+        const float sx = x + w - sideW;
+        float sy = y + pad;
+        sf::Text title = text("AIS", 30, Theme::Accent);
+        title.setStyle(sf::Text::Bold);
+        title.setPosition({sx, sy});
+        win.draw(title);
+        char stats[96];
+        std::snprintf(stats, sizeof(stats), "%zu ships, %d messages", list.size(), frames);
+        sf::Text st = text(stats, 22, sf::Color(220, 220, 225));
+        st.setPosition({sx + 50.0f, sy + 4.0f});
+        win.draw(st);
+        sy += 24.0f;
+        sf::Text ci = text(info, 20, sf::Color(160, 160, 170));
+        ci.setPosition({sx, sy});
+        win.draw(ci);
+        sy += 18.0f;
+        btnClear->setPosition(sx, sy);
+        btnClear->draw(win);
+        sy += 30.0f;
+        sf::Text lt = text("Latest messages", 22, Theme::Accent);
+        lt.setPosition({sx, sy});
+        win.draw(lt);
+        sy += 18.0f;
+        for (const auto& m : msgs) {
+            if (sy > y + h - 16.0f) break;
+            std::string s = m.size() > 52 ? m.substr(0, 51) + "." : m;
+            sf::Text mt = text(s, 20, sf::Color(200, 200, 205));
+            mt.setPosition({sx, sy});
+            win.draw(mt);
+            sy += 15.0f;
         }
     }
 };

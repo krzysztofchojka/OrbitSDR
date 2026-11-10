@@ -11,6 +11,7 @@
         #define NOMINMAX
     #endif
     #include <windows.h>
+    #include <shlobj.h>
 #elif defined(__APPLE__)
     #include <mach-o/dyld.h>
     #include <limits.h>
@@ -44,6 +45,37 @@ inline std::string getExecutableDir() {
     size_t pos = full.find_last_of("/\\");
     if (pos == std::string::npos) return ".";
     return full.substr(0, pos);
+}
+
+// Default folder for saved pictures (SSTV, WEFAX): an "OrbitSDR" folder inside the
+// user's Pictures folder. The folder itself is created when the first picture is saved.
+inline std::string getDefaultPicturesPath() {
+    std::string base;
+#ifdef _WIN32
+    char buf[MAX_PATH] = {0};
+    // Follows a Pictures folder that was moved (e.g. to OneDrive)
+    if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_MYPICTURES, NULL, 0, buf)) && buf[0]) base = buf;
+    else if (const char* up = std::getenv("USERPROFILE")) base = std::string(up) + "\\Pictures";
+    else base = ".";
+    return base + "\\OrbitSDR";
+#else
+#ifndef __APPLE__
+    // Linux: the XDG user directory knows localised names (e.g. "Obrazy")
+    if (FILE* p = popen("xdg-user-dir PICTURES 2>/dev/null", "r")) {
+        char line[PATH_MAX] = {0};
+        if (fgets(line, sizeof(line), p)) {
+            base = line;
+            while (!base.empty() && (base.back() == '\n' || base.back() == '\r')) base.pop_back();
+        }
+        pclose(p);
+    }
+#endif
+    if (base.empty()) {
+        const char* home = std::getenv("HOME");
+        base = home ? std::string(home) + "/Pictures" : ".";
+    }
+    return base + "/OrbitSDR";
+#endif
 }
 
 inline bool fileExistsReadable(const std::string& path) {

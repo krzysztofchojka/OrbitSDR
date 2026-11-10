@@ -5,6 +5,7 @@
 #include <memory>
 #include <iostream>
 #include <cstdio>
+#include <cctype>
 
 #ifdef _WIN32
     // --- FIX: check whether NOMINMAX is already defined ---
@@ -75,11 +76,11 @@ inline std::string openFileDialog() {
 }
 
 // Opens a native folder selection dialog
-inline std::string selectFolderDialog() {
+inline std::string selectFolderDialog(const std::string& title = "Select Folder for Recordings") {
     std::string result = "";
     #ifdef _WIN32
         BROWSEINFOA bi = { 0 };
-        bi.lpszTitle = "Select Folder for Recordings";
+        bi.lpszTitle = title.c_str();
         LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
         
         if (pidl != 0) {
@@ -90,18 +91,18 @@ inline std::string selectFolderDialog() {
             CoTaskMemFree(pidl);
         }
     #elif __APPLE__
-        const char* cmd = "osascript -e 'try' -e 'POSIX path of (choose folder with prompt \"Select Recording Folder\")' -e 'on error' -e 'return \"\"' -e 'end try'";
+        std::string cmd = "osascript -e 'try' -e 'POSIX path of (choose folder with prompt \"" + title + "\")' -e 'on error' -e 'return \"\"' -e 'end try'";
         std::array<char, 128> buffer;
-        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
+        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
         if (pipe) {
             while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
                 result += buffer.data();
             }
         }
     #elif __linux__
-        const char* cmd = "zenity --file-selection --directory --title='Select Recording Folder'";
+        std::string cmd = "zenity --file-selection --directory --title='" + title + "'";
         std::array<char, 128> buffer;
-        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
+        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
         if (pipe) {
             while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
                 result += buffer.data();
@@ -112,6 +113,50 @@ inline std::string selectFolderDialog() {
     // Trim trailing newline characters
     if (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
         result.pop_back();
+    }
+    return result;
+}
+
+// Opens a native "Save as" dialog for a PNG picture, starting in 'folder' with the
+// suggested file name. Returns the chosen path, or an empty string when cancelled.
+inline std::string savePictureDialog(const std::string& folder, const std::string& fileName) {
+    std::string result = "";
+    #ifdef _WIN32
+        char filename[MAX_PATH] = {0};
+        fileName.copy(filename, MAX_PATH - 1);
+        std::string initialDir = folder;
+        for (auto& c : initialDir) if (c == '/') c = '\\';
+        OPENFILENAMEA ofn;
+        ZeroMemory(&ofn, sizeof(ofn));
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = NULL;
+        ofn.lpstrFile = filename;
+        ofn.nMaxFile = sizeof(filename);
+        ofn.lpstrFilter = "PNG image\0*.png\0All Files\0*.*\0";
+        ofn.nFilterIndex = 1;
+        ofn.lpstrInitialDir = initialDir.c_str();
+        ofn.lpstrDefExt = "png";
+        ofn.lpstrTitle = "Save picture";
+        ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if (GetSaveFileNameA(&ofn)) result = filename;
+    #elif __APPLE__
+        std::string cmd = "osascript -e 'try' -e 'POSIX path of (choose file name with prompt \"Save picture\" default name \"" + fileName +
+                          "\" default location (POSIX file \"" + folder + "\"))' -e 'on error' -e 'return \"\"' -e 'end try'";
+        std::array<char, 256> buffer;
+        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
+        if (pipe) while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) result += buffer.data();
+    #elif __linux__
+        std::string cmd = "zenity --file-selection --save --confirm-overwrite --title='Save picture' --filename='" + folder + "/" + fileName + "'";
+        std::array<char, 256> buffer;
+        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
+        if (pipe) while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) result += buffer.data();
+    #endif
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) result.pop_back();
+    // Make sure the file gets the .png extension
+    if (!result.empty()) {
+        std::string lower = result;
+        for (auto& c : lower) c = (char)std::tolower((unsigned char)c);
+        if (lower.size() < 4 || lower.compare(lower.size() - 4, 4, ".png") != 0) result += ".png";
     }
     return result;
 }

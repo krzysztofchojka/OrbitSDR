@@ -151,6 +151,10 @@ public:
         audioOut.reserve(estimatedOut);
 
         double resampleRatio = sampleRateIn / sampleRateOut;
+        // WFM: the discriminator output is in radians per input sample, so its level depends on
+        // the sample rate. Scale it so the full 75 kHz deviation gives the same audio level at
+        // every sample rate (the factor is 1.5 at 1 MSps, the previous fixed value).
+        const float wfmGain = (float)(0.7 * sampleRateIn / (2.0 * PI * 75000.0));
         if (resampleRatio < 1.0) resampleRatio = 1.0;
 
         float iqAlpha = 1.0f;
@@ -269,8 +273,8 @@ public:
                 wfmResampleAcc += 1.0;
 
                 if (wfmResampleAcc >= resampleRatio) {
-                    float finalL = (wfmSumL / (float)wfmCount) * 1.5f;
-                    float finalR = (wfmSumR / (float)wfmCount) * 1.5f;
+                    float finalL = (wfmSumL / (float)wfmCount) * wfmGain;
+                    float finalR = (wfmSumR / (float)wfmCount) * wfmGain;
                     wfmDcState = 0.995f * wfmDcState + 0.005f * ((finalL + finalR) * 0.5f);
                     finalL -= wfmDcState; finalR -= wfmDcState;
                     finalL = std::tanh(finalL); finalR = std::tanh(finalR);

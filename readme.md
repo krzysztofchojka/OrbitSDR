@@ -18,14 +18,17 @@ Please note that this project is in a very early stage of development. It is cur
   - Sound card as baseband source.
 - **Baseband Player:** Play raw IQ `.wav` files with a seekable timeline slider to analyze recordings (for now only 16-bit PCM is supported).
 - **Integrated APRS:** Built-in AX.25 packet decoder with a live dashboard for messages and GPS telemetry (more digital modes planned).
+- **AIS:** Ship tracking on 161.975 / 162.025 MHz (both channels at once when they fit into the bandwidth) with a live table of vessels: name, call sign, type, position, speed and course.
 - **RDS:** Decodes Radio Data System on WFM broadcasts: station name (PS), RadioText, PI code, programme type (PTY), TP/TA flags and clock time.
+- **SSTV:** Slow-scan TV picture decoder with VIS auto-detection (Robot 36/72, Martin M1/M2, Scottie S1/S2/DX, PD50-PD290), automatic slant correction and PNG saving.
+- **WEFAX:** HF radiofax decoder with automatic start/stop (APT tones), phasing, selectable LPM/IOC, slant correction and PNG saving.
 - **Recording:** Record both demodulated Audio or raw Baseband IQ data.
 - **Smooth UX:** Responsive waterfall with drag-to-tune, axis panning, and frequency snapping.
 - **Demodulation:** Supports AM, NFM, LSB/USB, and WFM Stereo.
 
 ### To-Do / Known Limitations
 
-- **Decoders:** Currently APRS (AX.25) and RDS are supported, more digital decoders will be added in future updates.
+- **Decoders:** Currently APRS (AX.25), AIS, RDS, SSTV and WEFAX are supported, more digital decoders will be added in future updates.
 - Add support for 32-bit Float baseband recordings.
 
 ---

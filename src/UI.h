@@ -249,7 +249,9 @@ class Dropdown : public Widget {
 public:
     sf::RectangleShape mainBox; sf::Text selectedText; sf::Font fontRef;
     bool isOpen = false; std::vector<std::string> options; int selectedIndex = 0; float w, h;
+    bool openUp = false;   // the list opens above the box when there is no room below it
     std::function<void(int)> onChange; static Dropdown* currentActive;
+    float listTop() const { return openUp ? mainBox.getPosition().y - (float)options.size() * h : mainBox.getPosition().y + h; }
     Dropdown(float _w, float _h, const sf::Font& font) : w(_w), h(_h), fontRef(font), selectedText(font, "", 24) { 
         selectedText.setScale({0.5f, 0.5f});
         mainBox.setSize({w, h}); mainBox.setOutlineThickness(1); updateStyle();
@@ -259,9 +261,9 @@ public:
     void setPosition(float x, float y) override { mainBox.setPosition({x, y}); selectedText.setPosition({x + 5, y + 4}); }
     void setOptions(const std::vector<std::string>& opts) { options = opts; if (!options.empty()) { selectedIndex = 0; selectedText.setString(options[0]); } else { selectedText.setString("None"); } }
     void setSelection(int index) { if (index >= 0 && index < (int)options.size()) { selectedIndex = index; selectedText.setString(options[index]); } }
-    bool isMouseOver(const sf::RenderWindow& win) const override { sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win)); if (mainBox.getGlobalBounds().contains(m)) return true; if (isOpen) { float sx = mainBox.getPosition().x; float sy = mainBox.getPosition().y; sf::FloatRect listRect({sx, sy + h}, {w, (float)options.size() * h}); if (listRect.contains(m)) return true; } return false; }
+    bool isMouseOver(const sf::RenderWindow& win) const override { sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win)); if (mainBox.getGlobalBounds().contains(m)) return true; if (isOpen) { float sx = mainBox.getPosition().x; sf::FloatRect listRect({sx, listTop()}, {w, (float)options.size() * h}); if (listRect.contains(m)) return true; } return false; }
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
-        if (const auto* mb = ev.getIf<sf::Event::MouseButtonPressed>()) { if (mb->button == sf::Mouse::Button::Left) { sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win)); if (currentActive && currentActive != this) return false; if (isOpen) { float startX = mainBox.getPosition().x; float startY = mainBox.getPosition().y; for (size_t i = 0; i < options.size(); ++i) { sf::FloatRect optRect({startX, startY + (i + 1) * h}, {w, h}); if (optRect.contains(m)) { selectedIndex = i; selectedText.setString(options[i]); isOpen = false; currentActive = nullptr; if(onChange) onChange(i); return true; } } isOpen = false; currentActive = nullptr; return true; } if (mainBox.getGlobalBounds().contains(m)) { isOpen = !isOpen; if(isOpen) currentActive = this; else currentActive = nullptr; return true; } } } return false;
+        if (const auto* mb = ev.getIf<sf::Event::MouseButtonPressed>()) { if (mb->button == sf::Mouse::Button::Left) { sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win)); if (currentActive && currentActive != this) return false; if (isOpen) { float startX = mainBox.getPosition().x; float startY = listTop(); for (size_t i = 0; i < options.size(); ++i) { sf::FloatRect optRect({startX, startY + i * h}, {w, h}); if (optRect.contains(m)) { selectedIndex = i; selectedText.setString(options[i]); isOpen = false; currentActive = nullptr; if(onChange) onChange(i); return true; } } isOpen = false; currentActive = nullptr; return true; } if (mainBox.getGlobalBounds().contains(m)) { isOpen = !isOpen; if(isOpen) { currentActive = this; const sf::View& v = win.getView(); float viewTop = v.getCenter().y - v.getSize().y / 2.0f; float viewBottom = v.getCenter().y + v.getSize().y / 2.0f; float listH = (float)options.size() * h; float y = mainBox.getPosition().y; openUp = (y + h + listH > viewBottom) && (y - listH >= viewTop); } else currentActive = nullptr; return true; } } } return false;
     }
     void draw(sf::RenderWindow& win) override {
         win.draw(mainBox); std::string display = selectedText.getString(); if (display.length() > 22) display = display.substr(0, 20) + ".."; sf::Text tempTxt = selectedText; tempTxt.setString(display); win.draw(tempTxt);
@@ -269,13 +271,13 @@ public:
     }
     void drawOverlay(sf::RenderWindow& win) override {
         if (isOpen) {
-            float startX = mainBox.getPosition().x; float startY = mainBox.getPosition().y;
-            sf::RectangleShape listBg({w, (float)options.size() * h}); listBg.setPosition({startX, startY + h}); listBg.setFillColor(sf::Color(40, 40, 42)); listBg.setOutlineColor(Theme::Accent); listBg.setOutlineThickness(1); win.draw(listBg);
+            float startX = mainBox.getPosition().x; float startY = listTop();
+            sf::RectangleShape listBg({w, (float)options.size() * h}); listBg.setPosition({startX, startY}); listBg.setFillColor(sf::Color(40, 40, 42)); listBg.setOutlineColor(Theme::Accent); listBg.setOutlineThickness(1); win.draw(listBg);
             for (size_t i = 0; i < options.size(); ++i) {
                 sf::Text optTxt(fontRef, options[i], 24); 
                 optTxt.setScale({0.5f, 0.5f}); 
-                optTxt.setPosition({startX + 5, startY + (i + 1) * h + 4});
-                sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win)); sf::FloatRect itemRect({startX, startY + (i + 1) * h}, {w, h});
+                optTxt.setPosition({startX + 5, startY + i * h + 4});
+                sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win)); sf::FloatRect itemRect({startX, startY + i * h}, {w, h});
                 if (itemRect.contains(m)) { sf::RectangleShape hl({w, h}); hl.setPosition(itemRect.position); hl.setFillColor(Theme::Glow); win.draw(hl); }
                 std::string s = options[i]; if (s.length() > 22) s = s.substr(0, 20) + ".."; optTxt.setString(s); win.draw(optTxt);
             }

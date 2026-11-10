@@ -26,7 +26,12 @@ public:
 
     virtual void processAudio(const std::vector<float>& audio) {}
     virtual void processIQ(const std::vector<std::complex<double>>& iqData, double currentSampleRate, double tunedOffset) {}
+    // Centre frequency of the radio in Hz (0 = unknown, e.g. a file without frequency in its name)
+    virtual void setRadioFrequency(long long /*centerHz*/) {}
 
     virtual void draw(sf::RenderWindow& window, float x, float y, float w, float h) = 0;
-    virtual void handleEvent(const sf::Event& ev, const sf::RenderWindow& win) {}
+    // Returns true if the event was used by the module's panel
+    virtual bool handleEvent(const sf::Event& /*ev*/, const sf::RenderWindow& /*win*/) { return false; }
+    // Height of the module's panel at the bottom of the waterfall
+    virtual float panelHeight(float /*windowHeight*/) const { return 250.0f; }
 };

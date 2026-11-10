@@ -7,6 +7,7 @@
 #include "Demodulator.h"
 #include "APRS_Decoder.h"
 #include "RDS_Decoder.h"
+#include "AudioLeveler.h"
 #include "InspectorDSP.h"
 #include "WavWriter.h"
 #include "Settings.h"
@@ -21,6 +22,7 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
     APRSDecoder aprsDecoder(AUDIO_RATE);
     InspectorDSP inspector;
     RDSDecoder rdsDecoder;
+    AudioLeveler leveler;
     long long rdsRefFreqHz = 0;    // tuned frequency the current RDS data belongs to
     bool rdsWasActive = false;
 
@@ -224,6 +226,10 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
             inspector.process(chunkToProcess, sr, freqOffset, bw, shared);
 
             if (play) {
+                if (activeModule && activeModule->enabled) {
+                    activeModule->setRadioFrequency(centerHz);
+                    activeModule->processIQ(chunkToProcess, sr, freqOffset);
+                }
                 auto audioData = demod.process(chunkToProcess, freqOffset, bw, mode, stereo);
                 if (rdsActive && !demod.mpxTap.empty()) rdsDecoder.process(demod.mpxTap.data(), demod.mpxTap.size());
 
@@ -255,6 +261,9 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                         s *= squelchEnv;
                     }
                 }
+
+                // Similar loudness for all modes (speaker only, the decoders above got the raw audio)
+                leveler.process(audioData);
 
                 float finalVol = muted ? 0.0f : vol;
                 for (auto& s : audioData) {
