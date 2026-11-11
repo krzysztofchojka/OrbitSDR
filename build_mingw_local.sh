@@ -38,6 +38,9 @@ SDR_LIB="$(pwd)/deps/sdrplay/lib/windows"
 # The SDRplay API is loaded at run time (installed API first, the bundled
 # sdrplay_api.dll as a fallback), so there is nothing to link against.
 
+# 3b. rtl_433 (ISM decoder): downloaded and compiled once into .cache/
+. scripts/rtl433.sh
+
 # 4. Compilation
 echo "------------------------------------------"
 echo "Compiling OrbitSDR into /$BUILD_DIR folder..."
@@ -45,9 +48,11 @@ echo "------------------------------------------"
 g++ -std=c++17 -O3 \
     -DENABLE_SDRPLAY \
     -D_USE_MATH_DEFINES \
+    $RTL433_FLAGS \
     -I"$SFML_PATH/include" \
     -I"$SDR_INC" \
     "$SRC_DIR/main.cpp" \
+    $RTL433_LIB \
     -o "$OUT_FILE" \
     -L"$SFML_PATH/lib" \
     -lcomdlg32 -lole32 -lws2_32 \

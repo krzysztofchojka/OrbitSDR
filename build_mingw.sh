@@ -19,6 +19,9 @@ echo "------------------------------------------"
 # The SDRplay API is loaded at run time (installed API first, the bundled
 # sdrplay_api.dll as a fallback), so there is nothing to link against.
 
+# --- rtl_433 (ISM decoder): downloaded and compiled once into .cache/ ---
+. scripts/rtl433.sh
+
 # --- COMPILATION ---
 windres resource.rc -O coff -o resource.res
 
@@ -26,10 +29,12 @@ g++ -std=c++17 -O3 \
     -DENABLE_SDRPLAY \
     -D_USE_MATH_DEFINES \
     -Wno-macro-redefined \
+    $RTL433_FLAGS \
     -I"$SFML_PATH/include" \
     -I"$SDR_INC" \
     "$SRC_DIR/main.cpp" \
     resource.res \
+    $RTL433_LIB \
     -o "$OUT_FILE" \
     -L"$SFML_PATH/lib" \
     -lcomdlg32 -lole32 -lws2_32 \

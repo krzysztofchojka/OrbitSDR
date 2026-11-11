@@ -28,6 +28,8 @@ public:
     virtual void processIQ(const std::vector<std::complex<double>>& iqData, double currentSampleRate, double tunedOffset) {}
     // Centre frequency of the radio in Hz (0 = unknown, e.g. a file without frequency in its name)
     virtual void setRadioFrequency(long long /*centerHz*/) {}
+    // True for decoders of short bursts (ISM): the radio's AGC must not change the gain mid-packet
+    virtual bool wantsBurstAgc() const { return false; }
 
     virtual void draw(sf::RenderWindow& window, float x, float y, float w, float h) = 0;
     // Returns true if the event was used by the module's panel

@@ -82,6 +82,8 @@ public:
     virtual int getAgcStepCount() { return 0; }
     virtual void setAgcMaxStep(int /*step*/) {}
     virtual bool isAgcLimited() { return false; }
+    // Slow AGC for short bursts on a quiet band (ISM decoder), see RtlSoftAgc
+    virtual void setBurstAgc(bool /*on*/) {}
 
     // --- Loop detection ---
     // Returns true only once, at the moment the file wrapped back to the start
@@ -320,6 +322,11 @@ public:
     std::atomic<int> gainTenths {-1};     // current gain for the UI
     std::atomic<int> currentStep {-1};    // current index into 'gains', -1 = AGC off
     std::atomic<int> maxStep {-1};        // highest index allowed (set by the RDS assisted tuning)
+    // Burst mode (ISM decoder): short packets on a quiet band. The normal AGC would see
+    // every packet and change the gain in the middle of it, which breaks the packet.
+    // In burst mode only the quietest buffer of a ~1 s window counts (the noise floor,
+    // not the packets) and the gain changes at most once per window.
+    std::atomic<bool> burstMode {false};
 
     void start() {
         enabled = !gains.empty();
@@ -346,11 +353,20 @@ public:
         const float rms = (float)std::sqrt(sum / n);
         overload = 0.7f * overload.load() + 0.3f * clipFrac;
         if (!enabled) return false;
-        if (holdoff > 0) { holdoff--; return false; }
+        if (holdoff > 0) { holdoff--; winCount = 0; return false; }
 
         int next = index;
-        if (clipFrac > 0.0001f || rms > 0.18f) next = index - (clipFrac > 0.01f ? 3 : 1);
-        else if (clipped == 0 && rms < 0.06f) next = index + 1;
+        if (burstMode) {
+            if (winCount == 0 || rms < winRms) { winRms = rms; winClip = clipFrac; }
+            if (++winCount < BURST_WINDOW) return false;
+            winCount = 0;
+            if (winClip > 0.0001f || winRms > 0.18f) next = index - 1;
+            else if (winClip == 0.0f && winRms < 0.06f) next = index + 1;
+        } else {
+            winCount = 0;
+            if (clipFrac > 0.0001f || rms > 0.18f) next = index - (clipFrac > 0.01f ? 3 : 1);
+            else if (clipped == 0 && rms < 0.06f) next = index + 1;
+        }
         const int limit = maxStep;
         if (limit >= 0 && next > limit) next = limit;   // limit from the RDS assisted tuning
         next = std::clamp(next, 0, (int)gains.size() - 1);
@@ -364,7 +380,10 @@ public:
     int gain() const { return gains[index]; }
 
 private:
+    static constexpr int BURST_WINDOW = 16;   // USB buffers (~53 ms each at 2.4 MS/s)
     int holdoff = 0;
+    int winCount = 0;
+    float winRms = 0.0f, winClip = 0.0f;
 };
 
 // --- RTL-SDR SOURCE ---
@@ -578,6 +597,7 @@ public:
     int getAgcStep() override { return agc.currentStep; }
     int getAgcStepCount() override { return (int)agc.gains.size(); }
     void setAgcMaxStep(int step) override { agc.maxStep = step; }
+    void setBurstAgc(bool on) override { agc.burstMode = on; }
     bool isAgcLimited() override { return agc.maxStep >= 0 && agc.currentStep >= 0; }
     
     void setCenterFrequency(long long hz) override {

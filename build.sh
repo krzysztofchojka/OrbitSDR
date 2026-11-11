@@ -58,8 +58,11 @@ MODULE_SOURCES=$(find src/modules -name "*.cpp")
 
 echo "Compiling with modules: $MODULE_SOURCES"
 
-$CXX -std=c++17 -O3 $SDR_FLAGS $FINAL_INCLUDES \
-    $SRC_DIR/main.cpp $MODULE_SOURCES \
+# rtl_433 (ISM decoder): downloaded and compiled once into .cache/
+. scripts/rtl433.sh
+
+$CXX -std=c++17 -O3 $SDR_FLAGS $RTL433_FLAGS $FINAL_INCLUDES \
+    $SRC_DIR/main.cpp $MODULE_SOURCES $RTL433_LIB \
     -o $OUT_FILE $FINAL_LIBS $EXTRAS
 
 if [ $? -ne 0 ]; then

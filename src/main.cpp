@@ -37,6 +37,7 @@
 #include "modules/AIS/AIS_Decoder.h"
 #include "modules/ImageDecoders/SSTV_Module.h"
 #include "modules/ImageDecoders/WEFAX_Module.h"
+#include "modules/ISM/ISM_Decoder.h"
 
 int main() {
     #ifdef _WIN32
@@ -161,6 +162,11 @@ int main() {
     wefaxMod->setSaveDir = setPictureDir;
     WEFAXModule* ptrWEFAX = wefaxMod.get();
     modules.push_back(std::move(wefaxMod));
+    auto ismMod = std::make_unique<ISMDecoder>();
+    ismMod->init(ctx);
+    ismMod->logPath = getIsmLogFilePath();
+    ISMDecoder* ptrISM = ismMod.get();
+    modules.push_back(std::move(ismMod));
 
     auto cursorArrow = sf::Cursor::createFromSystem(sf::Cursor::Type::Arrow);
     auto cursorHand = sf::Cursor::createFromSystem(sf::Cursor::Type::Hand);
@@ -965,6 +971,32 @@ int main() {
     }
     modDecoders->addWidget(chkSSTV);
     modDecoders->addWidget(chkWEFAX);
+
+    // --- ISM band decoder (rtl_433: weather stations, TPMS, sensors, remotes) ---
+    // Works on the raw IQ like AIS, but keeps the current demodulator mode.
+    auto chkISM = std::make_shared<Checkbox>(ISMDecoder::available() ? "Enable ISM (433/868 MHz sensors)"
+                                                                     : "Enable ISM (not in this build)", font);
+    auto disableIsm = [&]() {
+        if (!chkISM->checked) return;
+        chkISM->checked = false;
+        setPanelDecoder(ptrISM, false);
+    };
+    chkISM->onToggle = [&](bool b) {
+        if (b) { disableAprsAis(); disableSstv(); disableWefax(); }
+        setPanelDecoder(ptrISM, b);
+    };
+    // Every other decoder switches ISM off
+    {
+        auto aprsToggle = chkAprs->onToggle;
+        chkAprs->onToggle = [=](bool b) { if (b) disableIsm(); aprsToggle(b); };
+        auto aisToggle = chkAIS->onToggle;
+        chkAIS->onToggle = [=](bool b) { if (b) disableIsm(); aisToggle(b); };
+        auto sstvToggle = chkSSTV->onToggle;
+        chkSSTV->onToggle = [=](bool b) { if (b) disableIsm(); sstvToggle(b); };
+        auto wefaxToggle = chkWEFAX->onToggle;
+        chkWEFAX->onToggle = [=](bool b) { if (b) disableIsm(); wefaxToggle(b); };
+    }
+    modDecoders->addWidget(chkISM);
 
     auto modDisp = sidebar.addModule("Display");
     auto slMinDb = std::make_shared<Slider>(SIDEBAR_W - 40, -140.0f, -20.0f, -90.0f, "Min dB", font);

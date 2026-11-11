@@ -22,13 +22,14 @@ Please note that this project is in a very early stage of development. It is cur
 - **RDS:** Decodes Radio Data System on WFM broadcasts: station name (PS), RadioText, PI code, programme type (PTY), TP/TA flags and clock time.
 - **SSTV:** Slow-scan TV picture decoder with VIS auto-detection (Robot 36/72, Martin M1/M2, Scottie S1/S2/DX, PD50-PD290), automatic slant correction and PNG saving.
 - **WEFAX:** HF radiofax decoder with automatic start/stop (APT tones), phasing, selectable LPM/IOC, slant correction and PNG saving.
+- **ISM (433 / 868 / 315 / 915 MHz):** Decodes weather stations, thermometers, tyre pressure sensors (TPMS), door/window sensors, remotes and utility meters using the ~300 device decoders of [rtl_433](https://github.com/merbanan/rtl_433). Tune to e.g. 433.92 MHz and enable *ISM* in the Decoders section: a live table lists the devices heard (click a row for all fields), and every message is appended to `ism.log` in the settings folder. 250 kHz or 1 MHz decoding width.
 - **Recording:** Record both demodulated Audio or raw Baseband IQ data.
 - **Smooth UX:** Responsive waterfall with drag-to-tune, axis panning, and frequency snapping.
 - **Demodulation:** Supports AM, NFM, LSB/USB, and WFM Stereo.
 
 ### To-Do / Known Limitations
 
-- **Decoders:** Currently APRS (AX.25), AIS, RDS, SSTV and WEFAX are supported, more digital decoders will be added in future updates.
+- **Decoders:** Currently APRS (AX.25), AIS, RDS, SSTV, WEFAX and ISM (rtl_433) are supported, more digital decoders will be added in future updates.
 - Add support for 32-bit Float baseband recordings.
 
 ---
@@ -39,6 +40,12 @@ To use SDRPlay devices, you must have the **SDRPlay API (Service)** installed on
 * **Compatibility:** Other versions (e.g., 3.07 or newer 3.x releases) might work, but stability is not guaranteed.
 * **Download:** You can get the API drivers from the [SDRPlay Downloads page](https://www.sdrplay.com/downloads/).
 
+
+### rtl_433 (ISM decoder) at build time
+The rtl_433 sources are not stored in this repository. The build scripts (`build.sh`, `build_mingw.sh`, `build_mingw_local.sh`) call `scripts/rtl433.sh`, which downloads a pinned rtl_433 commit **once** into `.cache/` (ignored by git), compiles it into a static library once per compiler and reuses it on every later build. Only `curl` (or `wget`/`git`), `tar` and a C compiler are needed.
+* To update rtl_433 change `RTL433_REF` in `scripts/rtl433.sh`.
+* Without network access (and an empty cache) OrbitSDR is still built, just without the ISM decoder. `RTL433_DISABLE=1` skips it on purpose; `ORBITSDR_CACHE=/path` moves the cache.
+* rtl_433 is GPL-2.0-or-later, which is compatible with OrbitSDR's GPL-3.0.
 
 ## Building on macOS
 ### 1. Install Dependencies (Homebrew):

@@ -203,6 +203,9 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
         }
         rdsWasActive = rdsActive;
 
+        // Burst decoders (ISM) need a gain that stays put during a packet
+        src->setBurstAgc(activeModule && activeModule->enabled && activeModule->wantsBurstAgc());
+
         int readCount = src->read(iqBuffer.data(), chunkSize);
         if (src->didLoop()) {
             demod.clear();

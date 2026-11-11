@@ -48,6 +48,11 @@ inline std::string getAprsLogFilePath() {
     return getConfigDir() + PATH_SEP + "aprs.log";
 }
 
+// Returns the full path to ism.log (messages of the ISM / rtl_433 decoder)
+inline std::string getIsmLogFilePath() {
+    return getConfigDir() + PATH_SEP + "ism.log";
+}
+
 inline std::string getDefaultRecordingPath() {
     std::string path;
     #ifdef _WIN32
