@@ -598,6 +598,33 @@ public:
     std::vector<uint32_t> getAvailableSampleRatesValues() override { return RTL_SAMPLE_RATES; }
 };
 
+#ifdef _WIN32
+// Windows: state of the SDRplay API service, which every SDRplay API program talks to.
+// Returns "running", "stopped", "missing" or "" (unknown).
+inline std::string sdrplayServiceState() {
+    SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!scm) return "";
+    std::string state;
+    SC_HANDLE svc = OpenServiceA(scm, "SDRplayAPIService", SERVICE_QUERY_STATUS);
+    if (!svc) {
+        state = (GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST) ? "missing" : "";
+    } else {
+        SERVICE_STATUS st;
+        if (QueryServiceStatus(svc, &st)) state = (st.dwCurrentState == SERVICE_RUNNING) ? "running" : "stopped";
+        CloseServiceHandle(svc);
+    }
+    CloseServiceHandle(scm);
+    return state;
+}
+
+// Starts the SDRplay API service. Needs administrator rights, so Windows asks for
+// confirmation (UAC). Returns true when the request was started.
+inline bool sdrplayStartService() {
+    HINSTANCE r = ShellExecuteA(NULL, "runas", "sc.exe", "start SDRplayAPIService", NULL, SW_HIDE);
+    return (INT_PTR)r > 32;
+}
+#endif
+
 // --- SDRPLAY SOURCE ---
 #ifdef ENABLE_SDRPLAY
 
@@ -607,6 +634,17 @@ public:
 #ifndef sdrplay_api_Update_Ext1_None
     #define sdrplay_api_Update_Ext1_None (sdrplay_api_ReasonForUpdateExtension1T)0
 #endif
+
+// Opens the SDRplay API and warns when the installed API differs from the headers
+// this program was built with (the API is usually compatible, so it only warns).
+inline bool sdrplayApiOpen() {
+    if (sdrplay_api_Open() != sdrplay_api_Success) return false;
+    float ver = 0.0f;
+    if (sdrplay_api_ApiVersion(&ver) == sdrplay_api_Success && std::fabs(ver - SDRPLAY_API_VERSION) > 0.0001f)
+        std::cerr << "[SDRplay] API version " << ver << " installed, built for " << SDRPLAY_API_VERSION << std::endl;
+    return true;
+}
+
 
 class SdrPlaySource : public IQSource {
     bool isSelected = false; bool isInitialized = false; RingBuffer<Complex> ringBuffer; double sampleRate = 2000000.0; double hwSampleRate = 2000000.0; long long centerFreq = 100000000; std::mutex hwMtx;
@@ -635,12 +673,14 @@ public:
         std::vector<SDRDeviceItem> list;
         bool openedLocally = false;
         if (activeInstances == 0) {
-            sdrplay_api_ErrT err = sdrplay_api_Open();
-            if (err != sdrplay_api_Success) return list;
+            if (!sdrplayApiOpen()) return list;
             openedLocally = true;
         }
         sdrplay_api_DeviceT devs[6]; unsigned int nDevs = 0;
+        // The device list must be locked while it is read (other SDRplay programs may use it too)
+        sdrplay_api_LockDeviceApi();
         sdrplay_api_GetDevices(devs, &nDevs, 6);
+        sdrplay_api_UnlockDeviceApi();
         for(unsigned int i=0; i<nDevs; i++) {
             SDRDeviceItem item;
             if (devs[i].hwVer == SDRPLAY_RSP1_ID) item.name = "RSP1";
@@ -658,15 +698,20 @@ public:
     }
 
     bool open(std::string id, uint32_t requestedRate = 0) override {
-        std::lock_guard<std::mutex> lock(hwMtx); if (isSelected) close();
-        if (activeInstances == 0) if (sdrplay_api_Open() != sdrplay_api_Success) return false;
+        if (isSelected) close();   // close() takes hwMtx itself
+        std::lock_guard<std::mutex> lock(hwMtx);
+        if (activeInstances == 0) if (!sdrplayApiOpen()) return false;
         activeInstances++;
-        sdrplay_api_DeviceT devs[6]; unsigned int nDevs = 0; sdrplay_api_GetDevices(devs, &nDevs, 6); 
-        if (nDevs == 0) { activeInstances--; if(activeInstances == 0) sdrplay_api_Close(); return false; }
+        // Keep the device list locked from reading it until the device is selected
+        sdrplay_api_LockDeviceApi();
+        sdrplay_api_DeviceT devs[6]; unsigned int nDevs = 0; sdrplay_api_GetDevices(devs, &nDevs, 6);
+        if (nDevs == 0) { sdrplay_api_UnlockDeviceApi(); activeInstances--; if(activeInstances == 0) sdrplay_api_Close(); return false; }
         int foundIdx = 0;
         if (!id.empty()) { for(unsigned int i=0; i<nDevs; i++) { if (std::string(devs[i].SerNo) == id) { foundIdx = i; break; } } }
-        currentDevice = devs[foundIdx]; currentDevice.tuner = sdrplay_api_Tuner_A; 
-        if (sdrplay_api_SelectDevice(&currentDevice) != sdrplay_api_Success) { activeInstances--; if(activeInstances == 0) sdrplay_api_Close(); return false; } 
+        currentDevice = devs[foundIdx]; currentDevice.tuner = sdrplay_api_Tuner_A;
+        const bool selected = (sdrplay_api_SelectDevice(&currentDevice) == sdrplay_api_Success);
+        sdrplay_api_UnlockDeviceApi();
+        if (!selected) { activeInstances--; if(activeInstances == 0) sdrplay_api_Close(); return false; }
         isSelected = true;
         if (sdrplay_api_GetDeviceParams(currentDevice.dev, &deviceParams) != sdrplay_api_Success) { close(); return false; }
         if (requestedRate == 0) requestedRate = 2000000;

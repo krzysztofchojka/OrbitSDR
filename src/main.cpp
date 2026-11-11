@@ -593,7 +593,32 @@ int main() {
             else if (idx == 2) {
                 cachedDevices = SdrPlaySource::getDeviceList();
                 if (cachedDevices.empty()) {
+#ifdef _WIN32
+                    const std::string svc = sdrplayServiceState();
+                    if (svc == "stopped") {
+                        // The service crashed or was stopped: offer to start it (needs administrator rights)
+                        int answer = MessageBoxA(NULL,
+                            "The SDRplay API Service is not running (it may have crashed).\n"
+                            "OrbitSDR and other SDRplay API programs need it to see the device.\n"
+                            "(SDRconnect doesn't use it, so it can still work.)\n\n"
+                            "Start the service now? Windows will ask for administrator permission.",
+                            "SDRplay", MB_YESNO | MB_ICONWARNING);
+                        if (answer == IDYES && sdrplayStartService()) {
+                            for (int i = 0; i < 20 && sdrplayServiceState() != "running"; i++)
+                                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                            cachedDevices = SdrPlaySource::getDeviceList();
+                        }
+                        if (cachedDevices.empty() && answer == IDYES)
+                            showPopup("SDRplay", "No SDRplay device found yet.\n\nIf the service didn't start, open 'Services' (services.msc), select 'SDRplay API Service' and click Start - or restart the computer.");
+                    } else if (svc == "missing") {
+                        showPopup("SDRPlay Info", "The SDRplay API is not installed.\n\nIf you want to use SDRPlay, please install the official API from:\nhttps://www.sdrplay.com/downloads/");
+                    } else {
+                        showPopup("SDRPlay Info", "No SDRPlay device found.\n\nCheck the USB connection and close other programs that use the device (e.g. SDRuno or SDRconnect).");
+                    }
+#else
                     showPopup("SDRPlay Info", "No SDRPlay device found or SDRPlay API Service is not installed.\n\nIf you want to use SDRPlay, please install the official API from:\nhttps://www.sdrplay.com/downloads/");
+#endif
                 }
             }
             else if (idx == 3) cachedDevices = AudioCaptureSource::getDeviceList();
@@ -2418,6 +2443,19 @@ int main() {
 
     dspRunning = false;
     if (dspThread.joinable()) dspThread.join();
+
+    // Release the radio while everything is still alive. Leaving it to the destructor of
+    // the global source would run after main() returns, when the driver libraries may
+    // already be shutting down; the SDRplay API service doesn't cope well with a client
+    // that disappears in the middle of a stream.
+    {
+        std::lock_guard<std::mutex> l(sourceMtx);
+        if (currentSource) {
+            currentSource->stop();
+            currentSource->close();
+            currentSource = nullptr;
+        }
+    }
 
     return 0;
 }
