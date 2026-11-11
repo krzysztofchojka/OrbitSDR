@@ -9,6 +9,7 @@
 #include <functional>
 #include <algorithm>
 #include <filesystem>
+#include <atomic>
 #include "../Core/SDRModule.h"
 #include "../../NativeDialogs.h"
 #include "ToneDemod.h"
@@ -17,6 +18,10 @@
 //  Shared UI for the image decoders (SSTV, WEFAX): a large panel at the
 //  bottom of the waterfall with the picture on the left (scrollable) and
 //  the decoder settings on the right, plus PNG saving.
+//
+//  Input: with I/Q the decoder demodulates its own channel (yellow handle
+//  on the tuning bar, see DecoderChannels.h), so the main demodulator is
+//  free for listening. With audio input it decodes the input audio.
 //
 //  Threading: processAudio() runs on the DSP thread, draw()/handleEvent()
 //  on the UI thread. Everything shared is guarded by 'mtx'. Widget
@@ -126,6 +131,23 @@ protected:
     std::string message;                            // last user facing message (e.g. "Saved ...")
 
     struct PendingSave { std::vector<uint8_t> rgba; unsigned w = 0, h = 0; std::string tag; };
+
+    // --- own channel (I/Q input) ---
+    ChannelSet channels;
+    std::unique_ptr<Demodulator> chDemod;
+    double chDemodRate = 0.0;
+    std::atomic<bool> audioInput {false};
+    std::atomic<long long> radioHz {0};
+    std::vector<float> chMono;
+
+    // Feeds demodulated audio (48 kHz) into the tone demodulator and the decoder
+    void feedAudio(const float* a, size_t n) {
+        std::lock_guard<std::mutex> l(mtx);
+        trackScratch.clear();
+        tone.process(a, n, trackScratch);
+        updateHistogram(trackScratch);
+        processTrack(trackScratch);
+    }
     std::unique_ptr<PendingSave> pendingSave;       // queued by the auto-save (DSP thread)
 
     // --- implemented by the decoders (called with mtx held) ---
@@ -270,13 +292,31 @@ public:
         return std::clamp(windowHeight * 0.45f, 390.0f, 560.0f);
     }
 
+    // Audio input: the input audio is the signal
     void processAudio(const std::vector<float>& audio) override {
-        std::lock_guard<std::mutex> l(mtx);
-        trackScratch.clear();
-        tone.process(audio.data(), audio.size(), trackScratch);
-        updateHistogram(trackScratch);
-        processTrack(trackScratch);
+        if (!audioInput || audio.empty()) return;
+        feedAudio(audio.data(), audio.size());
     }
+
+    // I/Q input: demodulate the own channel
+    void processIQ(const std::vector<std::complex<double>>& iq, double sampleRate, double tunedOffset) override {
+        if (audioInput || iq.empty() || sampleRate <= 0.0) return;
+        const auto rc = channels.update(radioHz, sampleRate, tunedOffset);
+        if (rc.empty() || !rc[0].inBand) return;
+        if (!chDemod || chDemodRate != sampleRate) {
+            chDemod = std::make_unique<Demodulator>(sampleRate, 48000.0);
+            chDemodRate = sampleRate;
+        }
+        const DecoderChannel& c = rc[0].ch;
+        const std::vector<float> st = chDemod->process(iq, rc[0].offsetHz, c.widthHz, c.listenMode, false);
+        chMono.resize(st.size() / 2);
+        for (size_t i = 0; i < chMono.size(); i++) chMono[i] = st[i * 2];
+        feedAudio(chMono.data(), chMono.size());
+    }
+
+    void setAudioInput(bool audio) override { audioInput = audio; }
+    void setRadioFrequency(long long hz) override { radioHz = hz; }
+    ChannelSet* channelSet() override { return &channels; }
 
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
         if (!enabled) return false;
@@ -374,6 +414,10 @@ public:
         st.setPosition({cx, cy});
         win.draw(st);
         cy += 18.0f;
+        sf::Text chl = text(audioInput ? std::string("Input: audio") : channels.describe(), 20, sf::Color(255, 210, 0));
+        chl.setPosition({cx, cy});
+        win.draw(chl);
+        cy += 16.0f;
 
         // Tone histogram: shows where the audio tones are, to help with tuning
         const float hx = cx, hw = SETTINGS_W - 24.0f, hh = 28.0f;

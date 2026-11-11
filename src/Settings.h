@@ -53,6 +53,22 @@ inline std::string getIsmLogFilePath() {
     return getConfigDir() + PATH_SEP + "ism.log";
 }
 
+// Returns the full path to acars.log (messages of the ACARS decoder)
+inline std::string getAcarsLogFilePath() {
+    return getConfigDir() + PATH_SEP + "acars.log";
+}
+
+// Folder offered first when exporting decoder logs (the user's Documents folder)
+inline std::string getDefaultExportPath() {
+    #ifdef _WIN32
+        const char* userProfile = getenv("USERPROFILE");
+        return userProfile ? std::string(userProfile) + "\\Documents" : std::string("C:\\");
+    #else
+        const char* home = getenv("HOME");
+        return home ? std::string(home) : std::string("/tmp");
+    #endif
+}
+
 inline std::string getDefaultRecordingPath() {
     std::string path;
     #ifdef _WIN32

@@ -64,6 +64,8 @@ public:
     int audioNcoNormCounter = 0;
 
     float audioLpfState = 0.0f;
+    float dcBlock = 0.0f;   // AM carrier level (per instance: decoders run their own demodulators)
+    float dataDc = 0.0f;    // wide NFM data DC
     float deemphStateL = 0.0f;
     float deemphStateR = 0.0f;
     float wfmDcState = 0.0f;
@@ -330,7 +332,6 @@ public:
                     float rawAudio = 0.0f;
 
                     if (mode == Mode::AM) {
-                        static float dcBlock = 0.0f;
                         float mag = std::abs(filtered);
                         dcBlock = 0.995f * dcBlock + 0.005f * mag;
                         rawAudio = (mag - dcBlock) * 6.0f;
@@ -345,7 +346,6 @@ public:
                         if (bandwidthHz > 14000.0) { 
                             float normalized = phaseDelta / (float)PI;
                             normalized *= 5.0f;
-                            static float dataDc = 0.0f;
                             dataDc = 0.99f * dataDc + 0.01f * normalized;
                             rawAudio = std::clamp(normalized - dataDc, -1.0f, 1.0f);
                             audioLpfState = rawAudio;

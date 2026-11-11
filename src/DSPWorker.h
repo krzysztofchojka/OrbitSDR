@@ -22,6 +22,8 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
     #endif
     Demodulator demod(2000000, AUDIO_RATE);
     APRSDecoder aprsDecoder(AUDIO_RATE);
+    std::unique_ptr<Demodulator> aprsDemod;   // APRS channel (I/Q input), see aprsChannels()
+    double aprsDemodRate = 0.0;
     InspectorDSP inspector;
     RDSDecoder rdsDecoder;
     AudioLeveler leveler;
@@ -90,6 +92,7 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
         float currentZoom = 1.0f;
         double viewCenter = 0.5;
         SDRModule* activeModule = nullptr;
+        bool audioIn = false;
 
         {
             std::lock_guard<std::mutex> lock(shared.mtx);
@@ -117,6 +120,7 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
             currentZoom = shared.zoomLevel;
             viewCenter = shared.viewCenterPct;
             activeModule = shared.activeDecoder;
+            audioIn = shared.audioInput;
         }
 
         bool justSeeked = false;
@@ -187,6 +191,12 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
         int chunkSize = std::clamp((int)(sr / 20.0), 4096, 262144);
         if (iqBuffer.size() != chunkSize) iqBuffer.resize(chunkSize);
 
+        // Input set to Audio (Source / Input switch): the samples already are audio, so
+        // only RAW makes sense (any other demodulator would turn the audio into noise)
+        const bool audioSource = audioIn;
+        if (audioSource) mode = Mode::RAW;
+        if (activeModule) activeModule->setAudioInput(audioSource);
+
         // RDS runs only in WFM mode. Its data belongs to one station, so it is
         // cleared whenever the receiver moves to a different frequency.
         const bool rdsActive = rdsOn && mode == Mode::WFM && RDSDecoder::rateSupported(sr);
@@ -233,6 +243,7 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
             }
 
             double freqOffset = (targetFreqPct - 0.5) * sr;
+            if (audioSource) freqOffset = 0.0;   // audio: nothing to tune, keep it unshifted
             std::vector<Complex> chunkToProcess(iqBuffer.begin(), iqBuffer.begin() + readCount);
             inspector.process(chunkToProcess, sr, freqOffset, bw, shared);
 
@@ -260,10 +271,24 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                 }
 
                 if (aprsActive) {
+                    // Audio input: the input audio itself. I/Q: the own APRS channel (NFM)
+                    const std::vector<float>* src = &audioData;
+                    std::vector<float> chAudio;
+                    if (!audioSource) {
+                        const auto rc = aprsChannels().update(centerHz, sr, freqOffset);
+                        if (!rc.empty() && rc[0].inBand) {
+                            if (!aprsDemod || aprsDemodRate != sr) {
+                                aprsDemod = std::make_unique<Demodulator>(sr, AUDIO_RATE);
+                                aprsDemodRate = sr;
+                            }
+                            chAudio = aprsDemod->process(chunkToProcess, rc[0].offsetHz, rc[0].ch.widthHz, Mode::NFM, false);
+                        }
+                        src = &chAudio;
+                    }
                     std::vector<float> mono;
-                    mono.reserve(audioData.size()/2);
-                    for(size_t i=0; i<audioData.size(); i+=2) mono.push_back(audioData[i]);
-                    aprsDecoder.process(mono);
+                    mono.reserve(src->size()/2);
+                    for(size_t i=0; i<src->size(); i+=2) mono.push_back((*src)[i]);
+                    if (!mono.empty()) aprsDecoder.process(mono);
                 }
 
                 if (activeModule && activeModule->enabled) {

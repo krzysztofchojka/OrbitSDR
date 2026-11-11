@@ -5,6 +5,7 @@
 #include <string>
 #include <memory>
 #include "../../UI.h"
+#include "DecoderChannels.h"
 
 struct ModuleContext {
     float sampleRate;
@@ -30,10 +31,21 @@ public:
     virtual void setRadioFrequency(long long /*centerHz*/) {}
     // True for decoders of short bursts (ISM): the radio's AGC must not change the gain mid-packet
     virtual bool wantsBurstAgc() const { return false; }
+    // True when the input switch (Source / Input) is set to Audio: then processAudio()
+    // carries the signal and processIQ() must not be used for decoding
+    virtual void setAudioInput(bool /*audio*/) {}
+
+    // The channels this decoder listens to (yellow bands + handles on the tuning bar).
+    // nullptr for decoders without channels. Not shown while the input is audio.
+    virtual ChannelSet* channelSet() { return nullptr; }
 
     virtual void draw(sf::RenderWindow& window, float x, float y, float w, float h) = 0;
     // Returns true if the event was used by the module's panel
     virtual bool handleEvent(const sf::Event& /*ev*/, const sf::RenderWindow& /*win*/) { return false; }
+    // A popup window of the module (e.g. message details). While it is open the module
+    // gets every event first, and drawModal() is called after the rest of the UI.
+    virtual bool modalOpen() const { return false; }
+    virtual void drawModal(sf::RenderWindow& /*window*/) {}
     // Height of the module's panel at the bottom of the waterfall
     virtual float panelHeight(float /*windowHeight*/) const { return 250.0f; }
 };

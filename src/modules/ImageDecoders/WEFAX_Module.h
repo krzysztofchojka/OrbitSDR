@@ -133,6 +133,16 @@ protected:
 
 public:
     WEFAXModule() : ImageDecoderPanel("WEFAX", 1900.0, 500.0) {
+        channels.name = "WEFAX USB";
+        // Assigned frequencies (DWD Pinneberg, Northwood, NOAA Boston, Point Reyes);
+        // the USB dial sits 1.9 kHz below them
+        const long long assigned[] = { 3855000, 7880000, 13882500, 2618500, 4610000, 8040000, 11086500,
+                                       4235000, 6340500, 9110000, 12750000, 4346000, 8682000, 12786000 };
+        for (long long f : assigned) channels.presets.push_back(f - 1900);
+        channels.maxChannels = 1;
+        channels.defaultWidth = 3000.0;
+        channels.sideband = +1;
+        channels.listenMode = Mode::USB;
         dec.onImageComplete = [this]() { queueAutoSave(); };   // runs with mtx held
     }
 

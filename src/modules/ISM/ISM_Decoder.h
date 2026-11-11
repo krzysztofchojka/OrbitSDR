@@ -2,6 +2,8 @@
 
 #include "../Core/SDRModule.h"
 #include "IsmChannel.h"
+#include "../Core/DetailsPopup.h"
+#include "../Core/ModuleLog.h"
 #ifdef ENABLE_RTL433
 #include "rtl433_bridge.h"
 #endif
@@ -17,6 +19,7 @@
 #include <fstream>
 #include <algorithm>
 #include <functional>
+#include <atomic>
 
 // =====================================================================
 //  ISM band decoder (433.92 / 868 / 315 / 915 MHz) based on rtl_433.
@@ -39,6 +42,7 @@ class ISMDecoder : public SDRModule {
         double lastSeen = 0.0;
         std::string lastTime;
         int count = 0;
+        bool uncertain = false;   // from a decoder rtl_433 disables by default
     };
 
     std::mutex mtx;
@@ -53,7 +57,10 @@ class ISMDecoder : public SDRModule {
     int events = 0;
     std::string status = "Waiting for signal...";
     std::string diag;
-    bool allDecoders = false;
+    bool allDecoders = false;     // + the decoders rtl_433 disables by default
+    bool unknownSignals = false;  // + packages nobody decoded (guessed modulation and bits)
+    std::atomic<bool> audioInput {false};
+    ChannelSet channels;   // the decoded band (see DecoderChannels.h)
     std::string selectedKey;
     bool rateChanged = false;
     std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
@@ -67,12 +74,14 @@ class ISMDecoder : public SDRModule {
     float tableBodyY = 0.0f, tableRowH = 16.0f;
     int tableFirst = 0, tableVisible = 0;
     std::vector<std::string> drawnKeys;   // device keys in table order (for clicks)
-    std::shared_ptr<SdrButton> btnClear, btnRate, btnDecoders;
+    std::shared_ptr<SdrButton> btnClear, btnRate, btnDecoders, btnUnknown, btnLog, btnExport;
+    DetailsPopup popup;
 
     // meta fields are shown in their own columns or not at all
     static bool isMeta(const std::string& k) {
         static const char* meta[] = { "model", "id", "channel", "protocol", "mod", "freq", "freq1", "freq2",
-                                      "rssi", "snr", "noise", "mic", "time", "subtype" };
+                                      "rssi", "snr", "noise", "mic", "time", "subtype",
+                                      "note", "modulation", "timing", "pulses" };
         for (const char* m : meta) if (k == m) return true;
         return false;
     }
@@ -137,6 +146,8 @@ class ISMDecoder : public SDRModule {
         Device& d = devices[key];
         d.key = key; d.model = model; d.id = id; d.channel = chan; d.rssi = rssi;
         d.summary = summary; d.fields = fields;
+        d.uncertain = false;
+        for (const Field& f : fields) if (f.key == "note") d.uncertain = true;
         d.lastSeen = now(); d.lastTime = wallTime(false);
         d.count++;
         events++;
@@ -145,23 +156,25 @@ class ISMDecoder : public SDRModule {
         recentEvents.push_front(line);
         if (recentEvents.size() > 40) recentEvents.pop_back();
 
-        if (!logPath.empty()) {
-            std::ofstream log(logPath, std::ios::app);
-            if (log.is_open()) {
-                log << "[" << wallTime(true) << "] " << model;
-                if (!protocol.empty()) log << " [" << protocol << "]";
-                for (const Field& f : fields)
-                    if (f.key != "model" && f.key != "protocol") log << "  " << f.key << "=" << f.value;
-                log << "\n";
-            }
-        }
+        std::string logLine = model;
+        if (!protocol.empty()) logLine += " [" + protocol + "]";
+        for (const Field& f : fields)
+            if (f.key != "model" && f.key != "protocol") logLine += "  " + f.key + "=" + f.value;
+        log.add(logLine);
     }
 
 public:
-    // Text log of all received messages (empty = no log). Set by main.
-    std::string logPath;
+    // Log of all received messages (file set by main) and the folder offered for exports
+    ModuleLog log;
+    std::string exportDir;
 
-    ISMDecoder() : SDRModule("ISM") {}
+    ISMDecoder() : SDRModule("ISM") {
+        channels.name = "ISM";
+        channels.presets = { 433920000, 868300000, 315000000, 915000000, 345000000 };
+        channels.maxChannels = 1;
+        channels.defaultWidth = 250000.0 * 0.84;   // +-0.42 of the rtl_433 sample rate
+        channels.listenMode = Mode::AM;
+    }
     ~ISMDecoder() override {
 #ifdef ENABLE_RTL433
         std::lock_guard<std::mutex> l(mtx);
@@ -178,6 +191,9 @@ public:
     }
 
     bool wantsBurstAgc() const override { return true; }
+    void setAudioInput(bool audio) override { audioInput = audio; }
+
+    ChannelSet* channelSet() override { return &channels; }
 
     void init(const ModuleContext& ctx) override {
         font = &ctx.font;
@@ -187,6 +203,11 @@ public:
             devices.clear(); recentEvents.clear(); selectedKey.clear();
             events = 0;
         };
+        btnLog = std::make_shared<SdrButton>(110.0f, 24.0f, "Open log", *font);
+        btnLog->onClick = [this]() { log.openLogFile(); };
+        btnExport = std::make_shared<SdrButton>(110.0f, 24.0f, "Export", *font);
+        btnExport->onClick = [this]() { log.exportSession(exportDir, "ISM"); };
+        popup.init(*font);
         btnRate = std::make_shared<SdrButton>(150.0f, 24.0f, "Width: 250 kHz", *font);
         btnRate->onClick = [this]() {
             std::lock_guard<std::mutex> l(mtx);
@@ -199,7 +220,14 @@ public:
             std::lock_guard<std::mutex> l(mtx);
             allDecoders = !allDecoders;
             rateChanged = true;   // recreate rtl_433 with the other decoder set
-            btnDecoders->setText(allDecoders ? "Decoders: all" : "Decoders: default");
+            btnDecoders->setText(allDecoders ? "Decoders: + extra" : "Decoders: default");
+        };
+        btnUnknown = std::make_shared<SdrButton>(150.0f, 24.0f, "Unknown: hidden", *font);
+        btnUnknown->onClick = [this]() {
+            std::lock_guard<std::mutex> l(mtx);
+            unknownSignals = !unknownSignals;
+            rateChanged = true;   // recreate rtl_433 with the analyzer on / off
+            btnUnknown->setText(unknownSignals ? "Unknown: shown" : "Unknown: hidden");
         };
     }
 
@@ -226,6 +254,13 @@ public:
 #ifdef ENABLE_RTL433
         std::lock_guard<std::mutex> l(mtx);
 
+        // rtl_433 needs the raw radio signal; demodulated audio has lost what it decodes
+        if (audioInput) {
+            status = "ISM needs I/Q from an SDR: set Input signal to I/Q";
+            diag = "Use RTL-SDR, SDRplay, RTL-TCP or an I/Q (stereo) recording";
+            return;
+        }
+
         double rate = outRate;
         if (sampleRate < rate && rate > 250000.0) rate = 250000.0;   // 1 MHz needs a wider input
         if (sampleRate < rate) {
@@ -235,15 +270,25 @@ public:
 
         if (!bridge || rateChanged || rate != activeRate) {
             destroyBridge();
-            bridge = ism_create((uint32_t)rate, allDecoders ? 1 : 0, &ISMDecoder::eventThunk, this);
+            bridge = ism_create((uint32_t)rate,
+                                (allDecoders ? ISM_EXTRA_DECODERS : 0) | (unknownSignals ? ISM_UNKNOWN_SIGNALS : 0),
+                                &ISMDecoder::eventThunk, this);
             rateChanged = false;
             if (!bridge) { status = "rtl_433 initialisation failed"; return; }
             activeRate = rate;
+            channels.setWidth(rate * 0.84);
             channel.reset();
             cs16.clear();
         }
 
-        const long long hz = centerHz > 0 ? centerHz + (long long)std::llround(tunedOffset) : 0;
+        const auto rc = channels.update(centerHz, sampleRate, tunedOffset);
+        if (rc.empty()) return;
+        const double offset = rc[0].offsetHz;
+        if (!rc[0].inBand) {
+            status = channels.describe();
+            return;
+        }
+        const long long hz = centerHz > 0 ? rc[0].freqHz : 0;
         if (std::llabs(hz - decodeHz) > 5000) {   // retuned: drop the signal in progress
             decodeHz = hz;
             ism_reset(bridge);
@@ -251,7 +296,7 @@ public:
         }
         if (hz > 0) ism_set_frequency(bridge, (uint32_t)std::clamp(hz, 0LL, 4294967295LL));
 
-        if (!channel.configure(sampleRate, tunedOffset, rate)) return;
+        if (!channel.configure(sampleRate, offset, rate)) return;
         channel.process(iq.data(), iq.size(), cs16);
 
         // push in blocks of ~65 ms (rtl_433 works on whole buffers)
@@ -263,10 +308,10 @@ public:
 
         char b[160];
         if (hz > 0)
-            std::snprintf(b, sizeof(b), "%.3f MHz  +-%.0f kHz   %d decoders",
-                          hz / 1e6, rate * 0.42 / 1000.0, ism_protocols_enabled(bridge));
+            std::snprintf(b, sizeof(b), "%.3f MHz%s  +-%.0f kHz   %d decoders", hz / 1e6,
+                          rc[0].ch.followVfo ? " (tuner)" : "", rate * 0.42 / 1000.0, ism_protocols_enabled(bridge));
         else
-            std::snprintf(b, sizeof(b), "Tuned frequency  +-%.0f kHz   %d decoders",
+            std::snprintf(b, sizeof(b), "At the tuner  +-%.0f kHz   %d decoders",
                           rate * 0.42 / 1000.0, ism_protocols_enabled(bridge));
         status = b;
 
@@ -283,11 +328,18 @@ public:
 #endif
     }
 
+    bool modalOpen() const override { return popup.isOpen(); }
+    void drawModal(sf::RenderWindow& win) override { popup.draw(win); }
+
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
         if (!enabled) return false;
+        if (popup.handleEvent(ev, win)) return true;
         if (btnClear && btnClear->handleEvent(ev, win)) return true;
+        if (btnLog && btnLog->handleEvent(ev, win)) return true;
+        if (btnExport && btnExport->handleEvent(ev, win)) return true;
         if (btnRate && btnRate->handleEvent(ev, win)) return true;
         if (btnDecoders && btnDecoders->handleEvent(ev, win)) return true;
+        if (btnUnknown && btnUnknown->handleEvent(ev, win)) return true;
         sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
         if (const auto* sc = ev.getIf<sf::Event::MouseWheelScrolled>()) {
             if (!panelRect.contains(m)) return false;
@@ -299,11 +351,24 @@ public:
             if (mb->button == sf::Mouse::Button::Left && tableRect.contains(m) && m.y >= tableBodyY) {
                 int row = (int)((m.y - tableBodyY) / tableRowH);
                 int idx = tableFirst + row;
-                std::lock_guard<std::mutex> l(mtx);
-                if (row >= 0 && row < tableVisible && idx < (int)drawnKeys.size())
-                    selectedKey = (selectedKey == drawnKeys[idx]) ? std::string() : drawnKeys[idx];
-                else
+                std::string title;
+                std::vector<std::pair<std::string, std::string>> rows;
+                {
+                    std::lock_guard<std::mutex> l(mtx);
                     selectedKey.clear();
+                    if (row >= 0 && row < tableVisible && idx < (int)drawnKeys.size()) {
+                        auto it = devices.find(drawnKeys[idx]);
+                        if (it != devices.end()) {
+                            const Device& d = it->second;
+                            selectedKey = d.key;
+                            title = d.model + (d.id.empty() ? "" : "  #" + d.id);
+                            rows.push_back({"Last heard", d.lastTime});
+                            rows.push_back({"Messages", std::to_string(d.count)});
+                            for (const Field& f : d.fields) rows.push_back({f.label, f.value});
+                        }
+                    }
+                }
+                if (!title.empty()) popup.show(title, rows);
             }
             return true;
         }
@@ -394,7 +459,7 @@ public:
             }
             char b[16];
             std::string cells[7];
-            cells[0] = d.model;
+            cells[0] = d.uncertain ? d.model + " (?)" : d.model;
             cells[1] = d.id.empty() ? "-" : d.id;
             cells[2] = d.channel.empty() ? "-" : d.channel;
             cells[3] = d.summary;
@@ -452,40 +517,28 @@ public:
         btnRate->setPosition(sx + 115.0f, sy);
         btnRate->draw(win);
         sy += 28.0f;
+        btnLog->setPosition(sx, sy);
+        btnLog->draw(win);
         btnDecoders->setPosition(sx + 115.0f, sy);
         btnDecoders->draw(win);
+        sy += 28.0f;
+        btnExport->setPosition(sx, sy);
+        btnExport->draw(win);
+        btnUnknown->setPosition(sx + 115.0f, sy);
+        btnUnknown->draw(win);
         sy += 30.0f;
 
-        const Device* selDev = nullptr;
-        for (const Device& d : list) if (d.key == selKey) { selDev = &d; break; }
         const size_t sideChars = 58;
-        if (selDev) {
-            sf::Text lt = text(fit(selDev->model, 40) + "  (" + selDev->lastTime + ")", 22, Theme::Accent);
-            lt.setPosition({sx, sy});
-            win.draw(lt);
-            sy += 18.0f;
-            for (const Field& f : selDev->fields) {
-                if (sy > y + h - 16.0f) break;
-                sf::Text k = text(fit(f.label, 22), 20, sf::Color(150, 150, 160));
-                k.setPosition({sx, sy});
-                win.draw(k);
-                sf::Text v = text(fit(f.value, 36), 20, sf::Color(225, 225, 230));
-                v.setPosition({sx + 130.0f, sy});
-                win.draw(v);
-                sy += 15.0f;
-            }
-        } else {
-            sf::Text lt = text("Latest messages (click a row for details)", 22, Theme::Accent);
-            lt.setPosition({sx, sy});
-            win.draw(lt);
-            sy += 18.0f;
-            for (const auto& m : recent) {
-                if (sy > y + h - 16.0f) break;
-                sf::Text mt = text(fit(m, sideChars), 20, sf::Color(200, 200, 205));
-                mt.setPosition({sx, sy});
-                win.draw(mt);
-                sy += 15.0f;
-            }
+        sf::Text lt = text("Latest messages (click a table row for details)", 22, Theme::Accent);
+        lt.setPosition({sx, sy});
+        win.draw(lt);
+        sy += 18.0f;
+        for (const auto& m : recent) {
+            if (sy > y + h - 16.0f) break;
+            sf::Text mt = text(fit(m, sideChars), 20, sf::Color(200, 200, 205));
+            mt.setPosition({sx, sy});
+            win.draw(mt);
+            sy += 15.0f;
         }
     }
 };

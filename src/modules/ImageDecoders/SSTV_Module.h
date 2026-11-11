@@ -112,6 +112,24 @@ protected:
 
 public:
     SSTVModule() : ImageDecoderPanel("SSTV", 1750.0, 900.0) {
+        channels.name = "SSTV";
+        // ISS 145.800 (NFM) and the HF SSTV calling frequencies (dial, SSB)
+        channels.presets = { 145800000, 3730000, 7171000, 14230000, 14233000, 21340000, 28680000 };
+        channels.maxChannels = 1;
+        channels.shape = [](DecoderChannel& c) {
+            if (c.freqHz > 0 && c.freqHz < 30000000) {
+                const bool lsb = c.freqHz < 10000000;
+                c.listenMode = lsb ? Mode::LSB : Mode::USB;
+                c.sideband = lsb ? -1 : +1;
+                c.widthHz = 3000.0;
+                c.name = lsb ? "SSTV LSB" : "SSTV USB";
+            } else {
+                c.listenMode = Mode::NFM;
+                c.sideband = 0;
+                c.widthHz = 12500.0;
+                c.name = "SSTV NFM";
+            }
+        };
         dec.onImageComplete = [this]() { queueAutoSave(); };   // runs with mtx held
     }
 

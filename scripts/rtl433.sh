@@ -118,7 +118,8 @@ _rtl433_main() {
     # --- 3. the bridge (our code) + final library, rebuilt when the bridge changes ---
     if [ ! -f "$bdir/librtl433.a" ] || [ "$bridge_src" -nt "$bdir/librtl433.a" ] \
             || [ "$bdir/librtl433_core.a" -nt "$bdir/librtl433.a" ]; then
-        $cc $cflags -c "$bridge_src" -o "$bdir/rtl433_bridge.o" || {
+        # -I src: the bridge includes a quiet copy of src/pulse_analyzer.c
+        $cc $cflags -I"$src/src" -c "$bridge_src" -o "$bdir/rtl433_bridge.o" || {
             echo "[rtl_433] WARNING: compiling the bridge failed, building without the ISM decoder"
             return 1
         }

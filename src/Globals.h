@@ -39,6 +39,22 @@ struct GlobalHwState {
 };
 inline GlobalHwState hwState;
 
+// APRS channel (APRS is built into the DSP worker, not a module): 144.800 (EU),
+// 144.390 (US), 145.825 (ISS) ... or the tuner. See modules/Core/DecoderChannels.h
+inline ChannelSet& aprsChannels() {
+    static ChannelSet c;   // (holds a mutex: configured in place, not copied)
+    static const bool configured = [] {
+        c.name = "APRS";
+        c.presets = { 144800000, 144390000, 144640000, 144575000, 145175000, 145825000, 144930000 };
+        c.maxChannels = 1;
+        c.defaultWidth = 12500.0;
+        c.listenMode = Mode::NFM;
+        return true;
+    }();
+    (void)configured;
+    return c;
+}
+
 enum class RecMode { AUDIO, BASEBAND };
 
 struct AprsLastPacket {
@@ -62,6 +78,8 @@ struct SharedData {
     bool rdsEnabled = false;
     RdsInfo rds;               // latest RDS data, written by the DSP worker
     SDRModule* activeDecoder = nullptr;
+    // Input signal type (Source / Input switch): false = I/Q from a radio, true = demodulated audio
+    bool audioInput = false;
     
     std::deque<AprsLastPacket> aprsHistory;
     AprsLastPacket lastAprs;

@@ -19,9 +19,17 @@ typedef struct ism_bridge ism_bridge;
 typedef void (*ism_event_fn)(void* user, int n, const char* const* keys,
                              const char* const* labels, const char* const* values);
 
+// Flags for ism_create
+enum {
+    // also the ~50 decoders rtl_433 disables by default; they run after all default
+    // decoders (only on packages nobody else decoded) and their messages get a "note"
+    ISM_EXTRA_DECODERS = 1,
+    // packages nobody decoded: guess the modulation and slice the bits (model "Unknown")
+    ISM_UNKNOWN_SIGNALS = 2,
+};
+
 // sample_rate: the rate of the samples given to ism_push_cs16 (250000 or 1000000)
-// all_decoders: also the ~50 decoders rtl_433 disables by default (more false positives)
-ism_bridge* ism_create(uint32_t sample_rate, int all_decoders, ism_event_fn fn, void* user);
+ism_bridge* ism_create(uint32_t sample_rate, int flags, ism_event_fn fn, void* user);
 void ism_destroy(ism_bridge* b);
 
 // Forget the signal in progress (e.g. after a frequency change)

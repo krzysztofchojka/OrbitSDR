@@ -68,6 +68,9 @@ public:
     virtual void setGain(int gainDb) {} 
     virtual void setHardwareOption(std::string name, int value) {}
     virtual bool isHardware() { return false; }
+    // True when the samples are plain (already demodulated) audio, not I/Q:
+    // the sound card input and mono WAV files. The I part carries the audio, Q is 0.
+    virtual bool isAudio() { return false; }
     virtual bool isSeekable() { return false; } 
     virtual void seek(double percent) {}
     virtual double getProgress() { return 0.0; }
@@ -180,9 +183,9 @@ public:
 
         if (!foundFmt || !foundData) return false;
 
-        // Format validation
-        if (channels != 2) {
-            std::cerr << "[FileSource] Error: Only Stereo (2 channel) files supported currently." << std::endl;
+        // Format validation: stereo = I/Q baseband, mono = demodulated audio
+        if (channels != 1 && channels != 2) {
+            std::cerr << "[FileSource] Error: only mono (audio) or stereo (I/Q) files are supported." << std::endl;
             return false;
         }
 
@@ -231,9 +234,9 @@ public:
             const double scale = 1.0 / 32768.0;
             int16_t* ptr = (int16_t*)rawBuf.data();
             for (int i = 0; i < samplesRead; i++) {
-                // I = left, Q = right
-                double i_val = ptr[i * 2] * scale;
-                double q_val = ptr[i * 2 + 1] * scale;
+                // I = left, Q = right (mono audio: Q = 0)
+                double i_val = ptr[i * channels] * scale;
+                double q_val = channels == 2 ? ptr[i * 2 + 1] * scale : 0.0;
                 out[i] = Complex(i_val, q_val);
             }
         }
@@ -243,8 +246,8 @@ public:
             const double scale = 1.0 / 127.5;
             uint8_t* ptr = rawBuf.data();
             for (int i = 0; i < samplesRead; i++) {
-                double i_val = (ptr[i * 2] - 127.5) * scale;
-                double q_val = (ptr[i * 2 + 1] - 127.5) * scale;
+                double i_val = (ptr[i * channels] - 127.5) * scale;
+                double q_val = channels == 2 ? (ptr[i * 2 + 1] - 127.5) * scale : 0.0;
                 out[i] = Complex(i_val, q_val);
             }
         }
@@ -252,9 +255,11 @@ public:
              // 24-bit SIGNED packed (rare, but HDSDR writes it)
              const double scale = 1.0 / 8388608.0;
              uint8_t* ptr = rawBuf.data();
+             const int stride = 3 * channels;
              for(int i=0; i < samplesRead; i++) {
-                 int32_t i_int = (ptr[i*6+0] << 8) | (ptr[i*6+1] << 16) | (ptr[i*6+2] << 24);
-                 int32_t q_int = (ptr[i*6+3] << 8) | (ptr[i*6+4] << 16) | (ptr[i*6+5] << 24);
+                 const uint8_t* q = ptr + i * stride;
+                 int32_t i_int = (q[0] << 8) | (q[1] << 16) | (q[2] << 24);
+                 int32_t q_int = channels == 2 ? ((q[3] << 8) | (q[4] << 16) | (q[5] << 24)) : 0;
                  out[i] = Complex((i_int >> 8) * scale, (q_int >> 8) * scale);
              }
         }
@@ -262,7 +267,7 @@ public:
             // 32-bit FLOAT (commonly used by SDR# IQ Rec)
             float* ptr = (float*)rawBuf.data();
             for(int i=0; i<samplesRead; i++) {
-                out[i] = Complex(ptr[i*2], ptr[i*2+1]);
+                out[i] = Complex(ptr[i*channels], channels == 2 ? ptr[i*2+1] : 0.0f);
             }
         }
 
@@ -273,6 +278,7 @@ public:
 
     double getSampleRate() override { return (double)sampleRate; }
     bool isSeekable() override { return true; }
+    bool isAudio() override { return channels == 1; }
 
     void seek(double percent) override {
         if (!file.is_open()) return;
@@ -299,7 +305,8 @@ public:
     }
 
     std::vector<std::string> getAvailableSampleRatesText() override { 
-        return { "Format: " + std::to_string(bitsPerSample) + "-bit " + ((bitsPerSample==8)?"Unsigned":"Signed") }; 
+        return { "Format: " + std::to_string(bitsPerSample) + "-bit " + ((bitsPerSample==8)?"Unsigned":"Signed") +
+                 (channels == 1 ? ", mono audio" : ", I/Q") };
     }
     std::vector<uint32_t> getAvailableSampleRatesValues() override { return {0}; }
 };
@@ -1010,6 +1017,7 @@ public:
     double getSampleRate() override { return sampleRate; }
 
     std::vector<std::string> getAvailableSampleRatesText() override { return {"48.0 kHz"}; }
+    bool isAudio() override { return true; }
     std::vector<uint32_t> getAvailableSampleRatesValues() override { return {48000}; }
 };
 

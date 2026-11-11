@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <algorithm>
+#include <atomic>
 
 // =====================================================================
 //  AIS decoder module (ship tracking on VHF 161.975 / 162.025 MHz).
@@ -37,6 +38,8 @@ class AISDecoder : public SDRModule {
     std::deque<std::string> recentMessages;
     long long centerHz = 0;
     std::string channelInfo = "Waiting for signal...";
+    std::atomic<bool> audioInput {false};
+    ChannelSet channels;   // the two AIS channels (or the tuner, see DecoderChannels.h)
     std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
 
     const sf::Font* font = nullptr;
@@ -64,6 +67,14 @@ class AISDecoder : public SDRModule {
 
 public:
     AISDecoder() : SDRModule("AIS") {
+        channels.name = "AIS";
+        channels.presets = { AIS1_HZ, AIS2_HZ };
+        channels.maxChannels = 2;
+        channels.defaultWidth = 18000.0;   // +-9 kHz channel filter
+        channels.listenMode = Mode::NFM;
+        channels.shape = [](DecoderChannel& c) {
+            c.name = std::llabs(c.freqHz - AIS1_HZ) < 1000 ? "AIS 1" : std::llabs(c.freqHz - AIS2_HZ) < 1000 ? "AIS 2" : "AIS";
+        };
         for (int i = 0; i < 2; i++) {
             rx[i].decoder.sharedVessels = &vessels;
             rx[i].decoder.onMessage = [this, i](const ais::Message& m) {
@@ -104,22 +115,19 @@ public:
     void processIQ(const std::vector<std::complex<double>>& iq, double sampleRate, double tunedOffset) override {
         if (!enabled || iq.empty() || sampleRate <= 0.0) return;
         std::lock_guard<std::mutex> l(mtx);
-
-        // Which channels can be received? Both AIS channels if they fit into the
-        // band (with room for the +-9 kHz channel filter), else the tuned frequency.
-        const double usable = sampleRate / 2.0 - 15000.0;
-        bool in1 = centerHz > 0 && std::abs((double)(AIS1_HZ - centerHz)) < usable;
-        bool in2 = centerHz > 0 && std::abs((double)(AIS2_HZ - centerHz)) < usable;
-        if (in1 || in2) {
-            rx[0].active = in1; rx[0].offsetHz = (double)(AIS1_HZ - centerHz);
-            rx[1].active = in2; rx[1].offsetHz = (double)(AIS2_HZ - centerHz);
-            channelInfo = std::string("AIS 1 (161.975): ") + (in1 ? "on" : "out of band") +
-                          "   AIS 2 (162.025): " + (in2 ? "on" : "out of band");
-        } else {
-            rx[0].active = true; rx[0].offsetHz = tunedOffset;
-            rx[1].active = false;
-            channelInfo = "Tuned frequency only (tune ~162.000 MHz for both)";
+        if (audioInput) {   // AIS needs the I/Q of the two channels
+            rx[0].active = rx[1].active = false;
+            channelInfo = "AIS needs I/Q from an SDR: set Input signal to I/Q";
+            return;
         }
+
+        // Both AIS channels when they fit into the band, else the tuner (see ChannelSet)
+        const auto rc = channels.update(centerHz, sampleRate, tunedOffset);
+        for (int i = 0; i < 2; i++) {
+            rx[i].active = i < (int)rc.size() && rc[i].inBand;
+            if (i < (int)rc.size()) rx[i].offsetHz = rc[i].offsetHz;
+        }
+        channelInfo = channels.describe();
 
         const double t = now();
         for (auto& r : rx) {
@@ -131,6 +139,10 @@ public:
             r.decoder.process(disc.data(), power.data(), disc.size());
         }
     }
+
+    void setAudioInput(bool audio) override { audioInput = audio; }
+
+    ChannelSet* channelSet() override { return &channels; }
 
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
         if (!enabled) return false;

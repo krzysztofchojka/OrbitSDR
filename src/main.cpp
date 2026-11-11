@@ -38,6 +38,7 @@
 #include "modules/ImageDecoders/SSTV_Module.h"
 #include "modules/ImageDecoders/WEFAX_Module.h"
 #include "modules/ISM/ISM_Decoder.h"
+#include "modules/ACARS/ACARS_Decoder.h"
 
 int main() {
     #ifdef _WIN32
@@ -164,8 +165,15 @@ int main() {
     modules.push_back(std::move(wefaxMod));
     auto ismMod = std::make_unique<ISMDecoder>();
     ismMod->init(ctx);
-    ismMod->logPath = getIsmLogFilePath();
+    ismMod->log.setPath(getIsmLogFilePath());
+    ismMod->exportDir = getDefaultExportPath();
     ISMDecoder* ptrISM = ismMod.get();
+    auto acarsMod = std::make_unique<ACARSDecoder>();
+    acarsMod->init(ctx);
+    acarsMod->log.setPath(getAcarsLogFilePath());
+    acarsMod->exportDir = getDefaultExportPath();
+    ACARSDecoder* ptrACARS = acarsMod.get();
+    modules.push_back(std::move(acarsMod));
     modules.push_back(std::move(ismMod));
 
     auto cursorArrow = sf::Cursor::createFromSystem(sf::Cursor::Type::Arrow);
@@ -202,9 +210,9 @@ int main() {
     Sidebar sidebar(SIDEBAR_W, font);
 
     auto modDecoders = sidebar.addModule("Decoders");
-    auto chkAprs = std::make_shared<Checkbox>("Enable APRS (144.800)", font);
+    auto chkAprs = std::make_shared<Checkbox>("APRS (packet radio, 144.800)", font);
     auto btnCopyAprs = std::make_shared<SdrButton>(200, 25, "Copy Last Packet", font);
-    auto chkAIS = std::make_shared<Checkbox>("Enable AIS (161.975 / 162.025)", font);
+    auto chkAIS = std::make_shared<Checkbox>("AIS (ships, 161.975 / 162.025)", font);
 
     auto btnNFM = std::make_shared<SdrButton>(36, 25, "NFM", font);
     auto btnAM  = std::make_shared<SdrButton>(36, 25, "AM", font);
@@ -219,6 +227,20 @@ int main() {
     rowModes->add(btnUSB); rowModes->add(btnLSB); rowModes->add(btnRAW); rowModes->add(btnOFF);
 
     auto slBW = std::make_shared<Slider>(SIDEBAR_W - 40, 1000.0f, 200000.0f, 12500.0f, "Bandwidth (Hz)", font);
+
+    // Input signal type: I/Q from a radio, or audio that is already demodulated (sound card,
+    // a receiver's audio output, audio recordings). Set automatically when a source is opened,
+    // the user can change it. Every demodulator and decoder follows this switch.
+    bool inputIsAudio = false;
+    std::function<void(bool)> applyInputType;   // assigned once the demodulator buttons exist
+    auto lblInput = std::make_shared<Label>("Input signal:", font);
+    auto btnInIQ = std::make_shared<SdrButton>(136, 25, "I/Q (radio)", font);
+    auto btnInAudio = std::make_shared<SdrButton>(136, 25, "Audio", font);
+    btnInIQ->setActive(true);
+    btnInIQ->onClick = [&]() { if (applyInputType) applyInputType(false); };
+    btnInAudio->onClick = [&]() { if (applyInputType) applyInputType(true); };
+    auto rowInput = std::make_shared<RowContainer>();
+    rowInput->add(btnInIQ); rowInput->add(btnInAudio);
 
     auto modSource = sidebar.addModule("Source / Input");
     auto ddSourceType = std::make_shared<Dropdown>(SIDEBAR_W - 40, 25.0f, font);
@@ -373,6 +395,7 @@ int main() {
         bool success = false;
         currentSourceType = sourceIdx;
         updateRadioControls(sourceIdx);
+        if (sourceIdx != 0 && sourceIdx != 3 && applyInputType) applyInputType(false);   // radios: always I/Q
 
         if (sourceIdx == 0) {
             newSource = std::make_shared<FileSource>();
@@ -498,6 +521,8 @@ int main() {
             std::lock_guard<std::mutex> lock(sourceMtx);
             currentSource = newSource;
         }
+        // Sound card and mono WAV files are audio, everything else is I/Q (the user can change it)
+        if (applyInputType) applyInputType(newSource && newSource->isAudio());
 
         // RTL-TCP connected successfully -> the button turns into "Disconnect"
         if (sourceIdx == 4) {
@@ -549,6 +574,11 @@ int main() {
         modSource->widgets.clear();
         modSource->addWidget(std::make_shared<Label>("Source Type:", font));
         modSource->addWidget(ddSourceType);
+        // Only files and the sound card can be either; radios always deliver I/Q
+        if (ddSourceType->selectedIndex == 0 || ddSourceType->selectedIndex == 3) {
+            modSource->addWidget(lblInput);
+            modSource->addWidget(rowInput);
+        }
 
         if (ddSourceType->selectedIndex == 0) {
             modSource->addWidget(std::make_shared<Label>("Loaded File:", font));
@@ -758,22 +788,18 @@ int main() {
     chkRds->onToggle = [&](bool b) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.rdsEnabled = b; };
     modDemod->addWidget(chkRds);
 
-    Mode previousMode = Mode::NFM;
-
+    // --- Demodulator mode buttons (only for listening: the decoders have their own channels) ---
     auto setMode = [&](Mode m, SdrButton* me) {
-        if (chkAprs->checked) {
-            chkAprs->checked = false;
-            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.aprsEnabled = false; }
-        }
-        if (chkAIS->checked) {
-            chkAIS->checked = false;
-            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.activeDecoder = nullptr; ptrAIS->enabled = false; }
-        }
+        if (inputIsAudio && m != Mode::RAW && m != Mode::OFF) { m = Mode::RAW; me = btnRAW.get(); }
 
         rowModes->setEnabled(true);
         btnNFM->setActive(false); btnAM->setActive(false); btnWFM->setActive(false);
         btnUSB->setActive(false); btnLSB->setActive(false); btnRAW->setActive(false); btnOFF->setActive(false);
         me->setActive(true);
+        if (inputIsAudio) {   // audio input: the other demodulators make no sense
+            btnNFM->setEnabled(false); btnAM->setEnabled(false); btnWFM->setEnabled(false);
+            btnUSB->setEnabled(false); btnLSB->setEnabled(false);
+        }
 
         std::lock_guard<std::mutex> l(sharedData.mtx);
         sharedData.mode = m;
@@ -802,120 +828,6 @@ int main() {
     btnRAW->onClick = [&](){ setMode(Mode::RAW, btnRAW.get()); };
     btnOFF->onClick = [&](){ setMode(Mode::OFF, btnOFF.get()); };
 
-    chkAprs->onToggle = [&](bool b) {
-        { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.aprsEnabled = b; }
-        rowModes->setEnabled(!b);
-
-        if(b && chkAIS->checked) {
-            chkAIS->checked = false;
-            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.activeDecoder = nullptr; ptrAIS->enabled = false; }
-        }
-
-        if (b) {
-            { std::lock_guard<std::mutex> l(sharedData.mtx); previousMode = sharedData.mode; }
-
-            bool isAudioIn = (currentSourceType == 3);
-
-            btnNFM->setActive(!isAudioIn); btnAM->setActive(false); btnWFM->setActive(false);
-            btnUSB->setActive(false); btnLSB->setActive(false); btnRAW->setActive(isAudioIn); btnOFF->setActive(false);
-
-            {
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                sharedData.mode = isAudioIn ? Mode::RAW : Mode::NFM;
-                sharedData.bandwidth = isAudioIn ? 48000.0f : 12500.0f;
-            }
-
-            if (isAudioIn) {
-                slBW->setLimits(1000, 200000);
-                slBW->setValueSilent(48000);
-                slBW->setText("Bandwidth: 48.0 kHz");
-            } else {
-                slBW->setLimits(4000, 40000);
-                slBW->setValueSilent(12500);
-                slBW->setText("Bandwidth: 12.5 kHz");
-            }
-        } else {
-            if(previousMode == Mode::NFM) setMode(Mode::NFM, btnNFM.get());
-            else if(previousMode == Mode::AM) setMode(Mode::AM, btnAM.get());
-            else if(previousMode == Mode::WFM) setMode(Mode::WFM, btnWFM.get());
-            else if (previousMode == Mode::RAW) setMode(Mode::RAW, btnRAW.get());
-            else if(previousMode == Mode::USB) setMode(Mode::USB, btnUSB.get());
-            else if(previousMode == Mode::LSB) setMode(Mode::LSB, btnLSB.get());
-            else setMode(Mode::OFF, btnOFF.get());
-        }
-    };
-    modDecoders->addWidget(chkAprs);
-
-    /*btnCopyAprs->onClick = [&](){
-        std::lock_guard<std::mutex> l(sharedData.mtx);
-        sf::Clipboard::setString(sharedData.lastAprs.raw);
-    };
-    modDecoders->addWidget(btnCopyAprs);*/
-
-    chkAIS->onToggle = [&](bool b) {
-        std::lock_guard<std::mutex> l(sharedData.mtx);
-
-        if(b && chkAprs->checked) {
-            chkAprs->checked = false;
-            sharedData.aprsEnabled = false;
-        }
-        rowModes->setEnabled(!b);
-
-        if (b) {
-            sharedData.activeDecoder = ptrAIS;
-            ptrAIS->enabled = true;
-            previousMode = sharedData.mode;
-
-            bool isAudioIn = (currentSourceType == 3);
-
-            sharedData.mode = isAudioIn ? Mode::RAW : Mode::NFM;
-            sharedData.bandwidth = isAudioIn ? 48000.0f : 25000.0f;
-
-            btnNFM->setActive(!isAudioIn); btnAM->setActive(false); btnWFM->setActive(false);
-            btnUSB->setActive(false); btnLSB->setActive(false); btnRAW->setActive(isAudioIn); btnOFF->setActive(false);
-
-            if (isAudioIn) {
-                slBW->setLimits(1000, 200000);
-                slBW->setValueSilent(48000);
-                slBW->setText("Bandwidth: 48.0 kHz");
-            } else {
-                slBW->setLimits(4000, 40000);
-                slBW->setValueSilent(25000);
-                slBW->setText("Bandwidth: 25.0 kHz");
-            }
-        } else {
-            sharedData.activeDecoder = nullptr;
-            ptrAIS->enabled = false;
-        }
-    };
-
-    auto aisUiRestore = [&](bool b) {
-        if(!b) {
-            if(previousMode == Mode::NFM) setMode(Mode::NFM, btnNFM.get());
-            else if(previousMode == Mode::AM) setMode(Mode::AM, btnAM.get());
-            else if(previousMode == Mode::WFM) setMode(Mode::WFM, btnWFM.get());
-            else if (previousMode == Mode::RAW) setMode(Mode::RAW, btnRAW.get());
-            else if(previousMode == Mode::USB) setMode(Mode::USB, btnUSB.get());
-            else if(previousMode == Mode::LSB) setMode(Mode::LSB, btnLSB.get());
-            else setMode(Mode::OFF, btnOFF.get());
-        }
-    };
-
-    auto originalAisToggle = chkAIS->onToggle;
-    chkAIS->onToggle = [=](bool b) {
-        originalAisToggle(b);
-        aisUiRestore(b);
-    };
-
-    modDecoders->addWidget(chkAIS);
-
-    // --- Image decoders (SSTV, WEFAX) ---
-    // Only one decoder runs at a time. SSTV keeps the current mode (NFM for VHF,
-    // USB for HF); WEFAX switches to USB and restores the previous mode afterwards.
-    auto chkSSTV = std::make_shared<Checkbox>("Enable SSTV", font);
-    auto chkWEFAX = std::make_shared<Checkbox>("Enable WEFAX (HF fax, USB)", font);
-    Mode wefaxPrevMode = Mode::USB;
-
     auto restoreMode = [&](Mode m) {
         if (m == Mode::NFM) setMode(Mode::NFM, btnNFM.get());
         else if (m == Mode::AM) setMode(Mode::AM, btnAM.get());
@@ -925,78 +837,69 @@ int main() {
         else if (m == Mode::LSB) setMode(Mode::LSB, btnLSB.get());
         else setMode(Mode::OFF, btnOFF.get());
     };
-    auto setPanelDecoder = [&](SDRModule* mod, bool on) {
-        std::lock_guard<std::mutex> l(sharedData.mtx);
-        if (on) { sharedData.activeDecoder = mod; mod->enabled = true; }
-        else { if (sharedData.activeDecoder == mod) sharedData.activeDecoder = nullptr; mod->enabled = false; }
-    };
-    auto disableSstv = [&]() {
-        if (!chkSSTV->checked) return;
-        chkSSTV->checked = false;
-        setPanelDecoder(ptrSSTV, false);
-    };
-    auto disableWefax = [&]() {
-        if (!chkWEFAX->checked) return;
-        chkWEFAX->checked = false;
-        setPanelDecoder(ptrWEFAX, false);
-        restoreMode(wefaxPrevMode);
-    };
-    auto disableAprsAis = [&]() {
-        if (chkAprs->checked) { chkAprs->checked = false; chkAprs->onToggle(false); }
-        if (chkAIS->checked) { chkAIS->checked = false; chkAIS->onToggle(false); }
+
+    // --- Input signal switch (I/Q / Audio) ---
+    Mode modeBeforeAudio = Mode::NFM;
+    applyInputType = [&](bool audioIn) {
+        btnInIQ->setActive(!audioIn);
+        btnInAudio->setActive(audioIn);
+        if (audioIn == inputIsAudio) return;
+        Mode cur;
+        { std::lock_guard<std::mutex> l(sharedData.mtx); cur = sharedData.mode; }
+        if (audioIn) modeBeforeAudio = cur;
+        inputIsAudio = audioIn;
+        { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.audioInput = audioIn; }
+        if (audioIn) setMode(Mode::RAW, btnRAW.get());
+        else restoreMode(modeBeforeAudio);
     };
 
-    chkSSTV->onToggle = [&](bool b) {
-        if (b) { disableAprsAis(); disableWefax(); }
-        setPanelDecoder(ptrSSTV, b);
-    };
-    chkWEFAX->onToggle = [&](bool b) {
-        if (b) {
-            disableAprsAis(); disableSstv();
-            { std::lock_guard<std::mutex> l(sharedData.mtx); wefaxPrevMode = sharedData.mode; }
-            if (currentSourceType == 3) setMode(Mode::RAW, btnRAW.get());   // sound card input already is audio
-            else setMode(Mode::USB, btnUSB.get());
-            setPanelDecoder(ptrWEFAX, true);
+    // --- Decoders ---
+    // Every decoder works the same way:
+    //  - with I/Q input it listens to its own channel(s): the yellow bands with handles on the
+    //    tuning bar (see modules/Core/DecoderChannels.h). It never changes the demodulator, so
+    //    the tuner and the mode stay free for listening;
+    //  - with audio input (Input signal switch) it decodes the input audio;
+    //  - one decoder runs at a time.
+    auto chkSSTV  = std::make_shared<Checkbox>("SSTV (slow-scan TV pictures)", font);
+    auto chkWEFAX = std::make_shared<Checkbox>("WEFAX (HF weather fax)", font);
+    auto chkISM   = std::make_shared<Checkbox>(ISMDecoder::available() ? "ISM (433/868 MHz sensors)"
+                                                                       : "ISM (not in this build)", font);
+    auto chkACARS = std::make_shared<Checkbox>("ACARS (aircraft, 131.x MHz)", font);
+
+    struct DecoderEntry { std::shared_ptr<Checkbox> chk; SDRModule* mod; };   // mod == nullptr: APRS
+    std::vector<DecoderEntry> decoders = {
+        {chkAprs, nullptr}, {chkAIS, ptrAIS}, {chkSSTV, ptrSSTV},
+        {chkWEFAX, ptrWEFAX}, {chkISM, ptrISM}, {chkACARS, ptrACARS} };
+
+    auto activateDecoder = [&](size_t idx, bool on) {
+        DecoderEntry& d = decoders[idx];
+        std::lock_guard<std::mutex> l(sharedData.mtx);
+        if (d.mod) {
+            if (on) {
+                if (d.mod->channelSet()) d.mod->channelSet()->clear();   // placed again for the current band
+                sharedData.activeDecoder = d.mod;
+                d.mod->enabled = true;
+            } else {
+                if (sharedData.activeDecoder == d.mod) sharedData.activeDecoder = nullptr;
+                d.mod->enabled = false;
+            }
         } else {
-            setPanelDecoder(ptrWEFAX, false);
-            restoreMode(wefaxPrevMode);
+            if (on) aprsChannels().clear();
+            sharedData.aprsEnabled = on;
         }
     };
-    // Turning APRS or AIS on switches the image decoders off
-    {
-        auto aprsToggle = chkAprs->onToggle;
-        chkAprs->onToggle = [=](bool b) { if (b) { disableSstv(); disableWefax(); } aprsToggle(b); };
-        auto aisToggle = chkAIS->onToggle;
-        chkAIS->onToggle = [=](bool b) { if (b) { disableSstv(); disableWefax(); } aisToggle(b); };
+    for (size_t i = 0; i < decoders.size(); i++) {
+        decoders[i].chk->onToggle = [&, i](bool b) {
+            if (b) {
+                for (size_t j = 0; j < decoders.size(); j++) {
+                    if (j != i && decoders[j].chk->checked) { decoders[j].chk->checked = false; activateDecoder(j, false); }
+                }
+            }
+            activateDecoder(i, b);
+        };
+        modDecoders->addWidget(decoders[i].chk);
     }
-    modDecoders->addWidget(chkSSTV);
-    modDecoders->addWidget(chkWEFAX);
-
-    // --- ISM band decoder (rtl_433: weather stations, TPMS, sensors, remotes) ---
-    // Works on the raw IQ like AIS, but keeps the current demodulator mode.
-    auto chkISM = std::make_shared<Checkbox>(ISMDecoder::available() ? "Enable ISM (433/868 MHz sensors)"
-                                                                     : "Enable ISM (not in this build)", font);
-    auto disableIsm = [&]() {
-        if (!chkISM->checked) return;
-        chkISM->checked = false;
-        setPanelDecoder(ptrISM, false);
-    };
-    chkISM->onToggle = [&](bool b) {
-        if (b) { disableAprsAis(); disableSstv(); disableWefax(); }
-        setPanelDecoder(ptrISM, b);
-    };
-    // Every other decoder switches ISM off
-    {
-        auto aprsToggle = chkAprs->onToggle;
-        chkAprs->onToggle = [=](bool b) { if (b) disableIsm(); aprsToggle(b); };
-        auto aisToggle = chkAIS->onToggle;
-        chkAIS->onToggle = [=](bool b) { if (b) disableIsm(); aisToggle(b); };
-        auto sstvToggle = chkSSTV->onToggle;
-        chkSSTV->onToggle = [=](bool b) { if (b) disableIsm(); sstvToggle(b); };
-        auto wefaxToggle = chkWEFAX->onToggle;
-        chkWEFAX->onToggle = [=](bool b) { if (b) disableIsm(); wefaxToggle(b); };
-    }
-    modDecoders->addWidget(chkISM);
+    modDecoders->addWidget(std::make_shared<Label>("Each decoder has its own channel (yellow)", font, 11, sf::Color(150, 150, 160)));
 
     auto modDisp = sidebar.addModule("Display");
     auto slMinDb = std::make_shared<Slider>(SIDEBAR_W - 40, -140.0f, -20.0f, -90.0f, "Min dB", font);
@@ -1259,6 +1162,16 @@ int main() {
     float aprsLogScrollOffset = 0.0f;
     bool isPanningView = false;
 
+    // Dragging a decoder channel handle on the tuning bar (see DecoderChannels.h)
+    struct ChannelDrag {
+        ChannelSet* set = nullptr;
+        int id = -1;
+        float startX = 0.0f, x = 0.0f;
+        bool moved = false;
+        int snap = 0;   // 0: free, 1: known frequency, 2: the tuner
+        long long freqHz = 0;
+    } chDrag;
+
     bool showAprsModal = false;
     AprsLastPacket selectedAprsPacket;
     SdrButton btnModalClose(80, 30, "Close", font);
@@ -1389,6 +1302,102 @@ int main() {
         float bwPct = (slBW->currentVal / hwSampleRate);
         float bwPixels = (bwPct / viewWidthPct) * layout.specW;
 
+        // --- Decoder channels: yellow bands + handles on the tuning bar ---
+        ChannelSet* chSet = nullptr;
+        {
+            std::lock_guard<std::mutex> l(sharedData.mtx);
+            if (!inputIsAudio) {
+                if (sharedData.aprsEnabled) chSet = &aprsChannels();
+                else if (sharedData.activeDecoder && sharedData.activeDecoder->enabled) chSet = sharedData.activeDecoder->channelSet();
+            }
+        }
+        if (chDrag.set && chDrag.set != chSet) chDrag = ChannelDrag();   // decoder switched off while dragging
+        struct ChHandle { DecoderChannel ch; float x; float rawX; int edge; };
+        std::vector<ChHandle> chHandles;
+        const double vfoOffsetHz = (tunePct - 0.5) * hwSampleRate;
+        const long long vfoFreqHz = currentCenterFreq + (long long)std::llround(vfoOffsetHz);
+        auto offsetToX = [&](double off) {
+            return (float)(((0.5 + off / hwSampleRate) - viewStartPct) / viewWidthPct * layout.specW);
+        };
+        auto xToFreq = [&](float x) {
+            const double pct = viewStartPct + (x / layout.specW) * viewWidthPct;
+            return currentCenterFreq + (long long)std::llround((pct - 0.5) * hwSampleRate);
+        };
+        const float tbTop = (float)TOP_BAR_H + layout.specH, tbBot = tbTop + layout.tuneBarH;
+        if (chSet) {
+            for (const DecoderChannel& c : chSet->snapshot()) {
+                const double off = c.followVfo ? vfoOffsetHz : (double)(c.freqHz - currentCenterFreq);
+                const float x = offsetToX(off);
+                const int edge = x < 0.0f ? -1 : (x > layout.specW ? 1 : 0);
+                chHandles.push_back({c, std::clamp(x, 10.0f, layout.specW - 10.0f), x, edge});
+            }
+        }
+        auto handleAt = [&](sf::Vector2f m) -> int {
+            if (m.y < tbTop - 3.0f || m.y > tbBot + 3.0f || m.x > layout.specW) return -1;
+            int best = -1;
+            float bestD = 10.0f;
+            for (size_t i = 0; i < chHandles.size(); i++) {
+                const float d = std::abs(chHandles[i].x - m.x);
+                if (d < bestD) { bestD = d; best = (int)i; }
+            }
+            return best;
+        };
+        // Puts the tuner on a frequency (retunes the radio when it is outside the band)
+        auto tuneVfoTo = [&](long long f) {
+            const double halfBW = hwSampleRate / 2.0;
+            if (isHw && (f < currentCenterFreq - halfBW || f > currentCenterFreq + halfBW)) {
+                currentCenterFreq = f;
+                {
+                    std::lock_guard<std::mutex> l(sharedData.mtx);
+                    sharedData.centerFreq = f;
+                    sharedData.tunedFreqPercent = 0.5;
+                    sharedData.viewCenterPct = 0.5;
+                }
+                pendingCenterFreq = f;
+                debouncer.restart();
+            } else {
+                std::lock_guard<std::mutex> l(sharedData.mtx);
+                sharedData.tunedFreqPercent = std::clamp(0.5 + (double)(f - currentCenterFreq) / hwSampleRate, 0.0, 1.0);
+            }
+            freqVFO.setFrequency(f);
+        };
+        auto updateChannelDrag = [&](float mx) {
+            const float x = std::clamp(mx, 0.0f, layout.specW);
+            chDrag.x = x;
+            if (std::abs(x - chDrag.startX) > 3.0f) chDrag.moved = true;
+            if (!chDrag.moved) return;
+            // snap: the tuner first, then the known frequencies
+            chDrag.snap = 0;
+            chDrag.freqHz = xToFreq(x);
+            float bestD = 10.0f;
+            if (std::abs(visualCenterX - x) < bestD) { bestD = std::abs(visualCenterX - x); chDrag.snap = 2; chDrag.freqHz = vfoFreqHz; }
+            if (chDrag.snap == 0 && currentCenterFreq > 0) {
+                for (long long pf : chDrag.set->presets) {
+                    const float px = offsetToX((double)(pf - currentCenterFreq));
+                    if (std::abs(px - x) < bestD) { bestD = std::abs(px - x); chDrag.snap = 1; chDrag.freqHz = pf; }
+                }
+            }
+            if (chDrag.snap == 0) {
+                const long long step = STEP_VALUES[ddSnap->selectedIndex] > 0 ? STEP_VALUES[ddSnap->selectedIndex] : 100;
+                chDrag.freqHz = (long long)std::llround((double)chDrag.freqHz / step) * step;
+            }
+            chDrag.set->moveTo(chDrag.id, chDrag.freqHz);
+        };
+        auto finishChannelDrag = [&]() {
+            if (!chDrag.set) return;
+            if (!chDrag.moved) {
+                // a click: listen to the channel (tuner + the decoder's mode)
+                for (const ChHandle& h : chHandles) {
+                    if (h.ch.id != chDrag.id) continue;
+                    if (!h.ch.followVfo) tuneVfoTo(h.ch.freqHz);
+                    if (!inputIsAudio) restoreMode(h.ch.listenMode);
+                }
+            } else if (chDrag.snap == 2) {
+                chDrag.set->followTuner(chDrag.id);
+            }
+            chDrag = ChannelDrag();
+        };
+
         auto applySpectrumTuning = [&](float mouseX) {
             bool isHwLocal = false;
             double sr = 2e6;
@@ -1457,6 +1466,10 @@ int main() {
 
             // Global mouse-release catcher - prevents UI from getting stuck
             if (const auto* mr = ev->getIf<sf::Event::MouseButtonReleased>()) {
+                if (mr->button == sf::Mouse::Button::Left && chDrag.set) {
+                    finishChannelDrag();
+                    continue;
+                }
                 if (mr->button == sf::Mouse::Button::Left) {
                     isSpectrumDragging = false;
                     isDraggingScale = false;
@@ -1480,6 +1493,16 @@ int main() {
                 continue;
             }
 
+            // Popup window of the active decoder (message details): it takes every event
+            {
+                SDRModule* modalMod = nullptr;
+                { std::lock_guard<std::mutex> l(sharedData.mtx); modalMod = sharedData.activeDecoder; }
+                if (modalMod && modalMod->enabled && modalMod->modalOpen()) {
+                    modalMod->handleEvent(*ev, window);
+                    continue;
+                }
+            }
+
             if (sidebar.handleEvent(*ev, window)) continue;
 
             // Decoder panel at the bottom of the waterfall (SSTV / WEFAX controls, picture scrolling)
@@ -1487,6 +1510,27 @@ int main() {
                 SDRModule* panelMod = nullptr;
                 { std::lock_guard<std::mutex> l(sharedData.mtx); panelMod = sharedData.activeDecoder; }
                 if (panelMod && panelMod->enabled && panelMod->handleEvent(*ev, window)) continue;
+            }
+
+            // Decoder channel handles on the tuning bar: take the press before the scale drag
+            if (const auto* mbp = ev->getIf<sf::Event::MouseButtonPressed>()) {
+                if (mbp->button == sf::Mouse::Button::Left) {
+                    const sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window));
+                    const int h = handleAt(m);
+                    if (h >= 0 && chSet) {
+                        chDrag = ChannelDrag();
+                        chDrag.set = chSet;
+                        chDrag.id = chHandles[h].ch.id;
+                        chDrag.startX = chDrag.x = m.x;
+                        continue;
+                    }
+                }
+            }
+            if (chDrag.set) {
+                if (const auto* mmv = ev->getIf<sf::Event::MouseMoved>()) {
+                    updateChannelDrag(window.mapPixelToCoords(mmv->position).x);
+                    continue;
+                }
             }
 
             bool topBarHandled = false;
@@ -1762,9 +1806,10 @@ int main() {
             if (btnPlay.isMouseOver(window) || btnMute.isMouseOver(window) || btnTuningMode.isMouseOver(window)) showHand = true;
             if (aprsOn && mousePos.y > (layout.winH - 200) && mousePos.x < layout.specW) showHand = true;
         }
+        if (handleAt(mousePos) >= 0) showHand = true;
         if (showAprsModal) showHand = false;
 
-        if (isDraggingBW && cursorSizeH) { window.setMouseCursor(*cursorSizeH); }
+        if ((isDraggingBW || (chDrag.set && chDrag.moved)) && cursorSizeH) { window.setMouseCursor(*cursorSizeH); }
         else if (showHand && cursorHand) { window.setMouseCursor(*cursorHand); }
         else if (cursorArrow) { window.setMouseCursor(*cursorArrow); }
 
@@ -2004,6 +2049,97 @@ int main() {
             window.draw(centerLine);
         }
 
+        // --- Decoder channels: yellow bands (spectrum, waterfall) and handles (tuning bar) ---
+        if (!chHandles.empty()) {
+            const float specTop = (float)TOP_BAR_H;
+            const float specBot = specTop + (float)layout.specH;
+            const float wfTop = tbBot;
+            const float wfBot = wfTop + (float)layout.waterfallH;
+            const sf::Color yellow(255, 210, 0);
+            const sf::Color edgeCol(255, 210, 0, 210), fillCol(255, 210, 0, 38), wfEdgeCol(255, 210, 0, 110);
+            auto vline = [&](float x, float y0, float y1, sf::Color c) {
+                sf::VertexArray ln(sf::PrimitiveType::Lines, 2);
+                ln[0].position = {x, y0}; ln[0].color = c;
+                ln[1].position = {x, y1}; ln[1].color = c;
+                window.draw(ln);
+            };
+            auto label = [&](const std::string& str, float x, float y, sf::Color c, unsigned size = 20) {
+                sf::Text t(font, sf::String::fromUtf8(str.begin(), str.end()), size);
+                t.setScale({0.5f, 0.5f});
+                t.setFillColor(c);
+                t.setPosition({std::round(x), std::round(y)});
+                window.draw(t);
+                return t.getGlobalBounds().size.x;
+            };
+            auto mhzText = [](long long hz) { char b[32]; std::snprintf(b, sizeof(b), "%.3f", hz / 1e6); return std::string(b); };
+            const int hovered = chDrag.set ? -1 : handleAt(mousePos);
+
+            for (size_t i = 0; i < chHandles.size(); i++) {
+                const ChHandle& h = chHandles[i];
+                const DecoderChannel& c = h.ch;
+                const bool dragging = chDrag.set && chDrag.id == c.id;
+                const double off = c.followVfo ? vfoOffsetHz : (double)(c.freqHz - currentCenterFreq);
+                const std::string title = c.name + (c.followVfo ? "  (tuner)" : "  " + mhzText(c.freqHz));
+
+                if (h.edge == 0) {
+                    // band on the spectrum, edges on the waterfall
+                    float x0 = offsetToX(c.lowOffset(off)), x1 = offsetToX(c.highOffset(off));
+                    if (x1 - x0 < 2.0f) { const float m = (x0 + x1) / 2.0f; x0 = m - 1.0f; x1 = m + 1.0f; }
+                    const float cx0 = std::max(0.0f, x0), cx1 = std::min((float)layout.specW, x1);
+                    if (cx1 > cx0) {
+                        sf::RectangleShape band({cx1 - cx0, specBot - specTop});
+                        band.setPosition({cx0, specTop});
+                        band.setFillColor(dragging ? sf::Color(255, 210, 0, 70) : fillCol);
+                        window.draw(band);
+                    }
+                    for (float x : {x0, x1}) {
+                        if (x < 0.0f || x > layout.specW) continue;
+                        vline(x, specTop, specBot, edgeCol);
+                        vline(x, wfTop, wfBot, wfEdgeCol);
+                    }
+                    label(title, std::max(2.0f, x0 + 3.0f), specTop + 3.0f + 12.0f * (float)(i % 2), edgeCol);
+
+                    // handle: a yellow grip on the tuning bar at the channel frequency
+                    const float hw = 12.0f, hh = layout.tuneBarH - 6.0f;
+                    sf::RectangleShape grip({hw, hh});
+                    grip.setPosition({std::round(h.x - hw / 2.0f), tbTop + 3.0f});
+                    grip.setFillColor((dragging || (int)i == hovered) ? sf::Color(255, 235, 120) : yellow);
+                    grip.setOutlineThickness(c.followVfo ? 2.0f : 1.0f);
+                    grip.setOutlineColor(c.followVfo ? sf::Color::Red : sf::Color(60, 45, 0));
+                    window.draw(grip);
+                    for (float gx : {-2.0f, 2.0f}) vline(std::round(h.x + gx), tbTop + 7.0f, tbBot - 7.0f, sf::Color(90, 70, 0));
+                } else {
+                    // outside the visible spectrum: an arrow at the edge of the tuning bar
+                    sf::ConvexShape arrow(3);
+                    const float ax = h.edge < 0 ? 4.0f : layout.specW - 4.0f;
+                    const float dir = h.edge < 0 ? 1.0f : -1.0f;
+                    const float my = (tbTop + tbBot) / 2.0f;
+                    arrow.setPoint(0, {ax, my});
+                    arrow.setPoint(1, {ax + dir * 10.0f, my - 7.0f});
+                    arrow.setPoint(2, {ax + dir * 10.0f, my + 7.0f});
+                    arrow.setFillColor((int)i == hovered ? sf::Color(255, 235, 120) : yellow);
+                    window.draw(arrow);
+                    const std::string t = title + "  (outside the view)";
+                    sf::Text probe(font, t, 20);
+                    const float tw = probe.getGlobalBounds().size.x * 0.5f;
+                    label(t, h.edge < 0 ? 18.0f : layout.specW - 18.0f - tw, tbTop + 6.0f, edgeCol);
+                }
+            }
+
+            // what happens on release / click
+            if (chDrag.set && chDrag.moved) {
+                vline(chDrag.x, specTop, wfBot, sf::Color(255, 235, 120, 200));
+                const std::string what = chDrag.snap == 2 ? "release: follow the tuner"
+                                       : chDrag.snap == 1 ? mhzText(chDrag.freqHz) + " MHz  (known frequency)"
+                                                          : mhzText(chDrag.freqHz) + " MHz";
+                label(what, std::min(chDrag.x + 8.0f, layout.specW - 200.0f), tbTop - 15.0f, sf::Color(255, 235, 120), 22);
+            } else if (hovered >= 0) {
+                const ChHandle& h = chHandles[hovered];
+                const std::string tip = h.ch.name + ":  drag = move,  drop on the tuner = follow it,  click = listen";
+                label(tip, std::clamp(h.x - 60.0f, 4.0f, layout.specW - 380.0f), tbTop - 15.0f, sf::Color(255, 235, 120), 22);
+            }
+        }
+
         // --- RDS PANEL (top right corner of the spectrum) ---
         if (rdsOn && mode == Mode::WFM && currentSource) {
             const float pad = 10.0f;
@@ -2158,6 +2294,16 @@ int main() {
 
             float textX = compassX + compassR + 40.0f;
             float curY = overlayY + 20.0f;
+
+            // which channel APRS decodes (same yellow line as in the other decoder panels)
+            {
+                const std::string chText = inputIsAudio ? std::string("Input: audio") : aprsChannels().describe();
+                sf::Text chT(font, chText, 20);
+                chT.setScale({0.5f, 0.5f});
+                chT.setFillColor(sf::Color(255, 210, 0));
+                chT.setPosition({textX, overlayY + 4.0f});
+                window.draw(chT);
+            }
 
             sf::Text lblCall(font, pkt.src.empty() ? "-- WAITING --" : pkt.src, 64);
             lblCall.setScale({0.5f, 0.5f});
@@ -2435,6 +2581,7 @@ int main() {
             btnModalCopy.draw(window);
         }
 
+
         if (modInspector->isOpen) {
             float mx = modInspector->headerBg.getPosition().x + 10;
             float my = modInspector->headerBg.getPosition().y + 30;
@@ -2461,6 +2608,12 @@ int main() {
             infoTxt.setFillColor(sf::Color::Yellow);
         }
 
+        // Popup window of the active decoder, above everything else
+        {
+            SDRModule* modalMod = nullptr;
+            { std::lock_guard<std::mutex> l(sharedData.mtx); modalMod = sharedData.activeDecoder; }
+            if (modalMod && modalMod->enabled && modalMod->modalOpen()) modalMod->drawModal(window);
+        }
         window.display();
     }
 
