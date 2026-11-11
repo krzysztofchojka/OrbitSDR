@@ -26,14 +26,14 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     BASE_LIBS=${LIBS:-"-L/opt/homebrew/lib -lsfml-graphics -lsfml-window -lsfml-system -lrtlsdr"}
     EXTRAS="-framework CoreAudio -framework AudioToolbox -framework AudioUnit"
     SDRPLAY_INC="-I/usr/local/include"
-    SDRPLAY_LIB="-L/usr/local/lib -lsdrplay_api"
+    SDRPLAY_LIB=""   # loaded at run time (see src/SdrplayLoader.h)
 else
     echo "Detected: Linux"
     BASE_INCLUDES=${INCLUDES:-""}
     BASE_LIBS=${LIBS:-"-lsfml-graphics -lsfml-window -lsfml-system -ldl -lpthread -lm -lrtlsdr"}
     EXTRAS=""
     SDRPLAY_INC="-I/usr/local/include"
-    SDRPLAY_LIB="-lsdrplay_api"
+    SDRPLAY_LIB="-ldl"   # the API is loaded at run time with dlopen (see src/SdrplayLoader.h)
 fi
 
 # --- COMPILATION ---
@@ -119,9 +119,9 @@ if [ "$IS_MACOS" = true ]; then
     fi
 
     # Fix libraries linking
+    # Bundled SDRplay API: only a fallback, the installed API is used first (loaded at run time)
     if [[ "$SDRPLAY_MODE" == "yes" ]] && [ -f "/usr/local/lib/libsdrplay_api.so.3" ]; then
         cp "/usr/local/lib/libsdrplay_api.so.3" "$APP_BUNDLE/Contents/Frameworks/"
-        install_name_tool -change "libsdrplay_api.so.3" "@executable_path/../Frameworks/libsdrplay_api.so.3" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
     fi
 
     # Create Info.plist (includes the CFBundleIconFile entry)

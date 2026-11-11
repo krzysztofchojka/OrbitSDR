@@ -153,8 +153,7 @@ jobs:
           ls -la "$SDR_SRC"
           SRC_FILE=$(ls "$SDR_SRC"/libsdrplay_api.so* | head -n1)
           mkdir -p sdrlib
-          cp -L "$SRC_FILE" sdrlib/libsdrplay_api.so.3     # SONAME used at runtime
-          cp -L "$SRC_FILE" sdrlib/libsdrplay_api.so       # name used by the linker (-lsdrplay_api)
+          cp -L "$SRC_FILE" sdrlib/libsdrplay_api.so.3     # bundled as a fallback (loaded at run time)
           file sdrlib/libsdrplay_api.so.3
 
       - name: Compile OrbitSDR
@@ -162,10 +161,9 @@ jobs:
           chmod +x build.sh
           SFML_PATH="$GITHUB_WORKSPACE/sfml"
           SDR_INC="$GITHUB_WORKSPACE/deps/sdrplay/include"
-          SDR_LIB="$GITHUB_WORKSPACE/sdrlib"
           export CXXFLAGS="-I$SFML_PATH/include -I$SDR_INC"
           export LDFLAGS='-Wl,-rpath,$ORIGIN/libs'
-          export LIBS="-L$SFML_PATH/lib -L$SDR_LIB -lsfml-graphics -lsfml-window -lsfml-system -ldl -lpthread -lm -lrtlsdr -lsdrplay_api"
+          export LIBS="-L$SFML_PATH/lib -lsfml-graphics -lsfml-window -lsfml-system -ldl -lpthread -lm -lrtlsdr"
           ./build.sh --enable-sdrplay
           file orbitsdr
 
@@ -240,9 +238,8 @@ jobs:
         run: |
           chmod +x build.sh
           SDR_INC="$GITHUB_WORKSPACE/deps/sdrplay/include"
-          SDR_LIB="$GITHUB_WORKSPACE/deps/sdrplay/lib/macos"
           export CXXFLAGS="-I$SDR_INC -mmacosx-version-min=15.0"
-          export LDFLAGS="-L/opt/homebrew/lib -L$SDR_LIB -lsdrplay_api -mmacosx-version-min=15.0 -Wl,-headerpad_max_install_names"
+          export LDFLAGS="-L/opt/homebrew/lib -mmacosx-version-min=15.0 -Wl,-headerpad_max_install_names"
           ./build.sh --enable-sdrplay
 
       - name: Create .App Bundle with Icon
@@ -307,21 +304,17 @@ jobs:
           </plist>
           EOF
 
-          # 4. Bundle ALL dynamic libraries (SFML, rtlsdr, libusb, freetype, SDRplay...) into Frameworks
-          # The binary references the SDRplay lib by a bare name ("libsdrplay_api.so.3"), which
-          # dylibbundler cannot resolve. So first repoint it to the real file (absolute path).
-          SDR_DEP=$(otool -L OrbitSDR.app/Contents/MacOS/OrbitSDR | awk '/sdrplay/ {print $1; exit}')
-          if [ -n "$SDR_DEP" ]; then
-            mkdir -p sdrlib
-            cp deps/sdrplay/lib/macos/libsdrplay_api.dylib "sdrlib/$(basename "$SDR_DEP")"
-            install_name_tool -change "$SDR_DEP" "$PWD/sdrlib/$(basename "$SDR_DEP")" OrbitSDR.app/Contents/MacOS/OrbitSDR
-          fi
+          # 4. Bundle ALL dynamic libraries (SFML, rtlsdr, libusb, freetype...) into Frameworks
 
           dylibbundler -cd -of -b \
             -x OrbitSDR.app/Contents/MacOS/OrbitSDR \
             -d OrbitSDR.app/Contents/Frameworks/ \
             -p @executable_path/../Frameworks/ \
             -s /opt/homebrew/lib
+
+          # The SDRplay API is loaded at run time: the installed API first, this bundled copy
+          # as a fallback (see src/SdrplayLoader.h)
+          cp deps/sdrplay/lib/macos/libsdrplay_api.dylib OrbitSDR.app/Contents/Frameworks/libsdrplay_api.so.3
 
           # 5. Show what macOS versions the binary and libs require (for the log)
           otool -L OrbitSDR.app/Contents/MacOS/OrbitSDR

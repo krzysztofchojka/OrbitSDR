@@ -16,11 +16,8 @@ echo "SFML Path: $SFML_PATH"
 echo "SDR Path:  $SDR_LIB"
 echo "------------------------------------------"
 
-if [ ! -f "$SDR_LIB/sdrplay_api.lib" ]; then
-    echo "ERROR: sdrplay_api.lib not found in $SDR_LIB"
-    echo "Ensure that API/x64 files are in deps/sdrplay/lib/windows/"
-    exit 1
-fi
+# The SDRplay API is loaded at run time (installed API first, the bundled
+# sdrplay_api.dll as a fallback), so there is nothing to link against.
 
 # --- COMPILATION ---
 windres resource.rc -O coff -o resource.res
@@ -35,10 +32,9 @@ g++ -std=c++17 -O3 \
     resource.res \
     -o "$OUT_FILE" \
     -L"$SFML_PATH/lib" \
-    -L"$SDR_LIB" \
     -lcomdlg32 -lole32 -lws2_32 \
     -lsfml-graphics -lsfml-window -lsfml-system -lsfml-audio \
-    -lrtlsdr -lsdrplay_api \
+    -lrtlsdr \
     -lcomdlg32 -lole32 \
     -static-libstdc++ -static-libgcc
 
@@ -54,7 +50,7 @@ echo "------------------------------------------"
 # 1. Copy SFML DLLs
 cp "$SFML_PATH/bin/"*.dll .
 
-# 2. Copy sdrplay_api.dll
+# 2. Copy sdrplay_api.dll (fallback when the SDRplay API isn't installed or can't be used)
 if [ -f "$SDR_LIB/sdrplay_api.dll" ]; then
     echo "Copying sdrplay_api.dll..."
     cp "$SDR_LIB/sdrplay_api.dll" .

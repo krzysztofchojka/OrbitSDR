@@ -342,6 +342,10 @@ int main() {
     long long currentCenterFreq = savedFreq;
     long long pendingCenterFreq = 0;
 
+    // Startup restores the last source silently; errors are only explained when the user
+    // picks a source or refreshes the device list
+    bool quietSourceErrors = false;
+
     std::function<void(int, std::string, int, std::string)> doOpenSource = [&](int sourceIdx, std::string deviceID, int rateIdx, std::string pathOverride) {
         {
             std::lock_guard<std::mutex> lock(sourceMtx);
@@ -480,7 +484,7 @@ int main() {
         }
 
         if (!success && sourceIdx != 0) {
-            showPopup("Error", "Could not open device.");
+            if (!quietSourceErrors) showPopup("Error", "Could not open device.");
             return;
         }
 
@@ -568,6 +572,37 @@ int main() {
         sidebar.updateStyle();
     };
 
+    // No SDRplay device: tell the user why (service stopped / API missing / no device).
+    // May refill cachedDevices when the user lets us start the API service.
+    auto explainNoSdrplay = [&]() {
+#ifdef _WIN32
+        const std::string svc = sdrplayServiceState();
+        if (svc == "stopped") {
+            // The service crashed or was stopped: offer to start it (needs administrator rights)
+            int answer = MessageBoxA(NULL,
+                "The SDRplay API Service is not running (it may have crashed).\n"
+                "OrbitSDR and other SDRplay API programs need it to see the device.\n"
+                "(SDRconnect doesn't use it, so it can still work.)\n\n"
+                "Start the service now? Windows will ask for administrator permission.",
+                "SDRplay", MB_YESNO | MB_ICONWARNING);
+            if (answer == IDYES && sdrplayStartService()) {
+                for (int i = 0; i < 20 && sdrplayServiceState() != "running"; i++)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                cachedDevices = SdrPlaySource::getDeviceList();
+            }
+            if (cachedDevices.empty() && answer == IDYES)
+                showPopup("SDRplay", "No SDRplay device found yet.\n\nIf the service didn't start, open 'Services' (services.msc), select 'SDRplay API Service' and click Start - or restart the computer.");
+        } else if (svc == "missing") {
+            showPopup("SDRPlay Info", "The SDRplay API is not installed.\n\nIf you want to use SDRPlay, please install the official API from:\nhttps://www.sdrplay.com/downloads/");
+        } else {
+            showPopup("SDRPlay Info", "No SDRPlay device found.\n\nCheck the USB connection and close other programs that use the device (e.g. SDRuno or SDRconnect).");
+        }
+#else
+        showPopup("SDRPlay Info", "No SDRPlay device found or SDRPlay API Service is not installed.\n\nIf you want to use SDRPlay, please install the official API from:\nhttps://www.sdrplay.com/downloads/");
+#endif
+    };
+
     ddSourceType->onChange = [&](int idx) {
         // Switching away from RTL-TCP while connected: drop the connection first
         if (idx != 4 && tcpConnected) doDisconnectTcp();
@@ -592,34 +627,7 @@ int main() {
             if (idx == 1) cachedDevices = RtlSdrSource::getDeviceList();
             else if (idx == 2) {
                 cachedDevices = SdrPlaySource::getDeviceList();
-                if (cachedDevices.empty()) {
-#ifdef _WIN32
-                    const std::string svc = sdrplayServiceState();
-                    if (svc == "stopped") {
-                        // The service crashed or was stopped: offer to start it (needs administrator rights)
-                        int answer = MessageBoxA(NULL,
-                            "The SDRplay API Service is not running (it may have crashed).\n"
-                            "OrbitSDR and other SDRplay API programs need it to see the device.\n"
-                            "(SDRconnect doesn't use it, so it can still work.)\n\n"
-                            "Start the service now? Windows will ask for administrator permission.",
-                            "SDRplay", MB_YESNO | MB_ICONWARNING);
-                        if (answer == IDYES && sdrplayStartService()) {
-                            for (int i = 0; i < 20 && sdrplayServiceState() != "running"; i++)
-                                std::this_thread::sleep_for(std::chrono::milliseconds(250));
-                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                            cachedDevices = SdrPlaySource::getDeviceList();
-                        }
-                        if (cachedDevices.empty() && answer == IDYES)
-                            showPopup("SDRplay", "No SDRplay device found yet.\n\nIf the service didn't start, open 'Services' (services.msc), select 'SDRplay API Service' and click Start - or restart the computer.");
-                    } else if (svc == "missing") {
-                        showPopup("SDRPlay Info", "The SDRplay API is not installed.\n\nIf you want to use SDRPlay, please install the official API from:\nhttps://www.sdrplay.com/downloads/");
-                    } else {
-                        showPopup("SDRPlay Info", "No SDRPlay device found.\n\nCheck the USB connection and close other programs that use the device (e.g. SDRuno or SDRconnect).");
-                    }
-#else
-                    showPopup("SDRPlay Info", "No SDRPlay device found or SDRPlay API Service is not installed.\n\nIf you want to use SDRPlay, please install the official API from:\nhttps://www.sdrplay.com/downloads/");
-#endif
-                }
+                if (cachedDevices.empty() && !quietSourceErrors) explainNoSdrplay();
             }
             else if (idx == 3) cachedDevices = AudioCaptureSource::getDeviceList();
 
@@ -654,7 +662,10 @@ int main() {
 
         int idx = ddSourceType->selectedIndex;
         if (idx == 1) cachedDevices = RtlSdrSource::getDeviceList();
-        else if (idx == 2) cachedDevices = SdrPlaySource::getDeviceList();
+        else if (idx == 2) {
+            cachedDevices = SdrPlaySource::getDeviceList();
+            if (cachedDevices.empty()) explainNoSdrplay();
+        }
         else if (idx == 3) cachedDevices = AudioCaptureSource::getDeviceList();
 
         std::vector<std::string> names;
@@ -1193,7 +1204,9 @@ int main() {
             ddRate->setSelection(2);
             refreshSourceUI();
         } else {
+            quietSourceErrors = true;   // no "device not found" pop-ups right at startup
             ddSourceType->onChange(savedSourceIdx);
+            quietSourceErrors = false;
         }
     }
 
@@ -1231,6 +1244,11 @@ int main() {
             std::cerr << "[Warning] bandplan.json not found." << std::endl;
         }
     }
+
+    // Smoothed values of the signal meter in the status bar
+    float meterSnr = -1.0f;
+    double meterSignal = -127.0;
+    sf::Clock meterClock;
 
     while (window.isOpen()) {
         sf::Vector2u currSize = window.getSize();
@@ -2257,6 +2275,21 @@ int main() {
                 b1 = std::clamp(b1, b0, n - 1);
                 for (int b = b0; b <= b1; b++) signalDb = std::max(signalDb, spectrum[b]);
                 snrDb = (float)std::max(0.0, signalDb - floorDb);
+            }
+            // Smooth the readings (time constant ~0.8 s) so the meter doesn't jump around
+            {
+                const float dt = meterClock.restart().asSeconds();
+                const float a = 1.0f - std::exp(-dt / 0.8f);
+                if (snrDb < 0.0f) {
+                    meterSnr = -1.0f;
+                } else if (meterSnr < 0.0f) {
+                    meterSnr = snrDb; meterSignal = signalDb;
+                } else {
+                    meterSnr += a * (snrDb - meterSnr);
+                    meterSignal += a * (signalDb - meterSignal);
+                }
+                snrDb = meterSnr;
+                signalDb = meterSignal;
             }
 
             sf::RectangleShape sBg({meterW, 8.0f});

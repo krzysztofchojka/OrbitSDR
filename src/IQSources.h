@@ -18,6 +18,7 @@
 
 #ifdef ENABLE_SDRPLAY
     #include <sdrplay_api.h>
+    #include "SdrplayLoader.h"   // the API library is loaded at run time
 #endif
 
 using Complex = std::complex<double>;
@@ -638,7 +639,7 @@ inline bool sdrplayStartService() {
 // Opens the SDRplay API and warns when the installed API differs from the headers
 // this program was built with (the API is usually compatible, so it only warns).
 inline bool sdrplayApiOpen() {
-    if (sdrplay_api_Open() != sdrplay_api_Success) return false;
+    if (!SdrplayLib::get().open()) return false;
     float ver = 0.0f;
     if (sdrplay_api_ApiVersion(&ver) == sdrplay_api_Success && std::fabs(ver - SDRPLAY_API_VERSION) > 0.0001f)
         std::cerr << "[SDRplay] API version " << ver << " installed, built for " << SDRPLAY_API_VERSION << std::endl;

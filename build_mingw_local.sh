@@ -35,10 +35,8 @@ SFML_PATH="$(pwd)/sfml"
 SDR_INC="$(pwd)/deps/sdrplay/include"
 SDR_LIB="$(pwd)/deps/sdrplay/lib/windows"
 
-if [ ! -f "$SDR_LIB/sdrplay_api.lib" ]; then
-    echo "ERROR: sdrplay_api.lib not found in $SDR_LIB"
-    exit 1
-fi
+# The SDRplay API is loaded at run time (installed API first, the bundled
+# sdrplay_api.dll as a fallback), so there is nothing to link against.
 
 # 4. Compilation
 echo "------------------------------------------"
@@ -52,10 +50,9 @@ g++ -std=c++17 -O3 \
     "$SRC_DIR/main.cpp" \
     -o "$OUT_FILE" \
     -L"$SFML_PATH/lib" \
-    -L"$SDR_LIB" \
     -lcomdlg32 -lole32 -lws2_32 \
     -lsfml-graphics -lsfml-window -lsfml-system -lsfml-audio \
-    -lrtlsdr -lsdrplay_api \
+    -lrtlsdr \
     -lcomdlg32 -lole32
 
 if [ $? -ne 0 ]; then
