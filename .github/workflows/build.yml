@@ -263,6 +263,15 @@ jobs:
           export LDFLAGS="-L/opt/homebrew/lib -mmacosx-version-min=15.0 -Wl,-headerpad_max_install_names"
           ./build.sh --enable-sdrplay
 
+      - name: Determine version
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
       - name: Create .App Bundle with Icon
         run: |
           # 1. Create Directories
@@ -314,7 +323,9 @@ jobs:
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>CFBundleShortVersionString</key>
-              <string>1.0</string>
+              <string>${VERSION}</string>
+              <key>CFBundleVersion</key>
+              <string>${VERSION}</string>
               <key>LSMinimumSystemVersion</key>
               <string>15.0</string>
               <key>NSHighResolutionCapable</key>

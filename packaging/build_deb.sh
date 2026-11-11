@@ -50,7 +50,7 @@ Exec=orbitsdr
 Icon=orbitsdr
 Terminal=false
 Categories=HamRadio;AudioVideo;Audio;
-Keywords=sdr;radio;rtl-sdr;sdrplay;aprs;ais;
+Keywords=sdr;radio;rtl-sdr;sdrplay;aprs;ais;acars;rtl_433;ism;rds;sstv;wefax;
 EOF
 
 # --- license ---
@@ -80,7 +80,8 @@ Homepage: ${HOMEPAGE}
 Description: Lightweight multiplatform SDR receiver
  OrbitSDR is a lightweight software defined radio application with a
  waterfall display, AM/NFM/WFM/SSB demodulation, baseband recording and
- playback, and built-in APRS and AIS decoders.
+ playback, and built-in decoders for APRS, AIS, ACARS, ISM sensors
+ (rtl_433), RDS, SSTV and WEFAX.
  .
  Supports RTL-SDR, RTL-TCP, sound card input and SDRplay devices.
  SDRplay hardware additionally requires the official SDRplay API service
