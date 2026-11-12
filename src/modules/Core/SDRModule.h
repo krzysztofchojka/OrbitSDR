@@ -34,6 +34,8 @@ public:
     // True when the input switch (Source / Input) is set to Audio: then processAudio()
     // carries the signal and processIQ() must not be used for decoding
     virtual void setAudioInput(bool /*audio*/) {}
+    // Bandwidth of the main tuner (Hz); decoder channels that follow the tuner may use it
+    virtual void setTunerBandwidth(double /*hz*/) {}
 
     // The channels this decoder listens to (yellow bands + handles on the tuning bar).
     // nullptr for decoders without channels. Not shown while the input is audio.

@@ -1172,6 +1172,15 @@ int main() {
         long long freqHz = 0;
     } chDrag;
 
+    // Dragging an edge of a decoder channel's yellow band (changes its width)
+    struct ChannelEdgeDrag {
+        ChannelSet* set = nullptr;
+        int id = -1;
+        float x = 0.0f;
+        double widthHz = 0.0;
+        bool snapTuner = false;   // on the tuner's band edge: release = take the tuner's width again
+    } chEdge;
+
     bool showAprsModal = false;
     AprsLastPacket selectedAprsPacket;
     SdrButton btnModalClose(80, 30, "Close", font);
@@ -1314,6 +1323,7 @@ int main() {
             }
         }
         if (chDrag.set && chDrag.set != chSet) chDrag = ChannelDrag();   // decoder switched off while dragging
+        if (chEdge.set && chEdge.set != chSet) chEdge = ChannelEdgeDrag();
         struct ChHandle { DecoderChannel ch; float x; float rawX; int edge; };
         std::vector<ChHandle> chHandles;
         const double vfoOffsetHz = (tunePct - 0.5) * hwSampleRate;
@@ -1344,6 +1354,55 @@ int main() {
             }
             return best;
         };
+        // Edges of the main tuner's band (grey) in pixels
+        float tunerEdgeL = visualCenterX - bwPixels / 2.0f, tunerEdgeR = visualCenterX + bwPixels / 2.0f;
+        if (mode == Mode::USB) { tunerEdgeL = visualCenterX; tunerEdgeR = visualCenterX + bwPixels; }
+        if (mode == Mode::LSB) { tunerEdgeL = visualCenterX - bwPixels; tunerEdgeR = visualCenterX; }
+        auto chCentreOffset = [&](const DecoderChannel& c) {
+            return c.followVfo ? vfoOffsetHz : (double)(c.freqHz - currentCenterFreq);
+        };
+        // A draggable edge of a yellow band on the spectrum: index into chHandles, or -1.
+        // Bands whose width is the tuner's have no own edges (the grey band's edges change both).
+        // SSB channels: only the edge away from the dial frequency moves.
+        auto edgeAt = [&](sf::Vector2f m) -> int {
+            if (!chSet || !chSet->resizable || m.y < (float)TOP_BAR_H || m.y > (float)TOP_BAR_H + layout.specH || m.x > layout.specW) return -1;
+            int best = -1;
+            float bestD = 6.0f;
+            for (size_t i = 0; i < chHandles.size(); i++) {
+                const DecoderChannel& c = chHandles[i].ch;
+                if (chHandles[i].edge != 0 || chSet->widthFollowsTuner(c)) continue;
+                const double off = chCentreOffset(c);
+                if (c.sideband <= 0) { const float d = std::abs(offsetToX(c.lowOffset(off)) - m.x); if (d < bestD) { bestD = d; best = (int)i; } }
+                if (c.sideband >= 0) { const float d = std::abs(offsetToX(c.highOffset(off)) - m.x); if (d < bestD) { bestD = d; best = (int)i; } }
+            }
+            return best;
+        };
+        auto updateEdgeDrag = [&](float mx) {
+            const float x = std::clamp(mx, 0.0f, layout.specW);
+            chEdge.x = x;
+            const ChHandle* h = nullptr;
+            for (const ChHandle& ch : chHandles) if (ch.ch.id == chEdge.id) h = &ch;
+            if (!h) return;
+            const DecoderChannel& c = h->ch;
+            const double hzPerPx = (hwSampleRate * viewWidthPct) / layout.specW;
+            const float cx = offsetToX(chCentreOffset(c));
+            double w = c.sideband > 0 ? (x - cx) * hzPerPx
+                     : c.sideband < 0 ? (cx - x) * hzPerPx
+                                      : 2.0 * std::abs(x - cx) * hzPerPx;
+            // on the grey band's edge: the tuner's width (only for channels that may follow it)
+            chEdge.snapTuner = c.followVfo && chSet->followTunerWidth &&
+                               (std::abs(x - tunerEdgeL) < 6.0f || std::abs(x - tunerEdgeR) < 6.0f);
+            if (chEdge.snapTuner) w = slBW->currentVal;
+            else w = std::round(w / 100.0) * 100.0;
+            w = std::clamp(w, 500.0, std::max(500.0, hwSampleRate * 0.9));
+            chEdge.widthHz = w;
+            chEdge.set->setChannelWidth(chEdge.id, w);
+        };
+        auto finishEdgeDrag = [&]() {
+            if (chEdge.set && chEdge.snapTuner) chEdge.set->resetChannelWidth(chEdge.id);
+            chEdge = ChannelEdgeDrag();
+        };
+
         // Puts the tuner on a frequency (retunes the radio when it is outside the band)
         auto tuneVfoTo = [&](long long f) {
             const double halfBW = hwSampleRate / 2.0;
@@ -1472,6 +1531,10 @@ int main() {
                     finishChannelDrag();
                     continue;
                 }
+                if (mr->button == sf::Mouse::Button::Left && chEdge.set) {
+                    finishEdgeDrag();
+                    continue;
+                }
                 if (mr->button == sf::Mouse::Button::Left) {
                     isSpectrumDragging = false;
                     isDraggingScale = false;
@@ -1518,6 +1581,15 @@ int main() {
             if (const auto* mbp = ev->getIf<sf::Event::MouseButtonPressed>()) {
                 if (mbp->button == sf::Mouse::Button::Left) {
                     const sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window));
+                    const int e = edgeAt(m);
+                    if (e >= 0 && chSet) {
+                        chEdge = ChannelEdgeDrag();
+                        chEdge.set = chSet;
+                        chEdge.id = chHandles[e].ch.id;
+                        chEdge.x = m.x;
+                        chEdge.widthHz = chHandles[e].ch.widthHz;
+                        continue;
+                    }
                     const int h = handleAt(m);
                     if (h >= 0 && chSet) {
                         chDrag = ChannelDrag();
@@ -1531,6 +1603,12 @@ int main() {
             if (chDrag.set) {
                 if (const auto* mmv = ev->getIf<sf::Event::MouseMoved>()) {
                     updateChannelDrag(window.mapPixelToCoords(mmv->position).x);
+                    continue;
+                }
+            }
+            if (chEdge.set) {
+                if (const auto* mmv = ev->getIf<sf::Event::MouseMoved>()) {
+                    updateEdgeDrag(window.mapPixelToCoords(mmv->position).x);
                     continue;
                 }
             }
@@ -1811,7 +1889,8 @@ int main() {
         if (handleAt(mousePos) >= 0) showHand = true;
         if (showAprsModal) showHand = false;
 
-        if ((isDraggingBW || (chDrag.set && chDrag.moved)) && cursorSizeH) { window.setMouseCursor(*cursorSizeH); }
+        const bool overChEdge = chEdge.set || (!chDrag.set && !isDraggingBW && !showAprsModal && edgeAt(mousePos) >= 0);
+        if ((isDraggingBW || (chDrag.set && chDrag.moved) || overChEdge) && cursorSizeH) { window.setMouseCursor(*cursorSizeH); }
         else if (showHand && cursorHand) { window.setMouseCursor(*cursorHand); }
         else if (cursorArrow) { window.setMouseCursor(*cursorArrow); }
 
@@ -2074,12 +2153,13 @@ int main() {
                 return t.getGlobalBounds().size.x;
             };
             auto mhzText = [](long long hz) { char b[32]; std::snprintf(b, sizeof(b), "%.3f", hz / 1e6); return std::string(b); };
-            const int hovered = chDrag.set ? -1 : handleAt(mousePos);
+            const int hovered = (chDrag.set || chEdge.set) ? -1 : handleAt(mousePos);
+            const int hoveredEdge = (chDrag.set || chEdge.set || hovered >= 0) ? -1 : edgeAt(mousePos);
 
             for (size_t i = 0; i < chHandles.size(); i++) {
                 const ChHandle& h = chHandles[i];
                 const DecoderChannel& c = h.ch;
-                const bool dragging = chDrag.set && chDrag.id == c.id;
+                const bool dragging = (chDrag.set && chDrag.id == c.id) || (chEdge.set && chEdge.id == c.id);
                 const double off = c.followVfo ? vfoOffsetHz : (double)(c.freqHz - currentCenterFreq);
                 const std::string title = c.name + (c.followVfo ? "  (tuner)" : "  " + mhzText(c.freqHz));
 
@@ -2135,10 +2215,19 @@ int main() {
                                        : chDrag.snap == 1 ? mhzText(chDrag.freqHz) + " MHz  (known frequency)"
                                                           : mhzText(chDrag.freqHz) + " MHz";
                 label(what, std::min(chDrag.x + 8.0f, layout.specW - 200.0f), tbTop - 15.0f, sf::Color(255, 235, 120), 22);
+            } else if (chEdge.set) {
+                char b[48];
+                std::snprintf(b, sizeof(b), "width %.1f kHz", chEdge.widthHz / 1000.0);
+                const std::string what = chEdge.snapTuner ? "release: the tuner's bandwidth" : std::string(b);
+                label(what, std::min(chEdge.x + 8.0f, layout.specW - 200.0f), specTop + 28.0f, sf::Color(255, 235, 120), 22);
             } else if (hovered >= 0) {
                 const ChHandle& h = chHandles[hovered];
                 const std::string tip = h.ch.name + ":  drag = move,  drop on the tuner = follow it,  click = listen";
                 label(tip, std::clamp(h.x - 60.0f, 4.0f, layout.specW - 380.0f), tbTop - 15.0f, sf::Color(255, 235, 120), 22);
+            } else if (hoveredEdge >= 0) {
+                const std::string tip = chHandles[hoveredEdge].ch.name + ":  drag the edge = channel width" +
+                    std::string(chSet->followTunerWidth && chHandles[hoveredEdge].ch.followVfo ? ",  drop on the grey edge = the tuner's width" : "");
+                label(tip, std::clamp(mousePos.x + 10.0f, 4.0f, layout.specW - 420.0f), specTop + 28.0f, sf::Color(255, 235, 120), 22);
             }
         }
 

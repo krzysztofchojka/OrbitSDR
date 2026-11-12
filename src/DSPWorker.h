@@ -250,6 +250,7 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
             if (play) {
                 if (activeModule && activeModule->enabled) {
                     activeModule->setRadioFrequency(centerHz);
+                    activeModule->setTunerBandwidth(bw);
                     activeModule->processIQ(chunkToProcess, sr, freqOffset);
                 }
                 auto audioData = demod.process(chunkToProcess, freqOffset, bw, mode, stereo);

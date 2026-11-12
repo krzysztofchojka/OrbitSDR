@@ -116,6 +116,8 @@ public:
         // ISS 145.800 (NFM) and the HF SSTV calling frequencies (dial, SSB)
         channels.presets = { 145800000, 3730000, 7171000, 14230000, 14233000, 21340000, 28680000 };
         channels.maxChannels = 1;
+        channels.followTunerWidth = true;
+        channels.resizable = true;
         channels.shape = [](DecoderChannel& c) {
             if (c.freqHz > 0 && c.freqHz < 30000000) {
                 const bool lsb = c.freqHz < 10000000;

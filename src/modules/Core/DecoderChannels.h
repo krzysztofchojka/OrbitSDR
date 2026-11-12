@@ -41,6 +41,7 @@ struct DecoderChannel {
     bool followVfo = false;    // sits on the tuner and moves with it
     bool autoPlaced = false;   // placed by the program (may be moved / dropped on retune)
     bool fallback = false;     // automatic "follow the tuner" because no known frequency is in band
+    bool customWidth = false;  // width set by the user (dragged band edge): kept over shape / tuner width
 
     double lowOffset(double centreOffset) const {
         return sideband > 0 ? centreOffset : sideband < 0 ? centreOffset - widthHz : centreOffset - widthHz / 2.0;
@@ -83,6 +84,13 @@ class ChannelSet {
         c.name = name;
         if (shape) shape(c);
         return c;
+    }
+
+    // shape() may set the width; a width chosen by the user wins
+    void applyShape(DecoderChannel& c) const {
+        const double w = c.widthHz;
+        if (shape) shape(c);
+        if (c.customWidth) c.widthHz = w;
     }
 
     // In-band presets, closest to the centre first
@@ -145,6 +153,12 @@ public:
     int sideband = 0;
     Mode listenMode = Mode::NFM;
     std::function<void(DecoderChannel&)> shape;   // optional: name / width / mode from the frequency
+    // A channel that follows the tuner also takes the tuner's bandwidth (the grey band),
+    // so it hears exactly what the main demodulator hears. Wide FM signals (satellite
+    // SSTV with Doppler) don't fit the decoder's default width.
+    bool followTunerWidth = false;
+    // The decoder demodulates with the channel width, so the user may drag the band edges
+    bool resizable = false;
 
     bool multi() const { return maxChannels > 1; }
 
@@ -156,7 +170,7 @@ public:
     }
 
     // DSP thread, every block: places the channels and resolves their offsets
-    std::vector<ResolvedChannel> update(long long centreHz, double rate, double vfoOffsetHz) {
+    std::vector<ResolvedChannel> update(long long centreHz, double rate, double vfoOffsetHz, double tunerWidthHz = 0.0) {
         std::lock_guard<std::mutex> l(mtx);
         const long long vfoHz = centreHz + (long long)std::llround(vfoOffsetHz);
         if (!placed) {
@@ -172,7 +186,8 @@ public:
         for (auto& c : channels) {
             if (c.followVfo) {
                 c.freqHz = vfoHz;
-                if (shape) shape(c);
+                applyShape(c);
+                if (followTunerWidth && tunerWidthHz > 0.0 && !c.customWidth) c.widthHz = tunerWidthHz;
             }
             const double off = c.followVfo ? vfoOffsetHz : (double)(c.freqHz - centreHz);
             const bool in = std::max(std::abs(c.lowOffset(off)), std::abs(c.highOffset(off))) < rate / 2.0;
@@ -192,8 +207,29 @@ public:
         for (auto& c : channels) if (c.id == id) {
             c.freqHz = freqHz;
             c.followVfo = false; c.autoPlaced = false; c.fallback = false;
+            applyShape(c);
+        }
+    }
+
+    // The user dragged an edge of the band: this channel keeps the width
+    void setChannelWidth(int id, double w) {
+        std::lock_guard<std::mutex> l(mtx);
+        for (auto& c : channels) if (c.id == id) { c.widthHz = w; c.customWidth = true; }
+    }
+
+    // Back to the automatic width (the decoder's default, or the tuner's while following it)
+    void resetChannelWidth(int id) {
+        std::lock_guard<std::mutex> l(mtx);
+        for (auto& c : channels) if (c.id == id) {
+            c.customWidth = false;
+            c.widthHz = defaultWidth;
             if (shape) shape(c);
         }
+    }
+
+    // True while the channel's width simply is the tuner's (its edges are the grey band's)
+    bool widthFollowsTuner(const DecoderChannel& c) const {
+        return followTunerWidth && c.followVfo && !c.customWidth;
     }
 
     void followTuner(int id) {

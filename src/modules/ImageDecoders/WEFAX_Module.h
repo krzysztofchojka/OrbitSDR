@@ -140,6 +140,8 @@ public:
                                        4235000, 6340500, 9110000, 12750000, 4346000, 8682000, 12786000 };
         for (long long f : assigned) channels.presets.push_back(f - 1900);
         channels.maxChannels = 1;
+        channels.followTunerWidth = true;
+        channels.resizable = true;
         channels.defaultWidth = 3000.0;
         channels.sideband = +1;
         channels.listenMode = Mode::USB;

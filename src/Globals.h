@@ -48,6 +48,7 @@ inline ChannelSet& aprsChannels() {
         c.presets = { 144800000, 144390000, 144640000, 144575000, 145175000, 145825000, 144930000 };
         c.maxChannels = 1;
         c.defaultWidth = 12500.0;
+        c.resizable = true;   // the APRS demodulator uses the channel width
         c.listenMode = Mode::NFM;
         return true;
     }();

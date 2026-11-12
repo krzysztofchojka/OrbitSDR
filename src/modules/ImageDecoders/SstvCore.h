@@ -256,9 +256,15 @@ private:
 
     void evaluateVis(long long e) {
         const long long ms = (long long)(FS / 1000.0);
-        auto near1200 = [](double f) { return std::abs(f - 1200.0) < 80.0; };
+        // Start / stop bits only need to be clearly below the leader (1900) and the data
+        // "0" (1300) is checked by the bits themselves. The tolerance is wide on purpose:
+        // with a weak FM signal (satellites) the noise moves the averages by ~100 Hz, and a
+        // tight limit threw away good headers. The leader, the even parity and a known mode
+        // code still guard against false starts.
+        auto near1200 = [](double f) { return std::abs(f - 1200.0) < 150.0; };
         if (!near1200(visAvg(e + 3 * ms, e + 27 * ms))) return;            // start bit
-        if (!near1200(visAvg(e + 274 * ms, e + 296 * ms))) return;         // stop bit
+        // stop bit: kept off its edges, the image (sync / porch) follows right after it
+        if (!near1200(visAvg(e + 274 * ms, e + 290 * ms))) return;
         int code = 0, ones = 0;
         for (int i = 0; i < 8; i++) {
             double f = visAvg(e + (30 * (i + 1) + 4) * ms, e + (30 * (i + 2) - 4) * ms);

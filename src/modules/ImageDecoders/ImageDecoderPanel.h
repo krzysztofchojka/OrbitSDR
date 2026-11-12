@@ -138,6 +138,7 @@ protected:
     double chDemodRate = 0.0;
     std::atomic<bool> audioInput {false};
     std::atomic<long long> radioHz {0};
+    std::atomic<double> tunerBw {0.0};
     std::vector<float> chMono;
 
     // Feeds demodulated audio (48 kHz) into the tone demodulator and the decoder
@@ -301,7 +302,7 @@ public:
     // I/Q input: demodulate the own channel
     void processIQ(const std::vector<std::complex<double>>& iq, double sampleRate, double tunedOffset) override {
         if (audioInput || iq.empty() || sampleRate <= 0.0) return;
-        const auto rc = channels.update(radioHz, sampleRate, tunedOffset);
+        const auto rc = channels.update(radioHz, sampleRate, tunedOffset, tunerBw);
         if (rc.empty() || !rc[0].inBand) return;
         if (!chDemod || chDemodRate != sampleRate) {
             chDemod = std::make_unique<Demodulator>(sampleRate, 48000.0);
@@ -316,6 +317,7 @@ public:
 
     void setAudioInput(bool audio) override { audioInput = audio; }
     void setRadioFrequency(long long hz) override { radioHz = hz; }
+    void setTunerBandwidth(double hz) override { tunerBw = hz; }
     ChannelSet* channelSet() override { return &channels; }
 
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
