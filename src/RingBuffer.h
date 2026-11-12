@@ -2,86 +2,85 @@
 
 #include <vector>
 #include <mutex>
-#include <iostream>
-#include <algorithm> // for std::copy, std::min
-#include <cstring>   // for memcpy (optional, std::copy is safer for objects)
+#include <algorithm>
 
-// Thread-safe FIFO ring buffer optimization
+// Thread-safe FIFO ring buffer for streaming samples.
+// When the writer is faster than the reader the OLDEST samples are dropped, so the
+// reader always gets a continuous run of the newest data and latency stays bounded.
+// The lock is held only for the block copies, which are short compared with the
+// buffer length; clear() may be called from any thread.
 template <typename T>
 class RingBuffer {
 private:
     std::vector<T> buffer;
-    size_t head = 0;
-    size_t tail = 0;
+    size_t head = 0;      // next write position
+    size_t tail = 0;      // next read position
+    size_t size = 0;      // number of stored items (head == tail is ambiguous without it)
     size_t capacity;
+    size_t dropped = 0;   // items lost to overflow since the last clear()
     std::mutex mtx;
-    bool overflowWarning = false;
 
 public:
-    RingBuffer(size_t size) : buffer(size), capacity(size) {}
+    explicit RingBuffer(size_t cap) : buffer(cap > 0 ? cap : 1), capacity(cap > 0 ? cap : 1) {}
 
     void push(const T* data, size_t count) {
+        if (count == 0) return;
         std::lock_guard<std::mutex> lock(mtx);
-        
-        // OPTIMISATION: block copy instead of a per-element loop
-        size_t firstChunk = std::min(count, capacity - head);
-        std::copy(data, data + firstChunk, buffer.begin() + head);
-        
-        if (count > firstChunk) {
-            std::copy(data + firstChunk, data + count, buffer.begin());
+
+        // A push larger than the whole buffer: only the newest 'capacity' items can be kept
+        if (count > capacity) {
+            dropped += count - capacity;
+            data += count - capacity;
+            count = capacity;
         }
 
-        size_t next_head = (head + count) % capacity;
+        // Not enough room: drop the oldest items by moving tail forward
+        const size_t freeSpace = capacity - size;
+        if (count > freeSpace) {
+            const size_t overflow = count - freeSpace;
+            tail = (tail + overflow) % capacity;
+            size -= overflow;
+            dropped += overflow;
+        }
 
-        // Overflow detection (simple ring buffer heuristic)
-        // In a full ring buffer "head" could overtake "tail".
-        // For SDR throughput we assume that if the writer is faster,
-        // we simply move tail on (dropping old data) instead of blocking.
-        
-        size_t availableSpace = (tail > head) ? (tail - head) : (capacity - (head - tail));
-        // Note: this is simplified overflow handling for streaming.
-        // If we overwrote tail, it has to move.
-        
-        // A more conservative approach to tail in a simple buffer:
-        // if we wrote more data than there was room for, tail has to "run ahead".
-        // (Harder in a strictly lock-free implementation; here we have a mutex.)
-        
-        head = next_head;
+        const size_t firstChunk = std::min(count, capacity - head);
+        std::copy(data, data + firstChunk, buffer.begin() + head);
+        if (count > firstChunk) std::copy(data + firstChunk, data + count, buffer.begin());
+
+        head = (head + count) % capacity;
+        size += count;
     }
 
     // Returns the actual number of items read
     size_t pop(T* out, size_t count) {
         std::lock_guard<std::mutex> lock(mtx);
-        
-        size_t available = 0;
-        if (head >= tail) available = head - tail;
-        else available = capacity - (tail - head);
+        const size_t toRead = std::min(count, size);
+        if (toRead == 0) return 0;
 
-        if (available == 0) return 0;
-
-        size_t toRead = std::min(count, available);
-
-        // OPTIMISATION: block copy
-        size_t firstChunk = std::min(toRead, capacity - tail);
+        const size_t firstChunk = std::min(toRead, capacity - tail);
         std::copy(buffer.begin() + tail, buffer.begin() + tail + firstChunk, out);
-
-        if (toRead > firstChunk) {
+        if (toRead > firstChunk)
             std::copy(buffer.begin(), buffer.begin() + (toRead - firstChunk), out + firstChunk);
-        }
 
         tail = (tail + toRead) % capacity;
+        size -= toRead;
         return toRead;
     }
-    
+
     void clear() {
         std::lock_guard<std::mutex> lock(mtx);
-        head = 0;
-        tail = 0;
+        head = tail = size = 0;
+        dropped = 0;
     }
-    
+
     size_t available() {
         std::lock_guard<std::mutex> lock(mtx);
-        if (head >= tail) return head - tail;
-        return capacity - (tail - head);
+        return size;
+    }
+
+    // Items dropped because the reader fell behind (for diagnostics)
+    size_t droppedCount() {
+        std::lock_guard<std::mutex> lock(mtx);
+        return dropped;
     }
 };

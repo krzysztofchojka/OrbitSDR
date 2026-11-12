@@ -1208,9 +1208,11 @@ int main() {
         float autoGainDb = -1.0f;
         float adcOverload = 0.0f;
         bool agcLimitedByRds = false;
+        bool sourceReconnecting = false;
         {
             std::lock_guard<std::mutex> l(sourceMtx);
             if (currentSource) {
+                sourceReconnecting = currentSource->isReconnecting();
                 isHw = currentSource->isHardware();
                 hwSampleRate = currentSource->getSampleRate();
                 prog = currentSource->getProgress();
@@ -2496,7 +2498,13 @@ int main() {
             window.draw(sValTxt);
 
             // The ADC clips: the signal is distorted (weak signals and RDS suffer first)
-            if (adcOverload > 0.0002f) {
+            if (sourceReconnecting) {
+                sf::Text rc(font, "DEVICE LOST - reconnecting...", 22);
+                rc.setScale({0.5f, 0.5f});
+                rc.setPosition({meterX + meterW + 16.0f, statusY + 14.0f});
+                rc.setFillColor(sf::Color(255, 90, 90));
+                window.draw(rc);
+            } else if (adcOverload > 0.0002f) {
                 sf::Text ov(font, "ADC OVERLOAD - lower the RF gain", 22);
                 ov.setScale({0.5f, 0.5f});
                 ov.setPosition({meterX + meterW + 16.0f, statusY + 14.0f});

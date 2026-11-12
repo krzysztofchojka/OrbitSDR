@@ -7,6 +7,9 @@
 #include <atomic>
 #include <fstream>
 #include <mutex>
+#include <map>
+#include <condition_variable>
+#include <chrono>
 #include <cstring> 
 #include <algorithm>
 #include <sstream>
@@ -79,6 +82,8 @@ public:
     virtual float getAutoGainDb() { return -1.0f; }
     // Recent fraction of ADC samples at full scale (0 = no overload)
     virtual float getOverloadFraction() { return 0.0f; }
+    // True while the source has lost its device and is trying to reconnect
+    virtual bool isReconnecting() { return false; }
     // Software AGC gain steps (for the RDS assisted tuning): the current step (-1 = AGC off),
     // the number of steps, and the highest step the AGC may use (-1 = no limit)
     virtual int getAgcStep() { return -1; }
@@ -678,11 +683,39 @@ class SdrPlaySource : public IQSource {
     bool isSelected = false; bool isInitialized = false; RingBuffer<Complex> ringBuffer; double sampleRate = 2000000.0; double hwSampleRate = 2000000.0; long long centerFreq = 100000000; std::mutex hwMtx;
     sdrplay_api_DeviceT currentDevice; sdrplay_api_DeviceParamsT *deviceParams = NULL; sdrplay_api_CallbackFnsT cbFns; std::atomic<bool> running {false};
     static std::atomic<int> activeInstances;
+    static std::mutex apiMtx;           // serialises sdrplay_api_Open/Close between instances and threads
     IQDecimator decimator;              // used only by the stream callback
     std::vector<Complex> cbBuf;
 
+    // Settings remembered so they can be applied again after a reconnect (guarded by hwMtx)
+    std::string serial;
+    uint32_t openedRate = 0;
+    int gainDb = -1;                    // -1 = hardware AGC
+    std::map<std::string, int> hwOptions;
+    bool wantRunning = false;           // the user pressed play (and not stop)
+
+    // State reported by the API callbacks
+    std::atomic<bool> overloaded{false};
+    std::atomic<bool> deviceLost{false};
+    std::atomic<bool> reconnecting{false};
+    std::atomic<long long> lastStreamMs{0};
+
+    // Watchdog: notices a removed, failed or stalled device and reconnects it
+    std::thread watchdog;
+    std::mutex wdMtx;
+    std::condition_variable wdCv;
+    bool wdQuit = false;
+
+    static constexpr long long STALL_MS = 3000;   // no samples for this long while running = device lost
+    static constexpr long long RETRY_MS = 2000;   // pause between reconnect attempts
+
+    static long long nowMs() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
     static void StreamCallback(short *xi, short *xq, sdrplay_api_StreamCbParamsT *params, unsigned int numSamples, unsigned int reset, void *cbContext) {
         SdrPlaySource* self = (SdrPlaySource*)cbContext; if (!self->running) return;
+        self->lastStreamMs = nowMs();
         const double scale = 1.0 / 32768.0;
         auto& buf = self->cbBuf;
         buf.resize(numSamples);
@@ -691,7 +724,173 @@ class SdrPlaySource : public IQSource {
         const Complex* out = self->decimator.process(buf.data(), numSamples, outCount);
         if (outCount > 0) self->ringBuffer.push(out, outCount);
     }
-    static void EventCallback(sdrplay_api_EventT eventId, sdrplay_api_TunerSelectT tuner, sdrplay_api_EventParamsT *params, void *cbContext) {}
+
+    // Runs on the API's thread. It must not take hwMtx: stop() holds it while
+    // sdrplay_api_Uninit waits for this thread to finish.
+    static void EventCallback(sdrplay_api_EventT eventId, sdrplay_api_TunerSelectT tuner, sdrplay_api_EventParamsT *params, void *cbContext) {
+        SdrPlaySource* self = (SdrPlaySource*)cbContext;
+        if (!self) return;
+        switch (eventId) {
+        case sdrplay_api_PowerOverloadChange:
+            self->overloaded = params && params->powerOverloadParams.powerOverloadChangeType == sdrplay_api_Overload_Detected;
+            // The API sends no further overload messages until this one is acknowledged
+            sdrplay_api_Update(self->currentDevice.dev, tuner, sdrplay_api_Update_Ctrl_OverloadMsgAck, sdrplay_api_Update_Ext1_None);
+            break;
+        case sdrplay_api_DeviceRemoved:
+        case sdrplay_api_DeviceFailure:
+            std::cerr << "[SDRplay] " << (eventId == sdrplay_api_DeviceRemoved ? "device removed" : "device failure") << std::endl;
+            self->deviceLost = true;   // the watchdog reconnects
+            break;
+        default:
+            // GainChange: reports from the hardware AGC, nothing to do.
+            // RspDuoModeChange: only single tuner mode is used.
+            break;
+        }
+    }
+
+    // --- Helpers below are called with hwMtx held ---
+
+    // Opens the API (if needed) and selects the device. exactSerial: fail instead of
+    // falling back to the first device when the serial number is not found.
+    bool openLocked(const std::string& id, uint32_t requestedRate, bool exactSerial) {
+        {
+            std::lock_guard<std::mutex> al(apiMtx);
+            if (activeInstances == 0 && !sdrplayApiOpen()) return false;
+            activeInstances++;
+        }
+        auto giveUpApi = [&]() {
+            std::lock_guard<std::mutex> al(apiMtx);
+            activeInstances--;
+            if (activeInstances <= 0) { activeInstances = 0; sdrplay_api_Close(); }
+        };
+        // Keep the device list locked from reading it until the device is selected
+        sdrplay_api_LockDeviceApi();
+        sdrplay_api_DeviceT devs[6]; unsigned int nDevs = 0; sdrplay_api_GetDevices(devs, &nDevs, 6);
+        int foundIdx = (nDevs > 0 && !exactSerial) ? 0 : -1;
+        if (!id.empty()) { for (unsigned int i = 0; i < nDevs; i++) { if (std::string(devs[i].SerNo) == id) { foundIdx = (int)i; break; } } }
+        if (foundIdx < 0) { sdrplay_api_UnlockDeviceApi(); giveUpApi(); return false; }
+        currentDevice = devs[foundIdx]; currentDevice.tuner = sdrplay_api_Tuner_A;
+        const bool selected = (sdrplay_api_SelectDevice(&currentDevice) == sdrplay_api_Success);
+        sdrplay_api_UnlockDeviceApi();
+        if (!selected) { giveUpApi(); return false; }
+        isSelected = true;
+        if (sdrplay_api_GetDeviceParams(currentDevice.dev, &deviceParams) != sdrplay_api_Success) { releaseLocked(); return false; }
+        serial = std::string(currentDevice.SerNo);
+        openedRate = requestedRate;
+        if (requestedRate == 0) requestedRate = 2000000;
+        if (requestedRate < SDRPLAY_MIN_HW_RATE) {
+            // Low sample rate: run the radio at 2.0 MSps and decimate in software
+            hwSampleRate = (double)SDRPLAY_DECIM_BASE_RATE;
+            decimator.setFactor(computeDecimationFactor(SDRPLAY_DECIM_BASE_RATE, requestedRate));
+        } else {
+            hwSampleRate = (double)requestedRate;
+            decimator.setFactor(1);
+        }
+        sampleRate = hwSampleRate / decimator.getFactor();
+        deviceParams->devParams->fsFreq.fsHz = hwSampleRate; deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)centerFreq;
+        deviceParams->rxChannelA->tunerParams.bwType = sdrplay_api_BW_1_536;
+        if (hwSampleRate > 2000000) deviceParams->rxChannelA->tunerParams.bwType = sdrplay_api_BW_5_000;
+        if (hwSampleRate > 8000000) deviceParams->rxChannelA->tunerParams.bwType = sdrplay_api_BW_8_000;
+        deviceParams->rxChannelA->tunerParams.ifType = sdrplay_api_IF_Zero;
+        deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_50HZ;
+        return true;
+    }
+
+    void releaseLocked() {
+        if (!isSelected) return;
+        sdrplay_api_ReleaseDevice(&currentDevice);
+        isSelected = false;
+        deviceParams = NULL;
+        std::lock_guard<std::mutex> al(apiMtx);
+        activeInstances--;
+        if (activeInstances <= 0) { activeInstances = 0; sdrplay_api_Close(); }
+    }
+
+    void startLocked() {
+        if (running || !isSelected || !deviceParams) return;
+        deviceParams->devParams->fsFreq.fsHz = hwSampleRate;
+        deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)centerFreq;
+        decimator.reset();
+        ringBuffer.clear();   // never play samples left over from before the pause
+        overloaded = false;
+        deviceLost = false;
+        lastStreamMs = nowMs();
+        memset(&cbFns, 0, sizeof(cbFns)); cbFns.StreamACbFn = StreamCallback; cbFns.EventCbFn = EventCallback;
+        if (sdrplay_api_Init(currentDevice.dev, &cbFns, this) == sdrplay_api_Success) { isInitialized = true; running = true; }
+    }
+
+    void stopLocked() {
+        running = false;
+        if (isInitialized) { sdrplay_api_Uninit(currentDevice.dev); isInitialized = false; }
+        overloaded = false;
+    }
+
+    void applyGainLocked() {
+        if (!deviceParams) return;
+        if (gainDb == -1) {
+            if (deviceParams->rxChannelA->ctrlParams.agc.enable != sdrplay_api_AGC_50HZ) {
+                deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_50HZ;
+                if (running) sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Ctrl_Agc, sdrplay_api_Update_Ext1_None);
+            }
+        } else {
+            deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_DISABLE;
+            int reduction = (50 - gainDb); if (reduction < 0) reduction = 0; if (reduction > 59) reduction = 59;
+            deviceParams->rxChannelA->tunerParams.gain.gRdB = reduction;
+            deviceParams->rxChannelA->tunerParams.gain.LNAstate = 0;
+            if (running) sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, (sdrplay_api_ReasonForUpdateT)(sdrplay_api_Update_Ctrl_Agc | sdrplay_api_Update_Tuner_Gr), sdrplay_api_Update_Ext1_None);
+        }
+    }
+
+    void checkDevice(long long& nextAttempt) {
+        std::lock_guard<std::mutex> lock(hwMtx);
+        if (!wantRunning) { reconnecting = false; return; }
+        const long long t = nowMs();
+        const bool stalled = running && (t - lastStreamMs > STALL_MS);   // e.g. the API service was restarted
+        const bool notStreaming = !running;                              // a start or a reconnect failed
+        if (!deviceLost && !stalled && !notStreaming) { reconnecting = false; return; }
+        if (t < nextAttempt) return;
+        nextAttempt = t + RETRY_MS;
+
+        if (!reconnecting) {
+            std::cerr << "[SDRplay] no data from the device, reconnecting..." << std::endl;
+            reconnecting = true;
+        }
+        // Drop everything and open the same device again (the API too: the service may have restarted)
+        stopLocked();
+        releaseLocked();
+        if (!openLocked(serial, openedRate, true)) return;
+        applyGainLocked();
+        for (const auto& o : hwOptions) applyOptionLocked(o.first, o.second);
+        startLocked();
+        if (running) {
+            reconnecting = false;
+            std::cerr << "[SDRplay] reconnected" << std::endl;
+        }
+    }
+
+    void watchdogLoop() {
+        long long nextAttempt = 0;
+        std::unique_lock<std::mutex> wl(wdMtx);
+        while (!wdQuit) {
+            wdCv.wait_for(wl, std::chrono::milliseconds(500), [&] { return wdQuit; });
+            if (wdQuit) break;
+            wl.unlock();
+            checkDevice(nextAttempt);
+            wl.lock();
+        }
+    }
+
+    void startWatchdog() {
+        stopWatchdog();
+        { std::lock_guard<std::mutex> wl(wdMtx); wdQuit = false; }
+        watchdog = std::thread(&SdrPlaySource::watchdogLoop, this);
+    }
+
+    void stopWatchdog() {
+        { std::lock_guard<std::mutex> wl(wdMtx); wdQuit = true; }
+        wdCv.notify_all();
+        if (watchdog.joinable()) watchdog.join();
+    }
 
 public:
     SdrPlaySource() : ringBuffer(8 * 1024 * 1024) {}
@@ -699,6 +898,7 @@ public:
 
     static std::vector<SDRDeviceItem> getDeviceList() {
         std::vector<SDRDeviceItem> list;
+        std::lock_guard<std::mutex> al(apiMtx);
         bool openedLocally = false;
         if (activeInstances == 0) {
             if (!sdrplayApiOpen()) return list;
@@ -726,87 +926,69 @@ public:
     }
 
     bool open(std::string id, uint32_t requestedRate = 0) override {
-        if (isSelected) close();   // close() takes hwMtx itself
-        std::lock_guard<std::mutex> lock(hwMtx);
-        if (activeInstances == 0) if (!sdrplayApiOpen()) return false;
-        activeInstances++;
-        // Keep the device list locked from reading it until the device is selected
-        sdrplay_api_LockDeviceApi();
-        sdrplay_api_DeviceT devs[6]; unsigned int nDevs = 0; sdrplay_api_GetDevices(devs, &nDevs, 6);
-        if (nDevs == 0) { sdrplay_api_UnlockDeviceApi(); activeInstances--; if(activeInstances == 0) sdrplay_api_Close(); return false; }
-        int foundIdx = 0;
-        if (!id.empty()) { for(unsigned int i=0; i<nDevs; i++) { if (std::string(devs[i].SerNo) == id) { foundIdx = i; break; } } }
-        currentDevice = devs[foundIdx]; currentDevice.tuner = sdrplay_api_Tuner_A;
-        const bool selected = (sdrplay_api_SelectDevice(&currentDevice) == sdrplay_api_Success);
-        sdrplay_api_UnlockDeviceApi();
-        if (!selected) { activeInstances--; if(activeInstances == 0) sdrplay_api_Close(); return false; }
-        isSelected = true;
-        if (sdrplay_api_GetDeviceParams(currentDevice.dev, &deviceParams) != sdrplay_api_Success) { close(); return false; }
-        if (requestedRate == 0) requestedRate = 2000000;
-        if (requestedRate < SDRPLAY_MIN_HW_RATE) {
-            // Low sample rate: run the radio at 2.0 MSps and decimate in software
-            hwSampleRate = (double)SDRPLAY_DECIM_BASE_RATE;
-            decimator.setFactor(computeDecimationFactor(SDRPLAY_DECIM_BASE_RATE, requestedRate));
-        } else {
-            hwSampleRate = (double)requestedRate;
-            decimator.setFactor(1);
+        close();   // takes hwMtx itself and stops the watchdog
+        {
+            std::lock_guard<std::mutex> lock(hwMtx);
+            gainDb = -1;
+            hwOptions.clear();
+            if (!openLocked(id, requestedRate, false)) return false;
         }
-        sampleRate = hwSampleRate / decimator.getFactor();
-        deviceParams->devParams->fsFreq.fsHz = hwSampleRate; deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)centerFreq;
-        deviceParams->rxChannelA->tunerParams.bwType = sdrplay_api_BW_1_536;
-        if (hwSampleRate > 2000000) deviceParams->rxChannelA->tunerParams.bwType = sdrplay_api_BW_5_000;
-        if (hwSampleRate > 8000000) deviceParams->rxChannelA->tunerParams.bwType = sdrplay_api_BW_8_000;
-        deviceParams->rxChannelA->tunerParams.ifType = sdrplay_api_IF_Zero; 
-        deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_50HZ; 
+        startWatchdog();
         return true;
     }
 
-    void close() override { 
-        stop(); 
-        std::lock_guard<std::mutex> lock(hwMtx); 
-        if (isSelected) { 
-            sdrplay_api_ReleaseDevice(&currentDevice); 
-            isSelected = false; 
-            deviceParams = NULL; 
-            activeInstances--;
-            if (activeInstances <= 0) { activeInstances = 0; sdrplay_api_Close(); }
-        } 
+    void close() override {
+        stopWatchdog();
+        std::lock_guard<std::mutex> lock(hwMtx);
+        wantRunning = false;
+        reconnecting = false;
+        stopLocked();
+        releaseLocked();
     }
 
-    void start() override { if (running || !isSelected) return; std::lock_guard<std::mutex> lock(hwMtx); if (deviceParams) { deviceParams->devParams->fsFreq.fsHz = hwSampleRate; deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)centerFreq; } decimator.reset(); memset(&cbFns, 0, sizeof(cbFns)); cbFns.StreamACbFn = StreamCallback; cbFns.EventCbFn = EventCallback; if (sdrplay_api_Init(currentDevice.dev, &cbFns, this) == sdrplay_api_Success) { isInitialized = true; running = true; } }
-    void stop() override { if (isInitialized) { running = false; sdrplay_api_Uninit(currentDevice.dev); isInitialized = false; } }
+    void start() override {
+        std::lock_guard<std::mutex> lock(hwMtx);
+        wantRunning = true;   // if the device is not there right now, the watchdog keeps trying
+        startLocked();
+    }
+    void stop() override {
+        std::lock_guard<std::mutex> lock(hwMtx);
+        wantRunning = false;
+        stopLocked();
+    }
     int read(Complex* buffer, int count) override { return ringBuffer.pop(buffer, count); }
     double getSampleRate() override { return sampleRate; }
     bool isHardware() override { return true; }
-    
-    void setCenterFrequency(long long hz) override { 
-        std::lock_guard<std::mutex> lock(hwMtx); 
-        centerFreq = hz; 
-        if (running && deviceParams) { 
-            deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)hz; 
-            sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Tuner_Frf, sdrplay_api_Update_Ext1_None); 
-        } 
-    }
-    
-    void setGain(int db) override {
-        std::lock_guard<std::mutex> lock(hwMtx); if (!running || !deviceParams) return;
-        if (db == -1) { 
-            if (deviceParams->rxChannelA->ctrlParams.agc.enable != sdrplay_api_AGC_50HZ) {
-                deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_50HZ; 
-                sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Ctrl_Agc, sdrplay_api_Update_Ext1_None);
-            }
-        } else { 
-            deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_DISABLE; 
-            int reduction = (50 - db); if (reduction < 0) reduction = 0; if (reduction > 59) reduction = 59;
-            deviceParams->rxChannelA->tunerParams.gain.gRdB = reduction;
-            deviceParams->rxChannelA->tunerParams.gain.LNAstate = 0;
-            sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, (sdrplay_api_ReasonForUpdateT)(sdrplay_api_Update_Ctrl_Agc | sdrplay_api_Update_Tuner_Gr), sdrplay_api_Update_Ext1_None);
+    // The API reports overload only as on/off; 1.0 makes the UI show its overload warning
+    float getOverloadFraction() override { return overloaded ? 1.0f : 0.0f; }
+    bool isReconnecting() override { return reconnecting; }
+
+    void setCenterFrequency(long long hz) override {
+        std::lock_guard<std::mutex> lock(hwMtx);
+        centerFreq = hz;
+        if (running && deviceParams) {
+            deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)hz;
+            sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Tuner_Frf, sdrplay_api_Update_Ext1_None);
         }
     }
-    
+
+    void setGain(int db) override {
+        std::lock_guard<std::mutex> lock(hwMtx);
+        gainDb = db;
+        applyGainLocked();
+    }
+
     void setHardwareOption(std::string name, int value) override {
-    std::lock_guard<std::mutex> lock(hwMtx);
-    
+        std::lock_guard<std::mutex> lock(hwMtx);
+        hwOptions[name] = value;   // applied again after a reconnect
+        applyOptionLocked(name, value);
+    }
+    std::vector<std::string> getAvailableSampleRatesText() override { return SDRPLAY_SAMPLE_RATES_TXT; }
+    std::vector<uint32_t> getAvailableSampleRatesValues() override { return SDRPLAY_SAMPLE_RATES; }
+
+private:
+    // Writes one hardware option into the device parameters (and sends it to the radio when streaming)
+    void applyOptionLocked(const std::string& name, int value) {
     // Guard against editing an uninitialised structure
     if (!deviceParams) return;
 
@@ -869,10 +1051,9 @@ public:
         }
     }
 }
-    std::vector<std::string> getAvailableSampleRatesText() override { return SDRPLAY_SAMPLE_RATES_TXT; }
-    std::vector<uint32_t> getAvailableSampleRatesValues() override { return SDRPLAY_SAMPLE_RATES; }
 };
 std::atomic<int> SdrPlaySource::activeInstances{0};
+std::mutex SdrPlaySource::apiMtx;
 
 #else
 class SdrPlaySource : public IQSource {
