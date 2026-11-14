@@ -45,6 +45,9 @@ SDR_LIB="$(pwd)/deps/sdrplay/lib/windows"
 echo "------------------------------------------"
 echo "Compiling OrbitSDR into /$BUILD_DIR folder..."
 echo "------------------------------------------"
+# Icon + version information (an exe without them looks anonymous to antivirus heuristics)
+windres resource.rc -O coff -o "$BUILD_DIR/resource.res" || exit 1
+
 g++ -std=c++17 -O3 \
     -DENABLE_SDRPLAY \
     -D_USE_MATH_DEFINES \
@@ -52,10 +55,11 @@ g++ -std=c++17 -O3 \
     -I"$SFML_PATH/include" \
     -I"$SDR_INC" \
     "$SRC_DIR/main.cpp" \
+    "$BUILD_DIR/resource.res" \
     $RTL433_LIB \
     -o "$OUT_FILE" \
     -L"$SFML_PATH/lib" \
-    -lcomdlg32 -lole32 -lws2_32 \
+    -lcomdlg32 -lole32 -lws2_32 -lwininet \
     -lsfml-graphics -lsfml-window -lsfml-system -lsfml-audio \
     -lrtlsdr \
     -lcomdlg32 -lole32
@@ -86,6 +90,10 @@ for dll in $(ldd "$OUT_FILE" | grep "/ucrt64" | awk '{print $3}'); do
     echo "Copying to build: $(basename "$dll")"
     cp "$dll" "$BUILD_DIR/"
 done
+
+# Satellite map configuration (proxy / map URL), read next to the exe
+echo "Copying orbitsdr.ini to build folder..."
+cp orbitsdr.ini "$BUILD_DIR/" 2>/dev/null || echo "WARNING: orbitsdr.ini not found!"
 
 echo "Copying bandplan.json to build folder..."
 cp bandplan.json "$BUILD_DIR/" 2>/dev/null || echo "WARNING: bandplan.json not found!"

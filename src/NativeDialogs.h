@@ -75,6 +75,36 @@ inline std::string openFileDialog() {
     return result;
 }
 
+// Opens a native file picker for TLE element sets (.tle / .txt, any file allowed)
+inline std::string openTleFileDialog() {
+    std::string result = "";
+    #ifdef _WIN32
+        char filename[MAX_PATH] = {0};
+        OPENFILENAMEA ofn;
+        ZeroMemory(&ofn, sizeof(ofn));
+        ofn.lStructSize = sizeof(ofn);
+        ofn.lpstrFile = filename;
+        ofn.nMaxFile = sizeof(filename);
+        ofn.lpstrFilter = "TLE files (*.tle;*.txt)\0*.tle;*.txt\0All Files\0*.*\0";
+        ofn.nFilterIndex = 1;
+        ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+        if (GetOpenFileNameA(&ofn)) result = filename;
+    #else
+        #ifdef __APPLE__
+        const char* cmd = "osascript -e 'try' -e 'POSIX path of (choose file with prompt \"Select a TLE file\")' -e 'on error' -e 'return \"\"' -e 'end try'";
+        #else
+        const char* cmd = "zenity --file-selection --title='Select a TLE file' 2>/dev/null";
+        #endif
+        std::array<char, 256> buffer;
+        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
+        if (pipe) {
+            while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) result += buffer.data();
+        }
+    #endif
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) result.pop_back();
+    return result;
+}
+
 // Opens a native folder selection dialog
 inline std::string selectFolderDialog(const std::string& title = "Select Folder for Recordings") {
     std::string result = "";

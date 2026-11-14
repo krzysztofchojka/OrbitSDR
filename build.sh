@@ -120,6 +120,10 @@ if [ "$IS_MACOS" = true ]; then
     if [ -f "bandplan.json" ]; then
         cp "bandplan.json" "$APP_BUNDLE/Contents/Resources/"
     fi
+    # Satellite map configuration (proxy / map URL)
+    if [ -f "orbitsdr.ini" ]; then
+        cp "orbitsdr.ini" "$APP_BUNDLE/Contents/Resources/"
+    fi
 
     # Fix libraries linking
     # Bundled SDRplay API: only a fallback, the installed API is used first (loaded at run time)

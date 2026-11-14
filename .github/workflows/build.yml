@@ -64,7 +64,7 @@ jobs:
       - name: Create portable zip
         shell: pwsh
         run: |
-          Compress-Archive -Path orbitsdr.exe, *.dll, bandplan.json -DestinationPath OrbitSDR-windows-x64-portable.zip
+          Compress-Archive -Path orbitsdr.exe, *.dll, bandplan.json, orbitsdr.ini -DestinationPath OrbitSDR-windows-x64-portable.zip
 
       # 5. Installer (Inno Setup)
       - name: Build installer
@@ -196,6 +196,7 @@ jobs:
           cp orbitsdr OrbitSDR_Linux/OrbitSDR
           cp icon.png OrbitSDR_Linux/ || true
           cp bandplan.json OrbitSDR_Linux/ || true
+          cp orbitsdr.ini OrbitSDR_Linux/ || true
           cp LICENSE OrbitSDR_Linux/ || true
 
           # Copy real files (-L) so symlinks do not disappear in archives
@@ -282,6 +283,7 @@ jobs:
           # 2. Copy Binary & resources
           cp orbitsdr OrbitSDR.app/Contents/MacOS/OrbitSDR
           cp bandplan.json OrbitSDR.app/Contents/Resources/ || true
+          cp orbitsdr.ini OrbitSDR.app/Contents/Resources/ || true
           cp icon.png OrbitSDR.app/Contents/Resources/ || true
 
           # --- ICON GENERATION START ---

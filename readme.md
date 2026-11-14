@@ -80,6 +80,13 @@ Decoded ISM, ACARS and APRS messages are logged to `ism.log`, `acars.log` and `a
 - **Recording:** demodulated audio or raw baseband I/Q to WAV.
 - **Low sample rates:** software decimation, so even narrow bandwidths stay smooth.
 
+- **Satellite map and tracking (MAP button):** a second window with a world map, in the spirit of Orbitron:
+  - live positions, footprints (coverage above your minimum elevation), ground tracks, day/night shading and the sun,
+  - satellite groups from CelesTrak (amateur, weather, stations, CubeSats, SatNOGS...), search by name or NORAD number, favourites, and your own TLEs (paste from the clipboard or import a file),
+  - details of the selected satellite: azimuth / elevation, range, range rate, sunlight / eclipse, polar plot of the pass, the next passes (click one to jump the map to it),
+  - transmitters from the SatNOGS DB with **Track freq** (tune once) or **Track Doppler** (follow the pass). Either the tuner or the active decoder's channel is tuned, so SSTV from the ISS decodes while you listen to something else. Manual fine tuning during tracking is kept as an offset,
+  - TLEs are cached for offline use: refreshed after 24 hours, marked stale after 4 days.
+
 <details>
 <summary><b>ISM decoder details</b></summary>
 
@@ -99,6 +106,20 @@ OrbitSDR is under active development. macOS on Apple Silicon and Windows with SD
 - More digital decoders are planned.
 
 Bug reports, recordings of signals that don't decode, and feature requests are very welcome in [Issues](https://github.com/krzysztofchojka/OrbitSDR/issues). If OrbitSDR is useful to you, a ⭐ helps other people find it.
+
+## Satellite data and the OrbitSDR API
+
+The map downloads TLEs, transmitter lists and the world map through the OrbitSDR API, a small caching proxy ([`server/orbitsdr-api.php`](server/orbitsdr-api.php)), so [CelesTrak](https://celestrak.org) and the [SatNOGS DB](https://db.satnogs.org) see one polite client instead of every installation. When the proxy does not answer, OrbitSDR asks CelesTrak and SatNOGS directly. Everything is also cached in the settings folder (`tle/`).
+
+The addresses are in [`orbitsdr.ini`](orbitsdr.ini), shipped next to the program. To use your own proxy, put a copy in the settings folder (`%APPDATA%\OrbitSDR` on Windows, `~/.config/orbitsdr` on macOS / Linux). That copy wins:
+
+```ini
+api_url = https://example.com/orbitsdr/orbitsdr-api.php
+api_key = ORBITSDR_APP
+map_url =
+```
+
+The key `ORBITSDR_APP` is public on purpose (OrbitSDR is open source). It only marks requests as coming from OrbitSDR, and the proxy's cache and rate limit deal with abuse. See [`server/README.md`](server/README.md) to run your own proxy.
 
 ## Building from source
 

@@ -37,7 +37,7 @@ g++ -std=c++17 -O3 \
     $RTL433_LIB \
     -o "$OUT_FILE" \
     -L"$SFML_PATH/lib" \
-    -lcomdlg32 -lole32 -lws2_32 \
+    -lcomdlg32 -lole32 -lws2_32 -lwininet \
     -lsfml-graphics -lsfml-window -lsfml-system -lsfml-audio \
     -lrtlsdr \
     -lcomdlg32 -lole32 \

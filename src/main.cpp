@@ -40,6 +40,9 @@
 #include "modules/ISM/ISM_Decoder.h"
 #include "modules/ACARS/ACARS_Decoder.h"
 
+// Satellite map and tracking
+#include "orbit/MapWindow.h"
+
 int main() {
     #ifdef _WIN32
     HMODULE hUser32 = LoadLibraryA("user32.dll");
@@ -195,6 +198,18 @@ int main() {
     SdrButton btnPlay(40, 40, ">", font);
     btnPlay.setColor(sf::Color(116, 57, 57));
     SdrButton btnMute(40, 40, "M", font);
+
+    // --- Satellite map / tracking (MAP button in the top bar, see src/orbit/) ---
+    SdrButton btnMap(56, 40, "MAP", font);
+    orbit::SatCatalog satCatalog;
+    satCatalog.init();
+    orbit::SatTracker satTracker;
+    satTracker.loadSettings(settingsMgr);
+    orbit::MapWindow mapWindow(font, satCatalog, satTracker);
+    mapWindow.uiScale = [&]() { return getUiScale(); };
+    mapWindow.icon = &icon;
+    mapWindow.loadSettings(settingsMgr);
+    sf::Clock trackClock;
 
     // Volume slider: the position maps to -40 .. +8 dB, so the low levels are easy to set
     auto volumeGain = [](float pos) { return pos <= 0.001f ? 0.0f : std::pow(10.0f, (pos * 48.0f - 40.0f) / 20.0f); };
@@ -901,6 +916,14 @@ int main() {
     }
     modDecoders->addWidget(std::make_shared<Label>("Each decoder has its own channel (yellow)", font, 11, sf::Color(150, 150, 160)));
 
+    // The map window offers to switch on the decoder a satellite transmitter needs (SSTV, APRS)
+    mapWindow.onEnableDecoder = [&](const std::string& name) {
+        for (auto& d : decoders) {
+            const std::string n = d.mod ? d.mod->name : std::string("APRS");
+            if (n == name && !d.chk->checked) { d.chk->checked = true; d.chk->onToggle(true); }
+        }
+    };
+
     auto modDisp = sidebar.addModule("Display");
     auto slMinDb = std::make_shared<Slider>(SIDEBAR_W - 40, -140.0f, -20.0f, -90.0f, "Min dB", font);
     slMinDb->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.minDb = v; };
@@ -941,6 +964,7 @@ int main() {
         btnTuningMode.updateStyle();
         btnPlay.updateStyle();
         btnMute.updateStyle();
+        btnMap.updateStyle();
         volSlider.updateStyle();
         timeSlider.updateStyle();
         sidebar.updateStyle();
@@ -1038,6 +1062,7 @@ int main() {
         freqVFO.setPosition(20, 4);
         btnTuningMode.setPosition(370, 10);
         btnPlay.setPosition(320, 10);
+        btnMap.setPosition(420, 10);
         volSlider.setPosition(layout.winW - 170, 10);
         btnMute.setPosition(layout.winW - 220, 10);
         sidebar.setGeometry(layout.sidebarX, TOP_BAR_H, layout.winH - TOP_BAR_H);
@@ -1646,6 +1671,11 @@ int main() {
                 topBarHandled = true;
             }
 
+            if (btnMap.isClicked(*ev, window)) {
+                mapWindow.openOrFocus();
+                topBarHandled = true;
+            }
+
             if (isHw && btnTuningMode.isClicked(*ev, window)) {
                 stickyCenterMode = !stickyCenterMode;
                 if(stickyCenterMode) {
@@ -1858,6 +1888,92 @@ int main() {
             }
         } // end of pollEvent loop
 
+        // --- Satellite map window and frequency / Doppler tracking ---
+        satCatalog.poll();
+        mapWindow.frame();
+        {
+            std::string decName;
+            ChannelSet* trackSet = nullptr;
+            {
+                std::lock_guard<std::mutex> l(sharedData.mtx);
+                if (sharedData.aprsEnabled) { decName = "APRS"; trackSet = &aprsChannels(); }
+                else if (sharedData.activeDecoder && sharedData.activeDecoder->enabled) {
+                    decName = sharedData.activeDecoder->name;
+                    trackSet = sharedData.activeDecoder->channelSet();
+                }
+            }
+            if (inputIsAudio) trackSet = nullptr;
+            satTracker.activeDecoderName = decName;
+
+            if (satTracker.update(satCatalog, orbit::nowJd())) {
+                satTracker.applyStatus.clear();
+                const double rate = hwSampleRate > 0 ? hwSampleRate : 2e6;
+                // Retunes the radio so `hz` lies in the received band, away from the DC spike;
+                // the tuner (VFO) goes onto `hz` as well
+                auto recentreOn = [&](long long hz) {
+                    const long long c = hz + (long long)std::llround(rate * 0.25);
+                    currentCenterFreq = c;
+                    {
+                        std::lock_guard<std::mutex> l(sharedData.mtx);
+                        sharedData.centerFreq = c;
+                        sharedData.tunedFreqPercent = 0.5 + (double)(hz - c) / rate;
+                        sharedData.viewCenterPct = 0.5;
+                    }
+                    pendingCenterFreq = c;
+                    debouncer.restart();
+                    freqVFO.setFrequency(hz);
+                };
+                auto inBand = [&](long long hz, double width) {
+                    return std::abs((double)(hz - currentCenterFreq)) + width / 2.0 < rate * 0.45;
+                };
+
+                if (satTracker.target == orbit::TrackTarget::Tuner) {
+                    // demodulator mode of the transmitter, once per tracking start
+                    if (satTracker.setDemodMode && !satTracker.demodApplied && !inputIsAudio) {
+                        const orbit::DemodHint h = orbit::demodHintFor(satTracker.tx);
+                        restoreMode(h.mode);
+                        slBW->setValueSilent((float)h.bandwidthHz);
+                        slBW->onChange(slBW->currentVal);
+                    }
+                    satTracker.demodApplied = true;
+                    double pct;
+                    { std::lock_guard<std::mutex> l(sharedData.mtx); pct = sharedData.tunedFreqPercent; }
+                    const long long cur = currentCenterFreq + (long long)std::llround((pct - 0.5) * rate);
+                    satTracker.noteRadioFrequency(cur);
+                    const long long want = satTracker.wantHz;
+                    if (std::llabs(want - cur) >= 5 && trackClock.getElapsedTime().asMilliseconds() >= 100) {
+                        if (isHw && !inBand(want, slBW->currentVal)) recentreOn(want);
+                        else if (!isHw && !inBand(want, 0.0)) satTracker.applyStatus = "Outside the file's band";
+                        else {
+                            std::lock_guard<std::mutex> l(sharedData.mtx);
+                            sharedData.tunedFreqPercent = 0.5 + (double)(want - currentCenterFreq) / rate;
+                            freqVFO.setFrequency(want);
+                        }
+                        satTracker.lastCommandHz = want;
+                        trackClock.restart();
+                    } else if (satTracker.lastCommandHz == 0) satTracker.lastCommandHz = cur;
+                } else {
+                    if (!trackSet) satTracker.applyStatus = inputIsAudio ? "Audio input: decoder channels are not used"
+                                                                         : "Switch on a decoder (e.g. SSTV) to track its channel";
+                    else {
+                        const auto chans = trackSet->snapshot();
+                        if (chans.empty()) satTracker.applyStatus = "Waiting for the decoder's channel...";
+                        else {
+                            const DecoderChannel& ch = chans.front();
+                            if (!ch.followVfo) satTracker.noteRadioFrequency(ch.freqHz);
+                            const long long want = satTracker.wantHz;
+                            if ((ch.followVfo || std::llabs(want - ch.freqHz) >= 5) && trackClock.getElapsedTime().asMilliseconds() >= 100) {
+                                trackSet->moveTo(ch.id, want);
+                                if (isHw && !inBand(want, ch.widthHz)) recentreOn(want);
+                                satTracker.lastCommandHz = want;
+                                trackClock.restart();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if (pendingCenterFreq != 0 && debouncer.getElapsedTime().asMilliseconds() > TUNING_LATENCY_MS) {
             std::lock_guard<std::mutex> l(sourceMtx);
             if (currentSource && currentSource->isHardware()) {
@@ -1883,7 +1999,7 @@ int main() {
             if (freqVFO.isHovered) showHand = true;
             if (mousePos.y >= TOP_BAR_H + layout.specH - 10 && mousePos.y <= TOP_BAR_H + layout.specH + 20 && mousePos.x < layout.specW) showHand = true;
             if (volSlider.isMouseOver(window) || (currentSourceType == 0 && timeSlider.isMouseOver(window))) showHand = true;
-            if (btnPlay.isMouseOver(window) || btnMute.isMouseOver(window) || btnTuningMode.isMouseOver(window)) showHand = true;
+            if (btnPlay.isMouseOver(window) || btnMute.isMouseOver(window) || btnTuningMode.isMouseOver(window) || btnMap.isMouseOver(window)) showHand = true;
             if (aprsOn && mousePos.y > (layout.winH - 200) && mousePos.x < layout.specW) showHand = true;
         }
         if (handleAt(mousePos) >= 0) showHand = true;
@@ -2609,6 +2725,29 @@ int main() {
         freqVFO.draw(window);
         btnPlay.draw(window);
         if (isHw) btnTuningMode.draw(window);
+        btnMap.setActive(mapWindow.isOpen());
+        btnMap.draw(window);
+        if (satTracker.active()) {
+            // what is being tracked, next to the MAP button
+            char tb[160];
+            const orbit::LookAngles& la = satTracker.la;
+            std::snprintf(tb, sizeof(tb), "%s %s", satTracker.mode == orbit::TrackMode::Doppler ? "DOPPLER" : "TRACK", satTracker.satName.c_str());
+            sf::Text t1(font, tb, 26);
+            t1.setScale({0.5f, 0.5f});
+            t1.setStyle(sf::Text::Bold);
+            t1.setFillColor(sf::Color(255, 160, 60));
+            t1.setPosition({486.0f, 12.0f});
+            window.draw(t1);
+            if (la.ok) std::snprintf(tb, sizeof(tb), "%+.2f kHz   El %.0f\xC2\xB0  Az %.0f\xC2\xB0%s", satTracker.dopplerHz / 1000.0, la.elDeg, la.azDeg,
+                                     satTracker.applyStatus.empty() ? "" : "   (!)");
+            else std::snprintf(tb, sizeof(tb), "%s", satTracker.applyStatus.c_str());
+            std::string s2 = tb;
+            sf::Text t2(font, sf::String::fromUtf8(s2.begin(), s2.end()), 22);
+            t2.setScale({0.5f, 0.5f});
+            t2.setFillColor(la.ok && la.elDeg > 0 ? sf::Color(90, 255, 120) : sf::Color(170, 170, 180));
+            t2.setPosition({486.0f, 30.0f});
+            window.draw(t2);
+        }
         btnMute.draw(window);
         volSlider.draw(window);
 
@@ -2746,6 +2885,8 @@ int main() {
     saveMgr.set("hw_direct_samp", hwState.directSampling);
     saveMgr.set("hw_antenna", hwState.antennaIndex);
     saveMgr.set("rtltcp_host", txtHost->getText());
+    satTracker.saveSettings(saveMgr);
+    mapWindow.saveSettings(saveMgr);
 
     {
         std::lock_guard<std::mutex> l(sharedData.mtx);

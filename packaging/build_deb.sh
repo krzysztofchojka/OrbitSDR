@@ -72,7 +72,7 @@ Version: ${VERSION}
 Section: hamradio
 Priority: optional
 Architecture: ${ARCH}
-Depends: libc6, libstdc++6, libgl1, libx11-6, libxrandr2, libxcursor1, libxi6, libfreetype6, libudev1, libusb-1.0-0, zenity
+Depends: libc6, libstdc++6, libgl1, libx11-6, libxrandr2, libxcursor1, libxi6, libfreetype6, libudev1, libusb-1.0-0, zenity, curl
 Recommends: rtl-sdr
 Installed-Size: ${INSTALLED_SIZE}
 Maintainer: ${MAINTAINER}
