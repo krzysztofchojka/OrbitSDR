@@ -2,6 +2,7 @@
 
 #include "../Core/SDRModule.h"
 #include "AisCore.h"
+#include "../Core/PositionBus.h"
 #include <SFML/Graphics.hpp>
 #include <mutex>
 #include <deque>
@@ -84,6 +85,27 @@ public:
                 std::snprintf(head, sizeof(head), "%s %09u  ", i == 0 ? "A" : "B", m.mmsi);
                 recentMessages.push_front(head + m.summary);
                 if (recentMessages.size() > 30) recentMessages.pop_back();
+                // the ship on the satellite map
+                auto it = vessels.find(m.mmsi);
+                if (it == vessels.end()) return;
+                const ais::Vessel& v = it->second;
+                char id[16];
+                std::snprintf(id, sizeof(id), "%09u", v.mmsi);
+                std::string label = v.name.empty() ? std::string(id) : v.name;
+                std::string info = v.shipType;
+                if (!v.callsign.empty()) info += (info.empty() ? "" : "  ") + v.callsign;
+                if (v.lat <= 90.0 && v.lon <= 180.0 && (m.type == 1 || m.type == 2 || m.type == 3 || m.type == 4 ||
+                                                       m.type == 18 || m.type == 19 || m.type == 21 || m.type == 27)) {
+                    PosReport r;
+                    r.kind = PosKind::AIS;
+                    r.id = id; r.label = label; r.info = info;
+                    r.lat = v.lat; r.lon = v.lon;
+                    r.speedKn = v.sog;
+                    r.courseDeg = v.heading >= 0 && v.heading < 360 ? v.heading : v.cog;
+                    // base stations and aids to navigation use their own icons
+                    r.symCode = m.type == 4 ? 'B' : m.type == 21 ? 'N' : 0;
+                    positionBus().report(r);
+                } else positionBus().describe(PosKind::AIS, id, label, info);
             };
         }
     }

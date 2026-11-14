@@ -77,6 +77,9 @@ public:
     virtual bool isSeekable() { return false; } 
     virtual void seek(double percent) {}
     virtual double getProgress() { return 0.0; }
+    // Files only: the path and the length of the recording (0 = not a file)
+    virtual std::string getFilePath() { return ""; }
+    virtual double getDurationSec() { return 0.0; }
 
     // Current gain chosen by the software AGC in dB, or a negative value if not available
     virtual float getAutoGainDb() { return -1.0f; }
@@ -113,8 +116,18 @@ class FileSource : public IQSource {
     bool looped = false;
 
 public:
+    std::string filePath;
+
+    std::string getFilePath() override { return dataLength ? filePath : std::string(); }
+    double getDurationSec() override {
+        const double bytesPerSec = (double)sampleRate * channels * (bitsPerSample / 8);
+        return bytesPerSec > 0 ? (double)dataLength / bytesPerSec : 0.0;
+    }
+
     bool open(std::string path, uint32_t requestedRate = 0) override {
         close();
+        filePath = path;
+        dataLength = 0;
         file.open(path, std::ios::binary);
         if (!file.is_open()) return false;
 

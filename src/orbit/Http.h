@@ -20,6 +20,7 @@
 #include <memory>
 #include <cstdio>
 #include <cctype>
+#include <algorithm>
 
 #ifdef _WIN32
     #ifndef NOMINMAX
@@ -107,16 +108,20 @@ inline HttpResult httpGet(const std::string& url, const std::vector<std::string>
     return res;
 }
 
-// One worker thread, requests in order. Callbacks run on the UI thread from poll().
+// Worker thread(s), requests in order (one worker: strictly one at a time, which is what
+// CelesTrak wants; map tiles use a few). Callbacks run on the UI thread from poll().
 // The state is shared with the worker, so the queue can be destroyed (app exit) while a
 // request is still in flight: the detached worker finishes it and quits.
 class HttpQueue {
 public:
     using Callback = std::function<void(const HttpResult&)>;
 
-    HttpQueue() : st(std::make_shared<State>()) {
-        std::shared_ptr<State> s = st;
-        std::thread([s] { run(s); }).detach();
+    explicit HttpQueue(int workers = 1, int timeoutSec = 30) : st(std::make_shared<State>()) {
+        st->timeoutSec = timeoutSec;
+        for (int i = 0; i < std::max(1, workers); i++) {
+            std::shared_ptr<State> s = st;
+            std::thread([s] { run(s); }).detach();
+        }
     }
     ~HttpQueue() {
         { std::lock_guard<std::mutex> l(st->mtx); st->stopping = true; st->pending.clear(); }
@@ -143,7 +148,10 @@ public:
     }
 
     // (answers waiting for poll() count too: their callbacks may queue the next request)
-    bool busy() const { std::lock_guard<std::mutex> l(st->mtx); return st->active || !st->pending.empty() || !st->done.empty(); }
+    bool busy() const { std::lock_guard<std::mutex> l(st->mtx); return st->active > 0 || !st->pending.empty() || !st->done.empty(); }
+    // requests not started yet (finished and running ones are not counted)
+    size_t queued() const { std::lock_guard<std::mutex> l(st->mtx); return st->pending.size(); }
+    size_t inFlight() const { std::lock_guard<std::mutex> l(st->mtx); return st->pending.size() + st->active + st->done.size(); }
 
 private:
     struct Req { std::string url; std::vector<std::string> headers; Callback cb; };
@@ -153,7 +161,8 @@ private:
         std::deque<Req> pending;
         std::deque<std::pair<Callback, HttpResult>> done;
         bool stopping = false;
-        bool active = false;
+        int active = 0;
+        int timeoutSec = 30;
     };
     std::shared_ptr<State> st;
 
@@ -166,12 +175,12 @@ private:
                 if (s->stopping) return;
                 r = std::move(s->pending.front());
                 s->pending.pop_front();
-                s->active = true;
+                s->active++;
             }
-            HttpResult res = httpGet(r.url, r.headers);
+            HttpResult res = httpGet(r.url, r.headers, s->timeoutSec);
             {
                 std::lock_guard<std::mutex> l(s->mtx);
-                s->active = false;
+                s->active--;
                 if (s->stopping) return;
                 s->done.push_back({std::move(r.cb), std::move(res)});
             }

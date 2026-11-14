@@ -3,6 +3,9 @@
 #include "../Core/SDRModule.h"
 #include "../Core/DetailsPopup.h"
 #include "../Core/ModuleLog.h"
+#include "../Core/PositionBus.h"
+#include <regex>
+#include <cmath>
 #include "../../Decimator.h"
 #include "AcarsCore.h"
 #include <SFML/Graphics.hpp>
@@ -184,6 +187,35 @@ class ACARSDecoder : public SDRModule {
     }
 
     // Called from processIQ (mtx is held)
+    // Many downlinks carry the aircraft position in the text, e.g. "POSN52142E021022"
+    // (degrees + minutes x10) or "N 52.142,E 21.022" (label 16). Put it on the map.
+    static void reportPosition(const acars::Message& m) {
+        if (!m.downlink || m.text.empty()) return;
+        static const std::regex posMin(R"(([NS])\s?(\d{2})(\d{2})(\d)\s?[,/ ]?\s?([EW])\s?(\d{3})(\d{2})(\d))");
+        static const std::regex posDec(R"(([NS])\s?(\d{1,2}\.\d{2,4})\s?[, ]\s?([EW])\s?(\d{1,3}\.\d{2,4}))");
+        std::smatch s;
+        double lat = 0, lon = 0;
+        if (std::regex_search(m.text, s, posDec)) {
+            lat = std::stod(s[2]); lon = std::stod(s[4]);
+            if (s[1] == "S") lat = -lat;
+            if (s[3] == "W") lon = -lon;
+        } else if (std::regex_search(m.text, s, posMin)) {
+            lat = std::stoi(s[2]) + (std::stoi(s[3]) + std::stoi(s[4]) / 10.0) / 60.0;
+            lon = std::stoi(s[6]) + (std::stoi(s[7]) + std::stoi(s[8]) / 10.0) / 60.0;
+            if (s[1] == "S") lat = -lat;
+            if (s[5] == "W") lon = -lon;
+        } else return;
+        if (std::fabs(lat) > 90 || std::fabs(lon) > 180) return;
+        PosReport r;
+        r.kind = PosKind::ACARS;
+        r.id = m.reg.empty() ? m.flight : m.reg;
+        if (r.id.empty()) return;
+        r.label = m.flight.empty() ? m.reg : m.flight + (m.reg.empty() ? "" : " (" + m.reg + ")");
+        r.info = "ACARS label " + m.label;
+        r.lat = lat; r.lon = lon;
+        positionBus().report(r);
+    }
+
     void onMessage(long long freqHz, const acars::Message& m) {
         Entry e;
         e.time = wallTime();
@@ -192,6 +224,7 @@ class ACARSDecoder : public SDRModule {
         entries.push_front(e);
         if (entries.size() > 1000) entries.pop_back();
         total++;
+        reportPosition(m);
 
         std::string line = mhz(freqHz) + (freqHz == AUDIO_FREQ ? "  " : " MHz  ") + (m.reg.empty() ? "-" : m.reg) +
                            (m.flight.empty() ? "" : "  " + m.flight) +

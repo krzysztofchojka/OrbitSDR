@@ -10,7 +10,7 @@
 OrbitSDR is a C++17 / SFML receiver that stays small and responsive while decoding several digital modes at once. Plug in an SDRplay or an RTL-SDR, enable a decoder, and it tunes its own channel to the right frequency. You can keep listening to something else in the meantime.
 
 - **Built for Apple Silicon (M1 and newer) and SDRplay.** That is the main development and test platform. No Homebrew or drivers needed for RTL-SDR, everything is bundled in the `.app`. For SDRPlay you have to install official [SDRPlay Api](https://sdrplay.com/hardware-api/).
-- **Seven decoders built in:** APRS, AIS, ACARS, ISM sensors (rtl_433), RDS, SSTV and WEFAX.
+- **Eight decoders built in:** APRS, AIS, ACARS, ADS-B, ISM sensors (rtl_433), RDS, SSTV and WEFAX.
 - **Every decoder runs on its own channel.** Decode AIS, watch the 433 MHz sensors and listen to FM radio at the same time, all within one bandwidth.
 - **Tested on real signals:** ships in harbours, weather stations and car tyre sensors in the city, APRS, SSTV, HF radiofax and RDS.
 
@@ -60,6 +60,7 @@ xattr -dr com.apple.quarantine /Applications/OrbitSDR.app
 | **AIS** | 161.975 / 162.025 MHz | Ships: name, call sign, type, position, speed, course. Both channels decoded at once. |
 | **ISM** (rtl_433) | 433.92 / 868 / 315 / 915 MHz | About 300 device types: weather stations, thermometers, tyre pressure sensors (TPMS), door sensors, remotes, utility meters. |
 | **ACARS** | 129–137 MHz | Aircraft datalink: registration, flight, label, message text. All ACARS channels in the bandwidth are decoded at once. |
+| **ADS-B** | 1090 MHz | Aircraft: callsign, altitude, speed, track, vertical rate, squawk and position (Mode S / extended squitter, like dump1090). Needs 2.4 or 2.0 MS/s; **Tune to 1090 MHz** in the panel sets the radio. Aircraft appear on the satellite map. |
 | **APRS** | 144.800 MHz (EU) / 144.390 MHz (US) | AX.25 packets, messages and GPS positions. |
 | **RDS** | FM broadcast | Station name, RadioText, PI, programme type, TP/TA, clock time. Also used to tune the WFM gain automatically. |
 | **SSTV** | 145.800 MHz (ISS), HF | Robot 36/72, Martin M1/M2, Scottie S1/S2/DX, PD50–PD290. VIS auto-detection, slant correction, PNG export. |
@@ -76,7 +77,7 @@ Decoded ISM, ACARS and APRS messages are logged to `ism.log`, `acars.log` and `a
   - Drop it on the tuner to make it follow the tuner.
   - Click it to listen to that channel.
   - An arrow at the edge of the tuning bar points to a channel that is outside the view.
-- **I/Q or audio input:** for files and the sound card you choose whether the input is I/Q or demodulated audio. In audio mode, APRS, SSTV, WEFAX and ACARS decode the audio directly. ISM and AIS need I/Q from an SDR.
+- **I/Q or audio input:** for files and the sound card you choose whether the input is I/Q or demodulated audio. In audio mode, APRS, SSTV, WEFAX and ACARS decode the audio directly. ISM, AIS and ADS-B need I/Q from an SDR.
 - **Recording:** demodulated audio or raw baseband I/Q to WAV.
 - **Low sample rates:** software decimation, so even narrow bandwidths stay smooth.
 

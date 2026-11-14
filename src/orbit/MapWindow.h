@@ -17,6 +17,10 @@
 #include "MapWidgets.h"
 #include "SatCatalog.h"
 #include "Tracker.h"
+#include "RecordingTime.h"
+#include "TileLayer.h"
+#include "../modules/Core/PositionBus.h"
+#include "../modules/Core/AprsPosition.h"
 #include "../NativeDialogs.h"
 #include <SFML/Graphics.hpp>
 #include <SFML/Window/Clipboard.hpp>
@@ -32,13 +36,22 @@ class MapWindow {
 public:
     std::function<float()> uiScale;                       // same scale as the main window
     std::function<void(const std::string&)> onEnableDecoder;   // "SSTV", "APRS"
+    // main.cpp: the IQ file being played (false = no file). progress 0..1
+    std::function<bool(std::string& path, double& progress, double& durationSec)> recordingInfo;
     const sf::Image* icon = nullptr;
 
     MapWindow(const sf::Font& f, SatCatalog& c, SatTracker& t) : font(f), cat(c), trk(t), panel(PANEL_W, f) {
+        tiles = std::make_unique<TileCache>(getConfigDir() + PATH_SEP + "tiles");
+        tiles->apiUrl = cat.env.apiUrl;
+        tiles->apiKey = cat.env.apiKey;
         buildPanel();
     }
 
     bool isOpen() const { return win && win->isOpen(); }
+
+    // Time for the frequency / Doppler tracking: real time, or the time of the
+    // recording being played / the manual date in those modes
+    double trackerJd() { refreshTime(); return curBaseJd; }
 
     void openOrFocus() {
         if (isOpen()) {
@@ -76,6 +89,7 @@ public:
         if (!win->isOpen()) { closeCleanup(); return; }
         handleEvents();
         if (!win || !win->isOpen()) { closeCleanup(); return; }
+        refreshTime();
         if (win->getSize() != lastSize) applyView();
         panel.update(*win);
         // ~30 fps is plenty for a map; faster while the user interacts
@@ -97,6 +111,14 @@ public:
         showTracks = s.getBool("map_tracks", true);
         allLabels = s.getBool("map_all_labels", false);
         footprintMode = std::clamp(s.getInt("map_footprints", 1), 0, 2);
+        // a manual date is not kept between runs, the recording mode is
+        timeSource = s.getInt("map_time_source", 0) == (int)TimeSource::Recording ? TimeSource::Recording : TimeSource::Live;
+        timeInputLocal = s.getBool("map_time_local", true);
+        baseLayer = std::clamp(s.getInt("map_layer", 0), 0, 2);
+        placeNames = s.getBool("map_place_names", true);
+        const int kinds = s.getInt("map_pos_kinds", 15);
+        for (int i = 0; i < (int)PosKind::Count; i++) showKind[i] = (kinds >> i) & 1;
+        posWindowIdx = std::clamp(s.getInt("map_pos_window", 2), 0, (int)POS_WINDOWS.size() - 1);
         syncPanelFromState();
     }
     void saveSettings(SettingsManager& s) const {
@@ -107,6 +129,14 @@ public:
         s.set("map_tracks", showTracks);
         s.set("map_all_labels", allLabels);
         s.set("map_footprints", footprintMode);
+        s.set("map_time_source", (int)timeSource);
+        s.set("map_time_local", timeInputLocal);
+        s.set("map_layer", baseLayer);
+        s.set("map_place_names", placeNames);
+        int kinds = 0;
+        for (int i = 0; i < (int)PosKind::Count; i++) if (showKind[i]) kinds |= 1 << i;
+        s.set("map_pos_kinds", kinds);
+        s.set("map_pos_window", posWindowIdx);
     }
 
 private:
@@ -116,6 +146,7 @@ private:
     static constexpr double WW = 3600.0;   // world units: 0.1 deg
     static constexpr double WH = 1800.0;
     static constexpr float CW = PANEL_W - 50.0f;   // content width inside the panel
+    static constexpr double MAX_ZOOM = 20000.0;      // ~5 m per pixel (street level)
 
     const sf::Font& font;
     SatCatalog& cat;
@@ -142,6 +173,22 @@ private:
     int hovered = 0;
     std::optional<SunPos> sunHover;
     sf::Vector2f mouseUi{-1, -1};
+    float toolbarRightX = 1e9f;
+
+    // tiles (zooming in) + positions heard by the decoders
+    std::unique_ptr<TileCache> tiles;
+    int baseLayer = 0;          // 0 satellite photos, 1 street map, 2 Blue Marble only
+    bool placeNames = true;     // borders + names over the photos
+    std::set<int> layersDrawn;  // for the attribution line
+    bool showKind[(int)PosKind::Count] = {true, true, true, true};
+    int posWindowIdx = 2;
+    inline static const std::vector<std::pair<double, const char*>> POS_WINDOWS = {
+        {15 * 60.0, "15 min"}, {3600.0, "1 h"}, {6 * 3600.0, "6 h"}, {24 * 3600.0, "24 h"}, {1e12, "all"}};
+    std::vector<PosTrack> posTracks;   // this frame
+    int hoveredPos = -1;               // index into posTracks
+    sf::Vector2f hoveredPosUi;
+    SdrButton tbKind[(int)PosKind::Count] = {{64, 24, "AIS", font}, {64, 24, "APRS", font}, {70, 24, "ACARS", font}, {66, 24, "ADS-B", font}};
+    SdrButton tbWindow{92, 24, "Last 6 h", font};
 
     // map picture
     sf::Texture mapTex;
@@ -178,9 +225,14 @@ private:
     long long chosenHz = 0;
 
     // --- widgets ---
-    std::shared_ptr<Dropdown> ddGroup, ddTx, ddTarget, ddFootprints;
+    std::shared_ptr<Dropdown> ddGroup, ddTx, ddTarget, ddFootprints, ddTime, ddLayer;
+    std::shared_ptr<Checkbox> chkPlaceNames;
     std::shared_ptr<SdrButton> btnRefresh, btnPaste, btnImport, btnFav, btnUseFreq, btnOff, btnFreq, btnDoppler, btnPick, btnApplyQth;
     std::shared_ptr<TextInput> txtSearch, txtFreq;
+    std::shared_ptr<SdrButton> btnTimeReset;
+    std::shared_ptr<CustomWidget> wDateTime;
+    std::shared_ptr<Checkbox> chkTimeLocal;
+    std::shared_ptr<CustomWidget> wTimeInfo;
     std::shared_ptr<LabeledInput> inLat, inLon, inAlt, inLoc;
     std::shared_ptr<CustomWidget> wList, wCatStatus, wInfo, wPolar, wPasses, wRadio;
     std::shared_ptr<Slider> slMinEl;
@@ -190,7 +242,47 @@ private:
               tbP10{44, 24, "+10m", font}, tbP1h{44, 24, "+1h", font};
     sf::FloatRect radioDecoderBtn;   // "Enable SSTV decoder" link inside the radio block
 
-    double simJd() const { return nowJd() + simOffsetSec / 86400.0; }
+    // --- time source ---
+    enum class TimeSource { Live = 0, Recording = 1, Manual = 2 };
+    TimeSource timeSource = TimeSource::Live;
+    double curBaseJd = 0;                 // "now" of the map (before the -1h / +1h preview offset)
+    double manualUnix = 0;                // Manual: the date set ...
+    std::chrono::steady_clock::time_point manualSetAt;   // ... and when it was set (it runs on)
+    std::string recPath;                  // Recording: the file the start time belongs to
+    RecordingStart recStart;
+    bool recStartUser = false;            // start time typed by the user
+    bool recPlaying = false;
+    double recProgress = 0, recDuration = 0;
+    bool timeInputLocal = true;           // the date field is in local time (else UTC)
+
+    void refreshTime() {
+        const double now = nowJd();
+        recPlaying = false;
+        if (timeSource == TimeSource::Manual) {
+            const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - manualSetAt).count();
+            curBaseJd = unixToJd(manualUnix + el);
+            return;
+        }
+        if (timeSource == TimeSource::Recording && recordingInfo) {
+            std::string path;
+            double prog = 0, dur = 0;
+            if (recordingInfo(path, prog, dur) && !path.empty()) {
+                if (path != recPath) {   // another file: detect its start time
+                    recPath = path;
+                    recStart = recordingStart(path, dur);
+                    recStartUser = false;
+                }
+                recPlaying = true;
+                recProgress = prog;
+                recDuration = dur;
+                if (recStart.unix > 0) { curBaseJd = unixToJd(recStart.unix + prog * dur); return; }
+            }
+        }
+        curBaseJd = now;
+    }
+    double baseJd() const { return curBaseJd > 0 ? curBaseJd : nowJd(); }
+    double lastPassBaseJd = 0;
+    double simJd() const { return baseJd() + simOffsetSec / 86400.0; }
 
     // ------------------------------------------------------------------
     //  Panel
@@ -375,14 +467,62 @@ private:
         mMap->addWidget(chkTracks);
         mMap->addWidget(chkLabels);
         mMap->addWidget(ddFootprints);
+        ddLayer = std::make_shared<Dropdown>(CW, 24.0f, font);
+        ddLayer->setOptions({"Zoom: satellite photos (Sentinel-2)", "Zoom: street map (OpenStreetMap)", "Zoom: off (Blue Marble only)"});
+        ddLayer->onChange = [this](int i) { baseLayer = i; dirty = true; };
+        mMap->addWidget(ddLayer);
+        chkPlaceNames = std::make_shared<Checkbox>("Place names and borders over the photos", font, placeNames);
+        chkPlaceNames->onToggle = [this](bool b) { placeNames = b; dirty = true; };
+        mMap->addWidget(chkPlaceNames);
 
-        allDropdowns = {ddGroup, ddTx, ddTarget, ddFootprints};
+        // --- Time (old recordings) ---
+        auto mTime = panel.addModule("Time");
+        ddTime = std::make_shared<Dropdown>(CW, 24.0f, font);
+        ddTime->setOptions({"Time: live (real time)", "Time: recording being played", "Time: manual date / time"});
+        ddTime->onChange = [this](int i) {
+            timeSource = (TimeSource)i;
+            if (timeSource == TimeSource::Manual) {   // start from what the map shows now
+                manualUnix = jdToUnix(simJd());
+                manualSetAt = std::chrono::steady_clock::now();
+            }
+            simOffsetSec = 0;
+            refreshTime();
+            fillTimeInput();
+            dirty = true;
+        };
+        mTime->addWidget(ddTime);
+        // click the upper / lower half of a field (or turn the wheel over it) to change it
+        wDateTime = std::make_shared<CustomWidget>(CW - 66.0f, 42.0f);
+        wDateTime->hoverHand = true;
+        wDateTime->onDraw = [this](sf::RenderWindow& w, const sf::FloatRect& r) { drawDateTime(w, r); };
+        wDateTime->onEvent = [this](const sf::Event& ev, sf::Vector2f l) { return dateTimeEvent(ev, l); };
+        btnTimeReset = std::make_shared<SdrButton>(58.0f, 24.0f, "Reset", font);
+        btnTimeReset->onClick = [this]() {
+            if (timeSource == TimeSource::Recording) recPath.clear();   // detect the start time again
+            else if (timeSource == TimeSource::Manual) { manualUnix = jdToUnix(nowJd()); manualSetAt = std::chrono::steady_clock::now(); }
+            simOffsetSec = 0;
+            refreshTime();
+            fillTimeInput();
+        };
+        auto rowTime = std::make_shared<HRow>();
+        rowTime->add(wDateTime, CW - 66.0f); rowTime->add(std::make_shared<VOffset>(btnTimeReset, 9.0f), 58.0f);
+        mTime->addWidget(rowTime);
+        chkTimeLocal = std::make_shared<Checkbox>("Date in local time (off = UTC)", font, timeInputLocal);
+        chkTimeLocal->onToggle = [this](bool b) { timeInputLocal = b; fillTimeInput(); };
+        mTime->addWidget(chkTimeLocal);
+        wTimeInfo = std::make_shared<CustomWidget>(CW, 44.0f);
+        wTimeInfo->onDraw = [this](sf::RenderWindow& w, const sf::FloatRect& r) { drawTimeInfo(w, r); };
+        mTime->addWidget(wTimeInfo);
+
+        allDropdowns = {ddGroup, ddTx, ddTarget, ddFootprints, ddTime, ddLayer};
 
         tbM1h.onClick = [this]() { simOffsetSec -= 3600; };
         tbM10.onClick = [this]() { simOffsetSec -= 600; };
         tbNow.onClick = [this]() { simOffsetSec = 0; };
         tbP10.onClick = [this]() { simOffsetSec += 600; };
         tbP1h.onClick = [this]() { simOffsetSec += 3600; };
+        for (int i = 0; i < (int)PosKind::Count; i++) tbKind[i].onClick = [this, i]() { showKind[i] = !showKind[i]; };
+        tbWindow.onClick = [this]() { posWindowIdx = (posWindowIdx + 1) % (int)POS_WINDOWS.size(); };
     }
 
     // A widget pushed down by a few pixels (buttons next to captioned inputs)
@@ -410,6 +550,165 @@ private:
         slMinEl->setValueSilent((float)trk.minElDeg);
         slMinEl->onChange((float)trk.minElDeg);
         fillQthInputs();
+        ddTime->setSelection((int)timeSource);
+        chkTimeLocal->checked = timeInputLocal;
+        ddLayer->setSelection(baseLayer);
+        chkPlaceNames->checked = placeNames;
+        fillTimeInput();
+    }
+
+    // The date field shows: Recording = the start of the recording, Manual / Live = the map time
+    double shownUnix() const {
+        if (timeSource == TimeSource::Recording) return recStart.unix;
+        return jdToUnix(simJd());
+    }
+    void fillTimeInput() { dirty = true; }   // the spinner reads shownUnix() when drawn
+
+    // Sets the date shown in the spinner
+    void applyUnix(double u) {
+        timeMsg.clear();
+        if (timeSource == TimeSource::Recording) {
+            if (recPath.empty()) { timeMsg = "Open an IQ file first (source: File)"; return; }
+            recStart.unix = u;
+            recStart.how = "set by you";
+            recStart.guess = false;
+            recStartUser = true;
+        } else {
+            // Live + a change = the manual mode
+            if (timeSource != TimeSource::Manual) {
+                timeSource = TimeSource::Manual;
+                ddTime->setSelection((int)timeSource);
+            }
+            manualUnix = u;
+            manualSetAt = std::chrono::steady_clock::now();
+        }
+        simOffsetSec = 0;
+        refreshTime();
+        dirty = true;
+    }
+
+    // field 0 year, 1 month, 2 day, 3 hour, 4 minute, 5 second
+    struct DtField { float x, w; };
+    std::vector<DtField> dtLayout(float width) const {
+        const float gap = 4.0f, unit = (width - 5 * gap) / 7.0f;   // the year is twice as wide
+        std::vector<DtField> v;
+        float x = 0;
+        for (int i = 0; i < 6; i++) { const float w = i == 0 ? unit * 2 : unit; v.push_back({x, w}); x += w + gap; }
+        return v;
+    }
+    std::tm brokenDown(double u) const {
+        const std::time_t t = (std::time_t)std::floor(u);
+        std::tm tm{};
+#ifdef _WIN32
+        if (timeInputLocal) localtime_s(&tm, &t); else gmtime_s(&tm, &t);
+#else
+        if (timeInputLocal) localtime_r(&t, &tm); else gmtime_r(&t, &tm);
+#endif
+        return tm;
+    }
+    void stepField(int field, int delta) {
+        double u = shownUnix();
+        if (u <= 0) u = jdToUnix(nowJd());
+        const double frac = u - std::floor(u);
+        if (field >= 2) {
+            static const double sec[] = {0, 0, 86400, 3600, 60, 1};
+            applyUnix(u + delta * sec[field]);
+            return;
+        }
+        std::tm tm = brokenDown(u);
+        int y = tm.tm_year + 1900, mo = tm.tm_mon + 1;
+        if (field == 0) y += delta;
+        else { mo += delta; while (mo > 12) { mo -= 12; y++; } while (mo < 1) { mo += 12; y--; } }
+        static const int mdays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+        const bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        const int dmax = mdays[mo - 1] + (mo == 2 && leap ? 1 : 0);
+        const double nu = civilToUnix(y, mo, std::min(tm.tm_mday, dmax), tm.tm_hour, tm.tm_min, tm.tm_sec, !timeInputLocal);
+        if (nu > 0) applyUnix(nu + frac);
+    }
+    bool dateTimeEvent(const sf::Event& ev, sf::Vector2f l) {
+        const auto lay = dtLayout(wDateTime->w);
+        int field = -1;
+        for (int i = 0; i < 6; i++) if (l.x >= lay[i].x && l.x < lay[i].x + lay[i].w) field = i;
+        if (field < 0) return true;
+        if (const auto* mb = ev.getIf<sf::Event::MouseButtonPressed>()) {
+            if (mb->button == sf::Mouse::Button::Left) stepField(field, l.y < wDateTime->getHeight() / 2 ? 1 : -1);
+            else if (mb->button == sf::Mouse::Button::Right) stepField(field, l.y < wDateTime->getHeight() / 2 ? 10 : -10);
+            return true;
+        }
+        if (const auto* sc = ev.getIf<sf::Event::MouseWheelScrolled>()) {
+            stepField(field, sc->delta > 0 ? 1 : -1);
+            return true;
+        }
+        return true;
+    }
+    void drawDateTime(sf::RenderWindow& w, const sf::FloatRect& r) {
+        const double u = shownUnix();
+        const bool known = u > 0;
+        const std::tm tm = brokenDown(known ? u : jdToUnix(nowJd()));
+        char v[6][8];
+        std::snprintf(v[0], 8, "%04d", tm.tm_year + 1900); std::snprintf(v[1], 8, "%02d", tm.tm_mon + 1);
+        std::snprintf(v[2], 8, "%02d", tm.tm_mday);         std::snprintf(v[3], 8, "%02d", tm.tm_hour);
+        std::snprintf(v[4], 8, "%02d", tm.tm_min);          std::snprintf(v[5], 8, "%02d", tm.tm_sec);
+        static const char* sep[] = {"-", "-", "", ":", ":", ""};
+        const auto lay = dtLayout(r.size.x);
+        const sf::Vector2f m = w.mapPixelToCoords(sf::Mouse::getPosition(w));
+        const float h = r.size.y, mid = r.position.y + h / 2;
+        for (int i = 0; i < 6; i++) {
+            const float x = r.position.x + lay[i].x, fw = lay[i].w;
+            const sf::FloatRect fr({x, r.position.y}, {fw, h});
+            const bool hov = fr.contains(m);
+            sf::RectangleShape box({fw, h});
+            box.setPosition({x, r.position.y});
+            box.setFillColor(hov ? sf::Color(48, 48, 56) : sf::Color(32, 32, 38));
+            box.setOutlineColor(hov ? Theme::Accent : sf::Color(70, 70, 78));
+            box.setOutlineThickness(1.f);
+            w.draw(box);
+            // arrows: the half under the mouse lights up
+            const bool upHov = hov && m.y < mid, dnHov = hov && m.y >= mid;
+            sf::ConvexShape up(3), dn(3);
+            const float cx = x + fw / 2;
+            up.setPoint(0, {cx - 5, r.position.y + 9}); up.setPoint(1, {cx + 5, r.position.y + 9}); up.setPoint(2, {cx, r.position.y + 3});
+            dn.setPoint(0, {cx - 5, r.position.y + h - 9}); dn.setPoint(1, {cx + 5, r.position.y + h - 9}); dn.setPoint(2, {cx, r.position.y + h - 3});
+            up.setFillColor(upHov ? Theme::Accent : sf::Color(120, 120, 130));
+            dn.setFillColor(dnHov ? Theme::Accent : sf::Color(120, 120, 130));
+            w.draw(up); w.draw(dn);
+            drawText(w, font, known ? v[i] : "--", cx, mid - 8, 13, known ? sf::Color(235, 235, 240) : sf::Color(130, 130, 140), true, 1);
+            if (*sep[i]) drawText(w, font, sep[i], x + fw + 2, mid - 8, 13, sf::Color(150, 150, 160), false, 1);
+        }
+    }
+    std::string timeMsg;
+
+    void drawTimeInfo(sf::RenderWindow& w, const sf::FloatRect& r) {
+        std::vector<std::pair<std::string, sf::Color>> lines;
+        const sf::Color grey(140, 140, 150), warn(255, 150, 80), ok(90, 220, 120);
+        if (!timeMsg.empty()) lines.push_back({timeMsg, warn});
+        lines.push_back({std::string("Click the top / bottom of a field or use the wheel (right click: 10 steps). ") +
+                         (timeInputLocal ? "Local time." : "UTC."), grey});
+        switch (timeSource) {
+        case TimeSource::Live:
+            lines.push_back({"Real time. Type a date above for another moment.", grey});
+            break;
+        case TimeSource::Manual:
+            lines.push_back({"Manual time, runs on from the date set. Tracking uses it too.", grey});
+            break;
+        case TimeSource::Recording:
+            if (!recPlaying) lines.push_back({"No IQ file is playing (source: File) - real time is used.", warn});
+            else if (recStart.unix <= 0) lines.push_back({"Start of the recording unknown - type it above.", warn});
+            else {
+                const std::string fn = std::filesystem::path(recPath).filename().string();
+                lines.push_back({"Start " + recStart.how + (recStartUser ? "" : ", fix it above if wrong"), recStart.guess ? warn : ok});
+                lines.push_back({fn + "  " + formatDuration(recProgress * recDuration) + " / " + formatDuration(recDuration), grey});
+            }
+            break;
+        }
+        // TLEs are accurate for days, not months: say so for old recordings
+        if (const Satellite* s = cat.get(selected)) {
+            const double d = std::fabs(baseJd() - s->epochJd);
+            if (d > 7.0) lines.push_back({"TLE is " + std::to_string((int)d) + " days from this time - paste an older TLE for exact passes", warn});
+        }
+        float y = r.position.y;
+        for (const auto& l : lines)
+            for (const auto& t : wrap(l.first, 11, r.size.x)) { drawText(w, font, t, r.position.x, y, 11, l.second); y += 14.0f; }
     }
 
     void fillQthInputs() {
@@ -631,6 +930,9 @@ private:
             if (!Dropdown::currentActive) {
                 if (tbM1h.isClicked(*ev, *win) || tbM10.isClicked(*ev, *win) || tbNow.isClicked(*ev, *win) ||
                     tbP10.isClicked(*ev, *win) || tbP1h.isClicked(*ev, *win)) continue;
+                bool used = tbWindow.isClicked(*ev, *win);
+                for (auto& b : tbKind) used = used || b.isClicked(*ev, *win);
+                if (used) continue;
             }
 
             if (panel.handleEvent(*ev, *win)) continue;
@@ -690,7 +992,7 @@ private:
             if (l.y < 20.0f || row < 0 || row >= (int)selPasses.size()) return true;
             const Pass& p = selPasses[row];
             // jump the map to the middle of that pass; NOW returns to real time
-            simOffsetSec = (p.alwaysUp ? 0.0 : (p.tcaJd - nowJd()) * 86400.0);
+            simOffsetSec = (p.alwaysUp ? 0.0 : (p.tcaJd - baseJd()) * 86400.0);
             return true;
         }
         return false;
@@ -715,7 +1017,7 @@ private:
     void zoomAt(sf::Vector2f m, double f) {
         double wx, wy;
         uiToWorld(m, wx, wy);
-        zoom = std::clamp(zoom * f, 1.0, 12.0);
+        zoom = std::clamp(zoom * f, 1.0, MAX_ZOOM);
         const auto r = mapRect();
         const double ppw = pixelsPerWorld();
         camX = wx - (m.x - (r.position.x + r.size.x / 2)) / ppw;
@@ -767,6 +1069,272 @@ private:
     // ------------------------------------------------------------------
     //  Map picture
     // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    //  Detail tiles
+    // ------------------------------------------------------------------
+    // One tile layer at the level that matches the zoom; missing tiles show a scaled
+    // part of an ancestor that is already loaded (or the world picture below).
+    void drawTileLayer(int layer, int minZ) {
+        const auto r = mapRect();
+        const double ppw = pixelsPerWorld();
+        const double ppd = ppw * 10.0;   // screen units per degree
+        const float s = uiScale ? std::max(0.5f, uiScale()) : 1.0f;
+        const TileSource& ts = tileSources()[layer];
+        // device pixels per degree decide the level (crisp on high-DPI screens)
+        int z = (int)std::ceil(std::log2(ppd * s * 180.0 / 256.0) - 0.25);
+        if (z < minZ) return;
+        z = std::clamp(z, 0, ts.maxZ);
+        const int ny = 1 << z, nx = 2 << z;
+        const double tdeg = 180.0 / ny;
+        double wx0, wy0, wx1, wy1;
+        uiToWorld(r.position, wx0, wy0);
+        uiToWorld(r.position + r.size, wx1, wy1);
+        const int tx0 = (int)std::floor(wx0 / 10.0 / tdeg), tx1 = (int)std::floor(wx1 / 10.0 / tdeg);
+        const int ty0 = std::clamp((int)std::floor(wy0 / 10.0 / tdeg), 0, ny - 1);
+        const int ty1 = std::clamp((int)std::floor(wy1 / 10.0 / tdeg), 0, ny - 1);
+        if (tx1 - tx0 > 80 || ty1 - ty0 > 60) return;   // (cannot happen at these levels, but never hang)
+
+        sf::View clip(r);
+        clip.setViewport(sf::FloatRect({r.position.x / logical.x, r.position.y / logical.y}, {r.size.x / logical.x, r.size.y / logical.y}));
+        win->setView(clip);
+        const double ccx = (tx0 + tx1) / 2.0, ccy = (ty0 + ty1) / 2.0;
+        const double ox = r.position.x + r.size.x / 2.0, oy = r.position.y + r.size.y / 2.0;
+        for (int ty = ty0; ty <= ty1; ty++) {
+            for (int tx = tx0; tx <= tx1; tx++) {
+                const int wx = ((tx % nx) + nx) % nx;
+                const TileKey k{layer, z, ty, wx};
+                const double prio = (tx - ccx) * (tx - ccx) + (ty - ccy) * (ty - ccy);
+                const sf::Texture* t = tiles->get(k, prio);
+                float u0 = 0, v0 = 0, u1 = 256, v1 = 256;
+                if (!t) {   // a loaded ancestor, scaled up
+                    for (int up = 1; up <= std::min(z, 7) && !t; up++) {
+                        t = tiles->peek(TileKey{layer, z - up, ty >> up, wx >> up});
+                        if (t) {
+                            const float sz = 256.0f / (float)(1 << up);
+                            u0 = (float)(wx & ((1 << up) - 1)) * sz; v0 = (float)(ty & ((1 << up) - 1)) * sz;
+                            u1 = u0 + sz; v1 = v0 + sz;
+                        }
+                    }
+                }
+                if (!t) continue;
+                const float tw = (float)t->getSize().x / 256.0f, th = (float)t->getSize().y / 256.0f;   // 512 px tiles too
+                const float x0 = (float)std::round(ox + (tx * tdeg * 10.0 - camX) * ppw), x1 = (float)std::round(ox + ((tx + 1) * tdeg * 10.0 - camX) * ppw);
+                const float y0 = (float)std::round(oy + (ty * tdeg * 10.0 - camY) * ppw), y1 = (float)std::round(oy + ((ty + 1) * tdeg * 10.0 - camY) * ppw);
+                sf::Vertex q[4] = {
+                    {{x0, y0}, sf::Color::White, {u0 * tw, v0 * th}}, {{x1, y0}, sf::Color::White, {u1 * tw, v0 * th}},
+                    {{x0, y1}, sf::Color::White, {u0 * tw, v1 * th}}, {{x1, y1}, sf::Color::White, {u1 * tw, v1 * th}}};
+                sf::RenderStates st;
+                st.texture = t;
+                win->draw(q, 4, sf::PrimitiveType::TriangleStrip, st);
+                layersDrawn.insert(layer);
+            }
+        }
+    }
+
+    void drawAttribution(const sf::FloatRect& r) {
+        if (layersDrawn.empty()) return;
+        std::string a;
+        for (int l : layersDrawn) {
+            if (l == 2 && layersDrawn.count(1)) continue;
+            a += (a.empty() ? "" : "  |  ") + tileSources()[l].attribution;
+        }
+        const float tw = textWidth(font, a, 10);
+        sf::RectangleShape bg({tw + 10, 15});
+        bg.setPosition({r.position.x + r.size.x - tw - 12, r.position.y + r.size.y - 16});
+        bg.setFillColor(sf::Color(0, 0, 0, 150));
+        win->draw(bg);
+        drawText(*win, font, a, r.position.x + r.size.x - 7, r.position.y + r.size.y - 15, 10, sf::Color(220, 220, 225), false, 2);
+    }
+
+    // ------------------------------------------------------------------
+    //  Positions heard by the decoders (AIS, APRS, ACARS, ADS-B)
+    // ------------------------------------------------------------------
+    enum class Icon { Dot, Ship, Plane, Car, Person, House, Tower, Weather, Balloon, Square, Diamond };
+
+    static Icon iconFor(const PosReport& p) {
+        switch (p.kind) {
+        case PosKind::AIS: return p.symCode == 'B' ? Icon::Square : p.symCode == 'N' ? Icon::Diamond : Icon::Ship;
+        case PosKind::ACARS: case PosKind::ADSB: return Icon::Plane;
+        default: break;
+        }
+        const std::string n = aprspos::symbolName(p.symTable, p.symCode);
+        if (n == "car" || n == "truck" || n == "van" || n == "jeep" || n == "motorcycle" || n == "bicycle" || n == "RV" ||
+            n == "bus" || n == "ambulance" || n == "fire truck") return Icon::Car;
+        if (n == "boat" || n == "ship") return Icon::Ship;
+        if (n == "aircraft" || n == "helicopter") return Icon::Plane;
+        if (n == "person") return Icon::Person;
+        if (n == "house" || n == "house (yagi)") return Icon::House;
+        if (n == "digipeater" || n == "gateway" || n == "repeater" || n == "ARES") return Icon::Tower;
+        if (n == "weather") return Icon::Weather;
+        if (n == "balloon") return Icon::Balloon;
+        return Icon::Dot;
+    }
+    static sf::Color kindColor(PosKind k) {
+        switch (k) {
+        case PosKind::AIS: return sf::Color(70, 200, 255);
+        case PosKind::APRS: return sf::Color(255, 120, 90);
+        case PosKind::ACARS: return sf::Color(215, 150, 255);
+        case PosKind::ADSB: return sf::Color(255, 220, 0);
+        default: return sf::Color::White;
+        }
+    }
+
+    // A filled polygon (convex parts) rotated by `deg` (clockwise from north) around p
+    void drawPoly(sf::Vector2f p, std::initializer_list<sf::Vector2f> pts, double deg, sf::Color fill, float scale) {
+        const double a = deg * M_PI / 180.0, c = std::cos(a), s = std::sin(a);
+        sf::ConvexShape sh(pts.size());
+        size_t i = 0;
+        for (const auto& q : pts) {
+            sh.setPoint(i++, {p.x + (float)((q.x * c - q.y * s) * scale), p.y + (float)((q.x * s + q.y * c) * scale)});
+        }
+        sh.setFillColor(fill);
+        sh.setOutlineColor(sf::Color(0, 0, 0, 200));
+        sh.setOutlineThickness(1.0f);
+        win->draw(sh);
+    }
+
+    void drawIcon(sf::Vector2f p, Icon ic, double course, sf::Color col, bool hl) {
+        const float k = hl ? 1.35f : 1.0f;
+        const double crs = course >= 0 ? course : 0.0;
+        auto circle = [&](sf::Vector2f c, float rad, sf::Color f) {
+            sf::CircleShape cs(rad); cs.setOrigin({rad, rad}); cs.setPosition(c);
+            cs.setFillColor(f); cs.setOutlineColor(sf::Color(0, 0, 0, 200)); cs.setOutlineThickness(1.f);
+            win->draw(cs);
+        };
+        switch (ic) {
+        case Icon::Ship:
+            drawPoly(p, {{0, -9}, {4.5f, -3}, {4.5f, 8}, {-4.5f, 8}, {-4.5f, -3}}, crs, col, k);
+            break;
+        case Icon::Plane:
+            drawPoly(p, {{0, -10}, {1.6f, -7}, {1.6f, 7}, {0, 9}, {-1.6f, 7}, {-1.6f, -7}}, crs, col, k);   // fuselage
+            drawPoly(p, {{0, -3}, {10, 2}, {10, 4}, {0, 1}, {-10, 4}, {-10, 2}}, crs, col, k);              // wings
+            drawPoly(p, {{0, 5}, {4, 8}, {4, 9.5f}, {-4, 9.5f}, {-4, 8}}, crs, col, k);                      // tail
+            break;
+        case Icon::Car:
+            drawPoly(p, {{-4, -7}, {4, -7}, {4, 7}, {-4, 7}}, crs, col, k);
+            drawPoly(p, {{-3, -4}, {3, -4}, {3, -1}, {-3, -1}}, crs, sf::Color(30, 30, 40, 220), k);   // windscreen
+            break;
+        case Icon::Person:
+            circle({p.x, p.y - 5 * k}, 2.8f * k, col);
+            drawPoly(p, {{-4, 8}, {4, 8}, {2.5f, -1}, {-2.5f, -1}}, 0, col, k);
+            break;
+        case Icon::House:
+            drawPoly(p, {{-6, -1}, {0, -8}, {6, -1}, {6, 6}, {-6, 6}}, 0, col, k);
+            break;
+        case Icon::Tower:
+            drawPoly(p, {{0, -9}, {5, 8}, {-5, 8}}, 0, col, k);
+            circle({p.x, p.y - 9 * k}, 2.5f * k, sf::Color::White);
+            break;
+        case Icon::Weather:
+            circle(p, 6.5f * k, col);
+            drawText(*win, font, "W", p.x, p.y - 7 * k, 10, sf::Color(20, 20, 30), true, 1);
+            break;
+        case Icon::Balloon:
+            circle({p.x, p.y - 3 * k}, 5.5f * k, col);
+            drawPoly(p, {{-0.6f, 2}, {0.6f, 2}, {0.6f, 9}, {-0.6f, 9}}, 0, col, k);
+            break;
+        case Icon::Square:
+            drawPoly(p, {{-5, -5}, {5, -5}, {5, 5}, {-5, 5}}, 0, col, k);
+            break;
+        case Icon::Diamond:
+            drawPoly(p, {{0, -7}, {6, 0}, {0, 7}, {-6, 0}}, 0, col, k);
+            break;
+        default:
+            circle(p, 5.0f * k, col);
+            break;
+        }
+        // direction tick for icons that do not turn themselves
+        if (course >= 0 && ic != Icon::Ship && ic != Icon::Plane && ic != Icon::Car) {
+            const double a = course * M_PI / 180.0;
+            sf::Vertex l[2] = {{p, sf::Color(255, 255, 255, 200)},
+                               {{p.x + (float)(std::sin(a) * 14 * k), p.y - (float)(std::cos(a) * 14 * k)}, sf::Color(255, 255, 255, 200)}};
+            win->draw(l, 2, sf::PrimitiveType::Lines);
+        }
+    }
+
+    // Where the object was at the map's time: its last report not after that moment
+    static bool positionAt(const PosTrack& t, double nowU, double& lat, double& lon, double& when) {
+        for (auto it = t.trail.rbegin(); it != t.trail.rend(); ++it) {
+            if (it->unix <= nowU + 5.0) { lat = it->lat; lon = it->lon; when = it->unix; return true; }
+        }
+        return false;
+    }
+
+    void drawPositions(const sf::FloatRect& r) {
+        posTracks = positionBus().snapshot();
+        hoveredPos = -1;
+        const double nowU = jdToUnix(simJd());
+        const double span = POS_WINDOWS[posWindowIdx].first;
+        const double ppd = pixelsPerWorld() * 10.0;
+        // labels only where they fit: few objects, or zoomed in
+        int visible = 0;
+        for (const auto& t : posTracks) {
+            double la, lo, wh;
+            if (showKind[(int)t.last.kind] && positionAt(t, nowU, la, lo, wh) && nowU - wh <= span && r.contains(latLonToUi(la, lo))) visible++;
+        }
+        const bool labels = visible <= 40 || ppd > 300.0;
+        float best = 12.0f;
+        for (size_t i = 0; i < posTracks.size(); i++) {
+            const PosTrack& t = posTracks[i];
+            if (!showKind[(int)t.last.kind]) continue;
+            double la, lo, wh;
+            if (!positionAt(t, nowU, la, lo, wh) || nowU - wh > span) continue;
+            const sf::Vector2f p = latLonToUi(la, lo);
+            const sf::Color col = kindColor(t.last.kind);
+            // trail inside the time window
+            sf::VertexArray tr(sf::PrimitiveType::LineStrip);
+            for (const auto& pt : t.trail) {
+                if (pt.unix > nowU + 5.0 || nowU - pt.unix > span) continue;
+                tr.append({latLonToUi(pt.lat, pt.lon), sf::Color(col.r, col.g, col.b, 130)});
+            }
+            if (tr.getVertexCount() > 1) win->draw(tr);
+            if (!r.contains(p)) continue;
+            const float d = std::hypot(p.x - mouseUi.x, p.y - mouseUi.y);
+            if (d < best && r.contains(mouseUi)) { best = d; hoveredPos = (int)i; hoveredPosUi = p; }
+            // old reports fade out
+            const double age = std::max(0.0, nowU - wh);
+            const sf::Color c(col.r, col.g, col.b, (std::uint8_t)(age > 1800 ? 150 : 255));
+            drawIcon(p, iconFor(t.last), t.last.courseDeg, c, false);
+            if (labels) drawText(*win, font, t.last.label, p.x + 9, p.y - 7, 10, sf::Color(235, 235, 240));
+        }
+        if (hoveredPos >= 0) {
+            const PosTrack& t = posTracks[hoveredPos];
+            drawIcon(hoveredPosUi, iconFor(t.last), t.last.courseDeg, kindColor(t.last.kind), true);
+        }
+    }
+
+    void drawPositionTooltip(const sf::FloatRect& r) {
+        const PosTrack& t = posTracks[hoveredPos];
+        const PosReport& p = t.last;
+        const double nowU = jdToUnix(simJd());
+        double la = p.lat, lo = p.lon, wh = p.unix;
+        positionAt(t, nowU, la, lo, wh);
+        std::string s = std::string(posKindName(p.kind)) + "  " + p.label;
+        if (p.id != p.label && p.label.find(p.id) == std::string::npos) s += "  [" + p.id + "]";
+        if (!p.info.empty()) s += "\n" + p.info;
+        if (p.kind == PosKind::APRS) {
+            const std::string sym = aprspos::symbolName(p.symTable, p.symCode);
+            if (!sym.empty()) s += "\nSymbol: " + sym;
+        }
+        char b[160];
+        std::string mv;
+        if (p.speedKn >= 0) { std::snprintf(b, sizeof(b), "%.1f kn", p.speedKn); mv += b; }
+        if (p.courseDeg >= 0) { std::snprintf(b, sizeof(b), "%s%.0f\xC2\xB0", mv.empty() ? "" : "  course ", p.courseDeg); mv += b; }
+        if (p.altM > -1e8) { std::snprintf(b, sizeof(b), "  alt %.0f m", p.altM); mv += b; }
+        if (!mv.empty()) s += "\n" + mv;
+        std::snprintf(b, sizeof(b), "\n%.5f, %.5f   heard %s ago (%d reports)", la, lo, formatDuration(std::max(0.0, nowU - wh)).c_str(), t.count);
+        s += b;
+        sf::Text tx = makeText(font, s, mouseUi.x + 14, mouseUi.y + 14, 11, sf::Color::White);
+        sf::FloatRect bb = tx.getGlobalBounds();
+        if (bb.position.x + bb.size.x + 8 > r.position.x + r.size.x) tx.move({-(bb.size.x + 36), 0.f});
+        if (bb.position.y + bb.size.y + 8 > r.position.y + r.size.y) tx.move({0.f, -(bb.size.y + 30)});
+        bb = tx.getGlobalBounds();
+        sf::RectangleShape bg({bb.size.x + 12, bb.size.y + 10});
+        bg.setPosition({bb.position.x - 6, bb.position.y - 5});
+        bg.setFillColor(sf::Color(20, 20, 26, 235)); bg.setOutlineColor(kindColor(p.kind)); bg.setOutlineThickness(1.f);
+        win->draw(bg); win->draw(tx);
+    }
+
     // The picture on disk (true when it is shown now)
     bool loadMapFile() {
         mapFileSize = fileSize(cat.mapFilePath());
@@ -897,7 +1465,7 @@ private:
     static constexpr float ROW_H = 19.0f;
 
     void updateState() {
-        const double now = nowJd();
+        const double now = baseJd();
         const double t = simJd();
         // search results arrived: show them
         // (as soon as there is something to show: the satellites already known come first)
@@ -925,6 +1493,9 @@ private:
         }
         const double key = trk.obs.latDeg * 1e4 + trk.obs.lonDeg * 7.0 + trk.obs.altM * 0.001 + trk.minElDeg * 1e7;
         if (key != obsKey) { obsKey = key; nextPass.clear(); selPassesFor = -1; }
+        // the map's "now" jumped (time source changed, seek in the recording, manual date): passes again
+        if (std::fabs(now - lastPassBaseJd) * 86400.0 > 120.0) { nextPass.clear(); selPassesFor = -1; }
+        lastPassBaseJd = now;
 
         // list contents
         const std::string search = txtSearch->getText();
@@ -1065,7 +1636,16 @@ private:
             ocean.setFillColor(sf::Color(14, 30, 52));
             drawWrapped(ocean);
         }
+        // detail tiles over the world picture when zoomed in
+        tiles->beginFrame();
+        layersDrawn.clear();
+        if (baseLayer == 0) drawTileLayer(0, 4);   // Blue Marble is as sharp below level 4
+        else if (baseLayer == 1) drawTileLayer(1, 0);
+        win->setView(worldView());
         if (showNight && night.getVertexCount()) drawWrapped(night);
+        if (baseLayer == 0 && placeNames) { drawTileLayer(2, 4); win->setView(worldView()); }
+        tiles->endFrame();
+        if (tiles->loading()) dirty = true;
         if (showGrid || !mapLoaded) {
             sf::VertexArray g(sf::PrimitiveType::Lines);
             const sf::Color gc(255, 255, 255, mapLoaded ? 28 : 50), eq(255, 255, 255, mapLoaded ? 55 : 80);
@@ -1151,6 +1731,8 @@ private:
             }
         }
 
+        drawPositions(r);
+
         // satellites
         hovered = 0;
         float bestD = 12.0f;
@@ -1215,7 +1797,10 @@ private:
             }
         }
 
-        if (sunHover && !hovered) {
+        if (hoveredPos >= 0 && !hovered) drawPositionTooltip(r);
+        drawAttribution(r);
+
+        if (sunHover && !hovered && hoveredPos < 0) {
             char b[200];
             std::snprintf(b, sizeof(b), "Sun - subsolar point (the Sun is overhead here)\nLat %.1f\xC2\xB0  Lon %.1f\xC2\xB0   moves with the map time",
                           sunHover->subLatDeg, sunHover->subLonDeg);
@@ -1251,7 +1836,9 @@ private:
         // cursor
         const bool overClickable = (hovered != 0) || (wList->isMouseOver(*win)) || (wPasses->isMouseOver(*win)) ||
                                    panel.isAnyWidgetHovered(*win) || tbNow.isMouseOver(*win) || tbM1h.isMouseOver(*win) ||
-                                   tbM10.isMouseOver(*win) || tbP10.isMouseOver(*win) || tbP1h.isMouseOver(*win);
+                                   tbM10.isMouseOver(*win) || tbP10.isMouseOver(*win) || tbP1h.isMouseOver(*win) ||
+                                   tbWindow.isMouseOver(*win) || tbKind[0].isMouseOver(*win) || tbKind[1].isMouseOver(*win) ||
+                                   tbKind[2].isMouseOver(*win) || tbKind[3].isMouseOver(*win);
         static auto curArrow = sf::Cursor::createFromSystem(sf::Cursor::Type::Arrow);
         static auto curHand = sf::Cursor::createFromSystem(sf::Cursor::Type::Hand);
         static auto curCross = sf::Cursor::createFromSystem(sf::Cursor::Type::Cross);
@@ -1271,25 +1858,53 @@ private:
         win->draw(bar);
         float x = PANEL_W + 10;
         for (SdrButton* b : {&tbM1h, &tbM10, &tbNow, &tbP10, &tbP1h}) { b->setPosition(x, 6); b->draw(*win); x += b->shape.getSize().x + 4; }
+        // right side: which decoder positions are shown, and how far back
+        {
+            float rx = logical.x - 10.0f;
+            tbWindow.setText(std::string("Last ") + POS_WINDOWS[posWindowIdx].second);
+            rx -= tbWindow.shape.getSize().x;
+            tbWindow.setPosition(rx, 6); tbWindow.draw(*win);
+            rx -= 8.0f;
+            for (int i = (int)PosKind::Count - 1; i >= 0; i--) {
+                const size_t n = positionBus().count((PosKind)i);
+                tbKind[i].setText(std::string(posKindName((PosKind)i)) + (n ? " " + std::to_string(n) : ""));
+                tbKind[i].setActive(showKind[i]);
+                rx -= tbKind[i].shape.getSize().x;
+                tbKind[i].setPosition(rx, 6); tbKind[i].draw(*win);
+                rx -= 4.0f;
+            }
+            toolbarRightX = rx;
+        }
         x += 10;
         const double t = simJd();
         std::string ts = "UTC " + formatJd(t, false, "%Y-%m-%d %H:%M:%S") + "   local " + formatJd(t, true, "%H:%M:%S");
-        drawText(*win, font, ts, x, 10, 13, sf::Color(220, 220, 225));
+        if (x + textWidth(font, ts, 13) < toolbarRightX) drawText(*win, font, ts, x, 10, 13, sf::Color(220, 220, 225));
         x += textWidth(font, ts, 13) + 16;
+        if (timeSource != TimeSource::Live) {
+            const std::string src = timeSource == TimeSource::Manual ? "MANUAL TIME" : recPlaying && recStart.unix > 0 ? "RECORDING TIME" : "RECORDING: NO FILE";
+            if (x + textWidth(font, src, 13) < toolbarRightX) drawText(*win, font, src, x, 10, 13, sf::Color(255, 170, 70), true);
+            x += textWidth(font, src, 13) + 16;
+        }
         if (std::fabs(simOffsetSec) >= 1.0) {
             std::string s = "SIMULATED TIME " + std::string(simOffsetSec > 0 ? "+" : "") + formatDuration(simOffsetSec);
-            drawText(*win, font, s, x, 10, 13, sf::Color(255, 160, 60), true);
+            if (x + textWidth(font, s, 13) < toolbarRightX) drawText(*win, font, s, x, 10, 13, sf::Color(255, 160, 60), true);
+            x += textWidth(font, s, 13) + 16;
         }
-        // data age of the shown group, right aligned
-        std::string age;
+        // data age of the shown group, right aligned before the position buttons;
+        // shortened, then left out when the window is too narrow
         sf::Color ac(150, 150, 160);
         const double h = cat.groupAgeHours(groupId);
-        if (h >= 0) {
-            age = CatalogLabel() + ": downloaded " + (h < 1 ? std::to_string((int)(h * 60)) + " min ago" : formatDuration(h * 3600) + " ago");
-            if (h > STALE_DAYS * 24) { age += " - STALE"; ac = sf::Color(255, 110, 90); }
-        } else age = CatalogLabel();
-        if (cat.busy()) age = "updating...  " + age;
-        drawText(*win, font, age, logical.x - 12, 10, 12, ac, false, 2);
+        std::string when = h < 0 ? std::string() : (h < 1 ? std::to_string((int)(h * 60)) + " min ago" : formatDuration(h * 3600) + " ago");
+        if (h > STALE_DAYS * 24) { when += " - STALE"; ac = sf::Color(255, 110, 90); }
+        const std::string busy = cat.busy() ? "updating...  " : "";
+        const std::vector<std::string> variants = {
+            busy + CatalogLabel() + (when.empty() ? "" : ": downloaded " + when),
+            busy + (when.empty() ? CatalogLabel() : "TLE " + when),
+            cat.busy() ? std::string("updating...") : std::string() };
+        for (const auto& v : variants) {
+            if (v.empty()) break;
+            if (toolbarRightX - 12 - textWidth(font, v, 12) > x) { drawText(*win, font, v, toolbarRightX - 12, 10, 12, ac, false, 2); break; }
+        }
     }
     std::string CatalogLabel() const { return SatCatalog::groupLabel(groupId); }
 
@@ -1328,7 +1943,7 @@ private:
         bg.setFillColor(sf::Color(24, 24, 28));
         bg.setOutlineColor(sf::Color(60, 60, 66)); bg.setOutlineThickness(1.f);
         w.draw(bg);
-        const double now = nowJd();
+        const double now = baseJd();
         char hdr[96];
         std::snprintf(hdr, sizeof(hdr), "%d satellites", (int)listIds.size());
         drawText(w, font, hdr, r.position.x + 22, r.position.y + 2, 11, sf::Color(130, 130, 140));
@@ -1434,8 +2049,8 @@ private:
         const double fpKm = 2.0 * footprintAngle(la.altKm, 0.0) * SGP_RE;
         row("Sunlight", la.eclipsed ? "eclipse" : "sunlit", "Footprint", f("%.0f km", fpKm));
         y += 2;
-        // next / current pass (real time)
-        const double now = nowJd();
+        // next / current pass (the map's time without the preview offset)
+        const double now = baseJd();
         std::string nx;
         sf::Color nc(220, 220, 225);
         if (!selPasses.empty()) {
@@ -1525,7 +2140,7 @@ private:
         y += 20;
         if (selPasses.empty()) { drawText(w, font, "-", x, y, 12, sf::Color(140, 140, 150)); return; }
         const sf::Vector2f m = w.mapPixelToCoords(sf::Mouse::getPosition(w));
-        const double t = simJd(), now = nowJd();
+        const double t = simJd(), now = baseJd();
         static const char* dirs[] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
         auto dir = [](double az) { return dirs[(int)std::fmod((az + 22.5) / 45.0, 8.0)]; };
         for (const auto& p : selPasses) {
@@ -1572,7 +2187,7 @@ private:
             if (other) { drawText(w, font, "(the tracked satellite is not the selected one)", x, y, 11, sf::Color(150, 150, 160)); y += 15; }
         } else if (s && chosenHz > 0) {
             // preview for the selected satellite (real time)
-            const LookAngles la = look(*s, trk.obs, nowJd());
+            const LookAngles la = look(*s, trk.obs, baseJd());
             if (la.ok) {
                 std::snprintf(b, sizeof(b), "Doppler now %+.0f Hz  ->  %s MHz", la.dopplerHz((double)chosenHz),
                               mhz(chosenHz + (long long)std::llround(la.dopplerHz((double)chosenHz)), 6).c_str());

@@ -6,6 +6,7 @@
 #include "AudioSink.h"
 #include "Demodulator.h"
 #include "APRS_Decoder.h"
+#include "modules/Core/AprsPosition.h"
 #include "RDS_Decoder.h"
 #include "AudioLeveler.h"
 #include "RdsGainOptimizer.h"
@@ -42,6 +43,9 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
             logFile << fullLog << "\n";
             logFile.close();
         }
+        // the station on the satellite map
+        PosReport pos;
+        if (aprspos::parse(msg, pos)) positionBus().report(pos);
         AprsLastPacket pkt;
         parseAprsData(fullLog, pkt);
         std::lock_guard<std::mutex> l(shared.mtx);

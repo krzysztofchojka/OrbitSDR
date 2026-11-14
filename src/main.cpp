@@ -39,6 +39,7 @@
 #include "modules/ImageDecoders/WEFAX_Module.h"
 #include "modules/ISM/ISM_Decoder.h"
 #include "modules/ACARS/ACARS_Decoder.h"
+#include "modules/ADSB/ADSB_Decoder.h"
 
 // Satellite map and tracking
 #include "orbit/MapWindow.h"
@@ -178,6 +179,10 @@ int main() {
     ACARSDecoder* ptrACARS = acarsMod.get();
     modules.push_back(std::move(acarsMod));
     modules.push_back(std::move(ismMod));
+    auto adsbMod = std::make_unique<ADSBDecoder>();
+    adsbMod->init(ctx);
+    ADSBDecoder* ptrADSB = adsbMod.get();
+    modules.push_back(std::move(adsbMod));
 
     auto cursorArrow = sf::Cursor::createFromSystem(sf::Cursor::Type::Arrow);
     auto cursorHand = sf::Cursor::createFromSystem(sf::Cursor::Type::Hand);
@@ -209,6 +214,16 @@ int main() {
     mapWindow.uiScale = [&]() { return getUiScale(); };
     mapWindow.icon = &icon;
     mapWindow.loadSettings(settingsMgr);
+    // "Time: recording being played": the map follows the IQ file's playback position
+    mapWindow.recordingInfo = [](std::string& path, double& progress, double& durationSec) {
+        std::lock_guard<std::mutex> l(sourceMtx);
+        if (!currentSource) return false;
+        path = currentSource->getFilePath();   // empty for radios and the sound card
+        if (path.empty()) return false;
+        progress = currentSource->getProgress();
+        durationSec = currentSource->getDurationSec();
+        return true;
+    };
     sf::Clock trackClock;
 
     // Volume slider: the position maps to -40 .. +8 dB, so the low levels are easy to set
@@ -880,11 +895,12 @@ int main() {
     auto chkISM   = std::make_shared<Checkbox>(ISMDecoder::available() ? "ISM (433/868 MHz sensors)"
                                                                        : "ISM (not in this build)", font);
     auto chkACARS = std::make_shared<Checkbox>("ACARS (aircraft, 131.x MHz)", font);
+    auto chkADSB  = std::make_shared<Checkbox>("ADS-B (aircraft, 1090 MHz)", font);
 
     struct DecoderEntry { std::shared_ptr<Checkbox> chk; SDRModule* mod; };   // mod == nullptr: APRS
     std::vector<DecoderEntry> decoders = {
         {chkAprs, nullptr}, {chkAIS, ptrAIS}, {chkSSTV, ptrSSTV},
-        {chkWEFAX, ptrWEFAX}, {chkISM, ptrISM}, {chkACARS, ptrACARS} };
+        {chkWEFAX, ptrWEFAX}, {chkISM, ptrISM}, {chkACARS, ptrACARS}, {chkADSB, ptrADSB} };
 
     auto activateDecoder = [&](size_t idx, bool on) {
         DecoderEntry& d = decoders[idx];
@@ -917,6 +933,7 @@ int main() {
     modDecoders->addWidget(std::make_shared<Label>("Each decoder has its own channel (yellow)", font, 11, sf::Color(150, 150, 160)));
 
     // The map window offers to switch on the decoder a satellite transmitter needs (SSTV, APRS)
+    ptrADSB->onOpenMap = [&]() { mapWindow.openOrFocus(); };
     mapWindow.onEnableDecoder = [&](const std::string& name) {
         for (auto& d : decoders) {
             const std::string n = d.mod ? d.mod->name : std::string("APRS");
@@ -1891,6 +1908,24 @@ int main() {
         // --- Satellite map window and frequency / Doppler tracking ---
         satCatalog.poll();
         mapWindow.frame();
+        // decoder positions are stamped with the map's time (the recording's time for old files)
+        positionBus().setClock(orbit::jdToUnix(mapWindow.trackerJd()));
+        // ADS-B: the receiver for distances / surface positions, and the "Tune to 1090 MHz" button
+        ptrADSB->setReceiver(satTracker.obs.latDeg, satTracker.obs.lonDeg);
+        if (const long long want = ptrADSB->tuneRequest.exchange(0); want > 0) {
+            if (isHw) {
+                currentCenterFreq = want;
+                {
+                    std::lock_guard<std::mutex> l(sharedData.mtx);
+                    sharedData.centerFreq = want;
+                    sharedData.tunedFreqPercent = 0.5;
+                    sharedData.viewCenterPct = 0.5;
+                }
+                pendingCenterFreq = want;
+                debouncer.restart();
+                freqVFO.setFrequency(want);
+            }
+        }
         {
             std::string decName;
             ChannelSet* trackSet = nullptr;
@@ -1905,7 +1940,8 @@ int main() {
             if (inputIsAudio) trackSet = nullptr;
             satTracker.activeDecoderName = decName;
 
-            if (satTracker.update(satCatalog, orbit::nowJd())) {
+            // real time, or the recording's / manual time set in the map's Time module
+            if (satTracker.update(satCatalog, mapWindow.trackerJd())) {
                 satTracker.applyStatus.clear();
                 const double rate = hwSampleRate > 0 ? hwSampleRate : 2e6;
                 // Retunes the radio so `hz` lies in the received band, away from the DC spike;

@@ -10,6 +10,9 @@
 #include <functional>
 
 // --- THEME SYSTEM ---
+// Widget texts are UTF-8 (degree sign, Polish letters...); SFML's std::string overload would read them as ANSI
+inline sf::String u8(const std::string& s) { return sf::String::fromUtf8(s.begin(), s.end()); }
+
 namespace Theme {
     inline sf::Color Accent     = sf::Color(0, 180, 255); 
     inline sf::Color AccentDim  = sf::Color(0, 100, 150); 
@@ -75,7 +78,7 @@ public:
 // --- MODERN SLIDER (RETINA FIX V2 - NO ROUNDING ON MOVING PARTS) ---
     Slider(float w, float minV, float maxV, float startV, std::string n, const sf::Font& font) 
         : minVal(minV), maxVal(maxV), currentVal(startV), 
-          label(font, n, 24), valueDisplay(font, "", 20) 
+          label(font, u8(n), 24), valueDisplay(font, "", 20) 
     {
         label.setScale({0.5f, 0.5f});
         valueDisplay.setScale({0.5f, 0.5f});
@@ -133,7 +136,7 @@ public:
     }
     void setLimits(float newMin, float newMax) { if (minVal == newMin && maxVal == newMax) return; minVal = newMin; maxVal = newMax; currentVal = std::clamp(currentVal, minVal, maxVal); updateHandlePos(); }
     void setValueSilent(float val) { currentVal = std::clamp(val, minVal, maxVal); updateHandlePos(); }
-    void setText(std::string t) { label.setString(t); } 
+    void setText(std::string t) { label.setString(u8(t)); } 
 
     void updateHandlePos() { 
         float p = (currentVal - minVal) / (maxVal - minVal); p = std::clamp(p, 0.0f, 1.0f);
@@ -181,7 +184,7 @@ public:
 class SdrButton : public Widget {
 public:
     sf::RectangleShape shape; sf::Text label; bool active = false; bool enabled = true; std::function<void()> onClick;
-    SdrButton(float w, float h, std::string t, const sf::Font& font) : label(font, t, 24) { 
+    SdrButton(float w, float h, std::string t, const sf::Font& font) : label(font, u8(t), 24) { 
         label.setScale({0.5f, 0.5f}); 
         shape.setSize({w, h}); shape.setOutlineThickness(1); updateStyle();
     }
@@ -204,7 +207,7 @@ public:
     }
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override { return isClicked(ev, win); }
     void setActive(bool a) { active = a; updateStyle(); }
-    void setText(std::string t) { label.setString(t); centerText(); }
+    void setText(std::string t) { label.setString(u8(t)); centerText(); }
     void setColor(sf::Color c) { if(enabled && !active) shape.setFillColor(c); } 
     void draw(sf::RenderWindow& w) override { w.draw(shape); w.draw(label); }
 };
@@ -213,7 +216,7 @@ public:
 class Checkbox : public Widget {
 public:
     sf::RectangleShape box, checkmark; sf::Text label; bool checked = false; std::function<void(bool)> onToggle;
-    Checkbox(std::string text, const sf::Font& font, bool initial = false) : label(font, text, 24), checked(initial) { 
+    Checkbox(std::string text, const sf::Font& font, bool initial = false) : label(font, u8(text), 24), checked(initial) { 
         label.setScale({0.5f, 0.5f});
         
         box.setSize({28.0f, 28.0f}); 
@@ -364,11 +367,11 @@ public:
 inline TextInput* TextInput::currentFocus = nullptr;
 
 class Label : public Widget { sf::Text text; public: 
-    Label(std::string c, const sf::Font& f, int s=12, sf::Color cl=sf::Color::White) : text(f, c, s * 2) { 
+    Label(std::string c, const sf::Font& f, int s=12, sf::Color cl=sf::Color::White) : text(f, u8(c), s * 2) { 
         text.setScale({0.5f, 0.5f}); 
         text.setFillColor(cl); 
     } 
-    float getHeight() const override { return text.getGlobalBounds().size.y + 8.0f; } void setPosition(float x, float y) override { text.setPosition({x, y}); } void setText(std::string s) { text.setString(s); } void draw(sf::RenderWindow& w) override { w.draw(text); } void updateStyle() override { text.setFillColor(Theme::Text); } 
+    float getHeight() const override { return text.getGlobalBounds().size.y + 8.0f; } void setPosition(float x, float y) override { text.setPosition({x, y}); } void setText(std::string s) { text.setString(u8(s)); } void draw(sf::RenderWindow& w) override { w.draw(text); } void updateStyle() override { text.setFillColor(Theme::Text); } 
 };
 
 class RowContainer : public Widget {
