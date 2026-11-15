@@ -3,6 +3,7 @@
 **A fast, lightweight SDR receiver with built-in decoders. Build with Apple Silicon in mind, also runs on Windows and Linux.**
 
 [![Build](https://github.com/krzysztofchojka/OrbitSDR/actions/workflows/build.yml/badge.svg)](https://github.com/krzysztofchojka/OrbitSDR/actions)
+
 ![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
 
 ![OrbitSDR decoding ISM sensors and AIS while listening to FM broadcast](screenshot.png)
