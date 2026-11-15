@@ -43,6 +43,7 @@
 
 // Satellite map and tracking
 #include "orbit/MapWindow.h"
+#include "MacWindowFix.h"
 
 int main() {
     #ifdef _WIN32
@@ -1247,6 +1248,7 @@ int main() {
     sf::Clock meterClock;
 
     while (window.isOpen()) {
+        syncMacWindowSize(window);   // macOS window tiling resizes without telling SFML
         sf::Vector2u currSize = window.getSize();
         if (currSize != lastSize && currSize.x > 0 && currSize.y > 0) {
             applyUiScale();

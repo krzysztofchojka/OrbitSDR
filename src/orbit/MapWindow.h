@@ -22,6 +22,7 @@
 #include "../modules/Core/PositionBus.h"
 #include "../modules/Core/AprsPosition.h"
 #include "../NativeDialogs.h"
+#include "../MacWindowFix.h"
 #include <SFML/Graphics.hpp>
 #include <SFML/Window/Clipboard.hpp>
 #include <memory>
@@ -90,6 +91,7 @@ public:
         handleEvents();
         if (!win || !win->isOpen()) { closeCleanup(); return; }
         refreshTime();
+        syncMacWindowSize(*win);   // macOS window tiling resizes without telling SFML
         if (win->getSize() != lastSize) applyView();
         panel.update(*win);
         // ~30 fps is plenty for a map; faster while the user interacts
@@ -588,6 +590,7 @@ private:
     }
 
     // field 0 year, 1 month, 2 day, 3 hour, 4 minute, 5 second
+    float dtWheelAcc = 0.0f;
     struct DtField { float x, w; };
     std::vector<DtField> dtLayout(float width) const {
         const float gap = 4.0f, unit = (width - 5 * gap) / 7.0f;   // the year is twice as wide
@@ -636,7 +639,10 @@ private:
             return true;
         }
         if (const auto* sc = ev.getIf<sf::Event::MouseWheelScrolled>()) {
-            stepField(field, sc->delta > 0 ? 1 : -1);
+            // a trackpad sends many fractional steps: add them up
+            dtWheelAcc += sc->delta;
+            while (dtWheelAcc >= 1.0f) { stepField(field, 1); dtWheelAcc -= 1.0f; }
+            while (dtWheelAcc <= -1.0f) { stepField(field, -1); dtWheelAcc += 1.0f; }
             return true;
         }
         return true;
@@ -901,11 +907,17 @@ private:
             // the list scrolls itself (the panel would scroll as a whole)
             if (const auto* sc = ev->getIf<sf::Event::MouseWheelScrolled>()) {
                 const sf::Vector2f m = win->mapPixelToCoords(sc->position);
-                if (!Dropdown::currentActive && wList->rect.contains(m) && wList->getHeight() > 0) {
+                if (!Dropdown::currentActive && sc->wheel == sf::Mouse::Wheel::Vertical && wList->rect.contains(m) && wList->getHeight() > 0) {
                     listScroll = std::max(0.0f, listScroll - sc->delta * 40.0f);
                     continue;
                 }
-                if (m.x > PANEL_W && mapRect().contains(m)) { zoomAt(m, sc->delta > 0 ? 1.25 : 0.8); continue; }
+                // zoom by the actual amount: a mouse wheel notch is 1.0, a trackpad sends many
+                // small (and momentum) steps; horizontal trackpad movement is ignored
+                if (m.x > PANEL_W && mapRect().contains(m)) {
+                    if (sc->wheel == sf::Mouse::Wheel::Vertical && sc->delta != 0.0f)
+                        zoomAt(m, std::pow(1.25, std::clamp((double)sc->delta, -3.0, 3.0)));
+                    continue;
+                }
             }
 
             if (const auto* mr = ev->getIf<sf::Event::MouseButtonReleased>()) {

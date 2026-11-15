@@ -24,7 +24,7 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     IS_MACOS=true
     BASE_INCLUDES=${INCLUDES:-"-I/opt/homebrew/include"}
     BASE_LIBS=${LIBS:-"-L/opt/homebrew/lib -lsfml-graphics -lsfml-window -lsfml-system -lrtlsdr"}
-    EXTRAS="-framework CoreAudio -framework AudioToolbox -framework AudioUnit"
+    EXTRAS="-framework CoreAudio -framework AudioToolbox -framework AudioUnit -framework AppKit"   # AppKit: MacWindowFix.h
     SDRPLAY_INC="-I/usr/local/include"
     SDRPLAY_LIB=""   # loaded at run time (see src/SdrplayLoader.h)
 else

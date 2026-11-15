@@ -440,7 +440,8 @@ public:
             cp *= 10;
         }
     }
-    bool handleEvent(const sf::Event& ev) { if (!enabled || !isHovered || hoverPower == 0) return false; if (const auto* mb = ev.getIf<sf::Event::MouseButtonPressed>()) { if (mb->button == sf::Mouse::Button::Left) { if (isTopHalf) frequency += hoverPower; else frequency -= hoverPower; if (frequency < 0) frequency = 0; return true; } } if (const auto* sc = ev.getIf<sf::Event::MouseWheelScrolled>()) { if (sc->wheel == sf::Mouse::Wheel::Vertical) { if (sc->delta > 0) frequency += hoverPower; else frequency -= hoverPower; if (frequency < 0) frequency = 0; return true; } } return false; }
+    bool handleEvent(const sf::Event& ev) { if (!enabled || !isHovered || hoverPower == 0) return false; if (const auto* mb = ev.getIf<sf::Event::MouseButtonPressed>()) { if (mb->button == sf::Mouse::Button::Left) { if (isTopHalf) frequency += hoverPower; else frequency -= hoverPower; if (frequency < 0) frequency = 0; return true; } } if (const auto* sc = ev.getIf<sf::Event::MouseWheelScrolled>()) { if (sc->wheel == sf::Mouse::Wheel::Vertical) { /* a trackpad sends many fractional steps: add them up */ wheelAcc += sc->delta; while (wheelAcc >= 1.0f) { frequency += hoverPower; wheelAcc -= 1.0f; } while (wheelAcc <= -1.0f) { frequency -= hoverPower; wheelAcc += 1.0f; } if (frequency < 0) frequency = 0; return true; } } return false; }
+    float wheelAcc = 0.0f;
     
     void draw(sf::RenderWindow& win) { 
         sf::FloatRect b = text.getGlobalBounds(); sf::RectangleShape bg({b.size.x + 30, b.size.y + 28}); bg.setPosition({x - 5, y - 8}); bg.setFillColor(sf::Color(15, 15, 17)); 
