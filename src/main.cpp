@@ -1913,7 +1913,7 @@ int main() {
         // ADS-B: the receiver for distances / surface positions, and the "Tune to 1090 MHz" button
         ptrADSB->setReceiver(satTracker.obs.latDeg, satTracker.obs.lonDeg);
         if (const long long want = ptrADSB->tuneRequest.exchange(0); want > 0) {
-            if (isHw) {
+            if (isHw) {   // only the frequency; the sample rate stays the user's choice
                 currentCenterFreq = want;
                 {
                     std::lock_guard<std::mutex> l(sharedData.mtx);

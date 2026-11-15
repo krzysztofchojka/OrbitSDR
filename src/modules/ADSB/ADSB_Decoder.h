@@ -65,6 +65,8 @@ public:
     float panelHeight(float windowHeight) const override { return std::clamp(windowHeight * 0.40f, 260.0f, 480.0f); }
 
     void setRadioFrequency(long long hz) override { std::lock_guard<std::mutex> l(mtx); centerHz = hz; }
+    // short bursts on a quiet band: the software AGC must not change the gain inside a frame
+    bool wantsBurstAgc() const override { return true; }
     void setAudioInput(bool audio) override { audioInput = audio; }
     ChannelSet* channelSet() override { return &channels; }
 
@@ -80,7 +82,7 @@ public:
         if (centerHz > 0 && std::llabs(centerHz - ADSB_HZ) > (long long)(sampleRate * 0.3)) {
             info = "Tune the radio to 1090 MHz (button below)";
         } else if (sampleRate > 2.01e6 && sampleRate < 2.35e6) {
-            info = mss(sampleRate) + ": 2.4 or 2.0 MS/s decode much better";
+            info = mss(sampleRate) + ": few positions, set 2.4 MS/s or more";
         } else info = "Decoding at " + mss(sampleRate);
         dec.clock = now();
         dec.magnitude(reinterpret_cast<const double*>(iq.data()), iq.size(), mag);
