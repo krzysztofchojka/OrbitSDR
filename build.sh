@@ -85,27 +85,27 @@ if [ "$IS_MACOS" = true ]; then
     chmod +x "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
     # --- Generate the .icns icon from icon.png ---
-    if [ -f "icon.png" ]; then
+    if [ -f "assets/icon.png" ]; then
         echo "Generating AppIcon.icns from icon.png..."
         
         # Also copy the PNG into Resources so SFML can load it at runtime (for the Dock)
-        cp "icon.png" "$APP_BUNDLE/Contents/Resources/"
+        cp "assets/icon.png" "$APP_BUNDLE/Contents/Resources/"
 
         # Create a temporary iconset folder
         ICONSET_DIR="OrbitSDR.iconset"
         mkdir -p "$ICONSET_DIR"
 
         # Generate the sizes macOS requires (using sips)
-        sips -z 16 16     icon.png --out "${ICONSET_DIR}/icon_16x16.png" > /dev/null
-        sips -z 32 32     icon.png --out "${ICONSET_DIR}/icon_16x16@2x.png" > /dev/null
-        sips -z 32 32     icon.png --out "${ICONSET_DIR}/icon_32x32.png" > /dev/null
-        sips -z 64 64     icon.png --out "${ICONSET_DIR}/icon_32x32@2x.png" > /dev/null
-        sips -z 128 128   icon.png --out "${ICONSET_DIR}/icon_128x128.png" > /dev/null
-        sips -z 256 256   icon.png --out "${ICONSET_DIR}/icon_128x128@2x.png" > /dev/null
-        sips -z 256 256   icon.png --out "${ICONSET_DIR}/icon_256x256.png" > /dev/null
-        sips -z 512 512   icon.png --out "${ICONSET_DIR}/icon_256x256@2x.png" > /dev/null
-        sips -z 512 512   icon.png --out "${ICONSET_DIR}/icon_512x512.png" > /dev/null
-        sips -z 1024 1024 icon.png --out "${ICONSET_DIR}/icon_512x512@2x.png" > /dev/null
+        sips -z 16 16 assets/icon.png --out "${ICONSET_DIR}/icon_16x16.png" > /dev/null
+        sips -z 32 32 assets/icon.png --out "${ICONSET_DIR}/icon_16x16@2x.png" > /dev/null
+        sips -z 32 32 assets/icon.png --out "${ICONSET_DIR}/icon_32x32.png" > /dev/null
+        sips -z 64 64 assets/icon.png --out "${ICONSET_DIR}/icon_32x32@2x.png" > /dev/null
+        sips -z 128 128 assets/icon.png --out "${ICONSET_DIR}/icon_128x128.png" > /dev/null
+        sips -z 256 256 assets/icon.png --out "${ICONSET_DIR}/icon_128x128@2x.png" > /dev/null
+        sips -z 256 256 assets/icon.png --out "${ICONSET_DIR}/icon_256x256.png" > /dev/null
+        sips -z 512 512 assets/icon.png --out "${ICONSET_DIR}/icon_256x256@2x.png" > /dev/null
+        sips -z 512 512 assets/icon.png --out "${ICONSET_DIR}/icon_512x512.png" > /dev/null
+        sips -z 1024 1024 assets/icon.png --out "${ICONSET_DIR}/icon_512x512@2x.png" > /dev/null
 
         # Convert the iconset folder into an .icns file
         iconutil -c icns "$ICONSET_DIR" -o "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
@@ -117,12 +117,12 @@ if [ "$IS_MACOS" = true ]; then
     fi
 
     # Copy bandplan.json into Resources
-    if [ -f "bandplan.json" ]; then
-        cp "bandplan.json" "$APP_BUNDLE/Contents/Resources/"
+    if [ -f "assets/bandplan.json" ]; then
+        cp "assets/bandplan.json" "$APP_BUNDLE/Contents/Resources/"
     fi
     # Satellite map configuration (proxy / map URL)
-    if [ -f "orbitsdr.ini" ]; then
-        cp "orbitsdr.ini" "$APP_BUNDLE/Contents/Resources/"
+    if [ -f "assets/orbitsdr.ini" ]; then
+        cp "assets/orbitsdr.ini" "$APP_BUNDLE/Contents/Resources/"
     fi
 
     # Fix libraries linking
@@ -186,13 +186,6 @@ EOF
 
 else
     # --- LINUX LOGIC ---
-    # On Linux just copy the png next to the binary so the C++ code can load it
-    if [ -f "icon.png" ]; then
-        cp "icon.png" "icon.png" # Dummy copy just to be explicit, logic handled in C++
-    fi
-    # Copy bandplan.json
-    if [ -f "bandplan.json" ]; then
-        cp "bandplan.json" "bandplan.json"
-    fi
+    # icon.png and bandplan.json are found in assets/ at run time (see findResourceFile)
     echo "SUCCESS! Run ./$OUT_FILE"
 fi

@@ -5,7 +5,7 @@
 [![Build](https://github.com/krzysztofchojka/OrbitSDR/actions/workflows/build.yml/badge.svg)](https://github.com/krzysztofchojka/OrbitSDR/actions)
 ![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
 
-![OrbitSDR decoding ISM sensors and AIS while listening to FM broadcast](screenshot.png)
+![OrbitSDR decoding ISM sensors and AIS while listening to FM broadcast](assets/screenshot.png)
 
 OrbitSDR is a C++17 / SFML receiver that stays small and responsive while decoding several digital modes at once. Plug in an SDRplay or an RTL-SDR, enable a decoder, and it tunes its own channel to the right frequency. You can keep listening to something else in the meantime.
 
@@ -112,7 +112,7 @@ Bug reports, recordings of signals that don't decode, and feature requests are v
 
 The map downloads TLEs, transmitter lists and the world map through the OrbitSDR API, a small caching proxy ([`server/orbitsdr-api.php`](server/orbitsdr-api.php)), so [CelesTrak](https://celestrak.org) and the [SatNOGS DB](https://db.satnogs.org) see one polite client instead of every installation. When the proxy does not answer, OrbitSDR asks CelesTrak and SatNOGS directly. Everything is also cached in the settings folder (`tle/`).
 
-The addresses are in [`orbitsdr.ini`](orbitsdr.ini), shipped next to the program. To use your own proxy, put a copy in the settings folder (`%APPDATA%\OrbitSDR` on Windows, `~/.config/orbitsdr` on macOS / Linux). That copy wins:
+The addresses are in [`orbitsdr.ini`](assets/orbitsdr.ini), shipped next to the program. To use your own proxy, put a copy in the settings folder (`%APPDATA%\OrbitSDR` on Windows, `~/.config/orbitsdr` on macOS / Linux). That copy wins:
 
 ```ini
 api_url = https://example.com/orbitsdr/orbitsdr-api.php
@@ -148,7 +148,7 @@ You need SFML **3.0**. If your distribution ships SFML 2.x, build SFML 3 from so
 Install [MSYS2](https://www.msys2.org/), open the **UCRT64** shell in the project folder and run:
 
 ```sh
-./build_mingw_local.sh
+./scripts/build_mingw_local.sh
 ```
 
 The script installs the compiler and librtlsdr with `pacman`, downloads SFML 3.0 for MinGW and builds `orbitsdr.exe` with all DLLs next to it.

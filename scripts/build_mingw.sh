@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Always work from the repository root (this script lives in scripts/)
+cd "$(dirname "$0")/.." || exit 1
+
 # --- CONFIGURATION ---
 SRC_DIR="src"
 OUT_FILE="orbitsdr.exe"
@@ -23,7 +26,7 @@ echo "------------------------------------------"
 . scripts/rtl433.sh
 
 # --- COMPILATION ---
-windres resource.rc -O coff -o resource.res
+windres -I assets assets/resource.rc -O coff -o resource.res
 
 g++ -std=c++17 -O3 \
     -DENABLE_SDRPLAY \
@@ -92,8 +95,6 @@ else
     rm -f rtlsdr_v4.zip
 fi
 
-echo "Copying bandplan.json..."
-cp bandplan.json . 2>/dev/null || echo "WARNING: bandplan.json not found!"
 
 echo "------------------------------------------"
 echo "DONE! The orbitsdr.exe file and libraries are ready."

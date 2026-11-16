@@ -50,8 +50,8 @@ jobs:
       - name: Compile OrbitSDR
         shell: msys2 {0}
         run: |
-          chmod +x build_mingw.sh
-          ./build_mingw.sh
+          chmod +x scripts/build_mingw.sh
+          ./scripts/build_mingw.sh
 
       - name: Determine version
         shell: pwsh
@@ -64,7 +64,7 @@ jobs:
       - name: Create portable zip
         shell: pwsh
         run: |
-          Compress-Archive -Path orbitsdr.exe, *.dll, bandplan.json, orbitsdr.ini -DestinationPath OrbitSDR-windows-x64-portable.zip
+          Compress-Archive -Path orbitsdr.exe, *.dll, assets/bandplan.json, assets/orbitsdr.ini -DestinationPath OrbitSDR-windows-x64-portable.zip
 
       # 5. Installer (Inno Setup)
       - name: Build installer
@@ -74,7 +74,7 @@ jobs:
           if (-not (Test-Path $iscc)) {
             choco install innosetup -y --no-progress
           }
-          & $iscc "/DAppVersion=$env:VERSION" installer\orbitsdr.iss
+          & $iscc "/DAppVersion=$env:VERSION" packaging\orbitsdr.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-ChildItem installer_output
 
@@ -194,9 +194,9 @@ jobs:
         run: |
           mkdir -p OrbitSDR_Linux/libs
           cp orbitsdr OrbitSDR_Linux/OrbitSDR
-          cp icon.png OrbitSDR_Linux/ || true
-          cp bandplan.json OrbitSDR_Linux/ || true
-          cp orbitsdr.ini OrbitSDR_Linux/ || true
+          cp assets/icon.png OrbitSDR_Linux/ || true
+          cp assets/bandplan.json OrbitSDR_Linux/ || true
+          cp assets/orbitsdr.ini OrbitSDR_Linux/ || true
           cp LICENSE OrbitSDR_Linux/ || true
 
           # Copy real files (-L) so symlinks do not disappear in archives
@@ -282,24 +282,24 @@ jobs:
 
           # 2. Copy Binary & resources
           cp orbitsdr OrbitSDR.app/Contents/MacOS/OrbitSDR
-          cp bandplan.json OrbitSDR.app/Contents/Resources/ || true
-          cp orbitsdr.ini OrbitSDR.app/Contents/Resources/ || true
-          cp icon.png OrbitSDR.app/Contents/Resources/ || true
+          cp assets/bandplan.json OrbitSDR.app/Contents/Resources/ || true
+          cp assets/orbitsdr.ini OrbitSDR.app/Contents/Resources/ || true
+          cp assets/icon.png OrbitSDR.app/Contents/Resources/ || true
 
           # --- ICON GENERATION START ---
           # macOS requires an .icns file, which contains the icon in multiple resolutions.
           # We use 'sips' to resize your icon.png and 'iconutil' to bundle them.
           mkdir OrbitSDR.iconset
-          sips -z 16 16     icon.png --out OrbitSDR.iconset/icon_16x16.png
-          sips -z 32 32     icon.png --out OrbitSDR.iconset/icon_16x16@2x.png
-          sips -z 32 32     icon.png --out OrbitSDR.iconset/icon_32x32.png
-          sips -z 64 64     icon.png --out OrbitSDR.iconset/icon_32x32@2x.png
-          sips -z 128 128   icon.png --out OrbitSDR.iconset/icon_128x128.png
-          sips -z 256 256   icon.png --out OrbitSDR.iconset/icon_128x128@2x.png
-          sips -z 256 256   icon.png --out OrbitSDR.iconset/icon_256x256.png
-          sips -z 512 512   icon.png --out OrbitSDR.iconset/icon_256x256@2x.png
-          sips -z 512 512   icon.png --out OrbitSDR.iconset/icon_512x512.png
-          sips -z 1024 1024 icon.png --out OrbitSDR.iconset/icon_512x512@2x.png
+          sips -z 16 16     assets/icon.png --out OrbitSDR.iconset/icon_16x16.png
+          sips -z 32 32     assets/icon.png --out OrbitSDR.iconset/icon_16x16@2x.png
+          sips -z 32 32     assets/icon.png --out OrbitSDR.iconset/icon_32x32.png
+          sips -z 64 64     assets/icon.png --out OrbitSDR.iconset/icon_32x32@2x.png
+          sips -z 128 128   assets/icon.png --out OrbitSDR.iconset/icon_128x128.png
+          sips -z 256 256   assets/icon.png --out OrbitSDR.iconset/icon_128x128@2x.png
+          sips -z 256 256   assets/icon.png --out OrbitSDR.iconset/icon_256x256.png
+          sips -z 512 512   assets/icon.png --out OrbitSDR.iconset/icon_256x256@2x.png
+          sips -z 512 512   assets/icon.png --out OrbitSDR.iconset/icon_512x512.png
+          sips -z 1024 1024 assets/icon.png --out OrbitSDR.iconset/icon_512x512@2x.png
 
           # Convert the folder into a .icns file
           iconutil -c icns OrbitSDR.iconset

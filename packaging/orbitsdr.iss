@@ -1,7 +1,7 @@
 ; Inno Setup script for OrbitSDR (Windows x64)
-; Build from the repository root after build_mingw.sh has produced orbitsdr.exe and the DLLs:
-;   ISCC.exe /DAppVersion=1.0.0 installer\orbitsdr.iss
-; All paths below are relative to THIS file (installer\), hence the "..\".
+; Build from the repository root after scripts/build_mingw.sh has produced orbitsdr.exe and the DLLs:
+;   ISCC.exe /DAppVersion=1.0.0 packaging\orbitsdr.iss
+; All paths below are relative to THIS file (packaging\), hence the "..\".
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -19,7 +19,7 @@ DefaultDirName={autopf}\OrbitSDR
 DefaultGroupName=OrbitSDR
 DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\orbitsdr.exe
-SetupIconFile=..\icon.ico
+SetupIconFile=..\assets\icon.ico
 LicenseFile=..\LICENSE
 OutputDir=..\installer_output
 OutputBaseFilename=OrbitSDR-Setup-{#AppVersion}-x64
@@ -41,9 +41,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "..\orbitsdr.exe";    DestDir: "{app}"; Flags: ignoreversion
 Source: "..\*.dll";           DestDir: "{app}"; Flags: ignoreversion
-Source: "..\bandplan.json";   DestDir: "{app}"; Flags: ignoreversion
-Source: "..\orbitsdr.ini";    DestDir: "{app}"; Flags: ignoreversion
-Source: "..\icon.png";        DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\assets\bandplan.json"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\assets\orbitsdr.ini"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\assets\icon.png"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{group}\OrbitSDR";           Filename: "{app}\orbitsdr.exe"; WorkingDir: "{app}"

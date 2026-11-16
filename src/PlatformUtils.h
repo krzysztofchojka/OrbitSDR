@@ -86,7 +86,7 @@ inline bool fileExistsReadable(const std::string& path) {
 // Looks for a resource file (bandplan.json, icon.png...) in all the places where it can live:
 //  - next to the executable                       (Windows / Linux / dev builds)
 //  - ../Resources relative to the executable      (macOS .app bundle)
-//  - current working directory                    (running from the repo folder)
+//  - current working directory or ./assets        (running from the repo folder)
 // Returns an empty string when nothing was found.
 inline std::string findResourceFile(const std::string& name) {
     std::string exeDir = getExecutableDir();
@@ -94,6 +94,8 @@ inline std::string findResourceFile(const std::string& name) {
         exeDir + "/" + name,
         exeDir + "/../Resources/" + name,
         "./" + name,
+        "./assets/" + name,                 // running from the repo folder
+        exeDir + "/../assets/" + name,      // binary in build/ (local Windows build)
         "../Resources/" + name
     };
     for (const auto& c : candidates) {

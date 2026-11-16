@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Always work from the repository root (this script lives in scripts/)
+cd "$(dirname "$0")/.." || exit 1
+
 echo "------------------------------------------"
 echo "Local OrbitSDR Compilation (MinGW64 / MSYS2 UCRT64)"
 echo "------------------------------------------"
@@ -46,7 +49,7 @@ echo "------------------------------------------"
 echo "Compiling OrbitSDR into /$BUILD_DIR folder..."
 echo "------------------------------------------"
 # Icon + version information (an exe without them looks anonymous to antivirus heuristics)
-windres resource.rc -O coff -o "$BUILD_DIR/resource.res" || exit 1
+windres -I assets assets/resource.rc -O coff -o "$BUILD_DIR/resource.res" || exit 1
 
 g++ -std=c++17 -O3 \
     -DENABLE_SDRPLAY \
@@ -93,10 +96,10 @@ done
 
 # Satellite map configuration (proxy / map URL), read next to the exe
 echo "Copying orbitsdr.ini to build folder..."
-cp orbitsdr.ini "$BUILD_DIR/" 2>/dev/null || echo "WARNING: orbitsdr.ini not found!"
+cp assets/orbitsdr.ini "$BUILD_DIR/" 2>/dev/null || echo "WARNING: orbitsdr.ini not found!"
 
 echo "Copying bandplan.json to build folder..."
-cp bandplan.json "$BUILD_DIR/" 2>/dev/null || echo "WARNING: bandplan.json not found!"
+cp assets/bandplan.json "$BUILD_DIR/" 2>/dev/null || echo "WARNING: bandplan.json not found!"
 
 # 6. OVERRIDE: Download latest RTL-SDR drivers for V4 support
 echo "------------------------------------------"

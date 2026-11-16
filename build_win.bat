@@ -21,4 +21,4 @@ echo.
 :: -here     : use the folder containing this .bat as the working directory
 :: -c        : run the given command in bash and wait for a key press at the end
 
-"%MSYS2_DIR%\msys2_shell.cmd" -ucrt64 -defterm -no-start -here -c "./build_mingw_local.sh; echo ''; read -n 1 -s -r -p 'Build finished. Press any key to close...'"
+"%MSYS2_DIR%\msys2_shell.cmd" -ucrt64 -defterm -no-start -here -c "./scripts/build_mingw_local.sh; echo ''; read -n 1 -s -r -p 'Build finished. Press any key to close...'"
