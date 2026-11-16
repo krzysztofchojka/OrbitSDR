@@ -56,15 +56,17 @@ jobs:
       - name: Determine version
         shell: pwsh
         run: |
-          $ver = "0.0.0-dev"
-          if ("${{ github.ref_type }}" -eq "tag") { $ver = "${{ github.ref_name }}".TrimStart("v") }
-          "VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $ver = "0.0.0-dev"; $tag = "dev"
+          if ("${{ github.ref_type }}" -eq "tag") { $tag = "${{ github.ref_name }}"; $ver = $tag.TrimStart("v") }
+          "VERSION=$ver"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # File names: OrbitSDR_<tag>_<os>_<arch>[_variant].<ext>
+          "FILE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # 4. Portable zip
       - name: Create portable zip
         shell: pwsh
         run: |
-          Compress-Archive -Path orbitsdr.exe, *.dll, assets/bandplan.json, assets/orbitsdr.ini -DestinationPath OrbitSDR-windows-x64-portable.zip
+          Compress-Archive -Path orbitsdr.exe, *.dll, assets/bandplan.json, assets/orbitsdr.ini -DestinationPath "OrbitSDR_${env:FILE_TAG}_windows_x64_portable.zip"
 
       # 5. Installer (Inno Setup)
       - name: Build installer
@@ -74,7 +76,7 @@ jobs:
           if (-not (Test-Path $iscc)) {
             choco install innosetup -y --no-progress
           }
-          & $iscc "/DAppVersion=$env:VERSION" packaging\orbitsdr.iss
+          & $iscc "/DAppVersion=$env:VERSION" "/DFileTag=$env:FILE_TAG" packaging\orbitsdr.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-ChildItem installer_output
 
@@ -83,8 +85,8 @@ jobs:
         with:
           name: OrbitSDR-windows-x64
           path: |
-            OrbitSDR-windows-x64-portable.zip
-            installer_output/OrbitSDR-Setup-*.exe
+            OrbitSDR_*_windows_x64_portable.zip
+            installer_output/OrbitSDR_*_windows_x64_setup.exe
 
   # --------------------------------------------------------
   # LINUX: amd64 + arm64  (portable tar.gz + .deb)
@@ -184,11 +186,12 @@ jobs:
       - name: Determine version
         run: |
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
+            VERSION="${GITHUB_REF_NAME#v}"; FILE_TAG="$GITHUB_REF_NAME"
           else
-            VERSION="0.0.0+git$(git rev-parse --short HEAD)"
+            VERSION="0.0.0+git$(git rev-parse --short HEAD)"; FILE_TAG="dev"
           fi
           echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "FILE_TAG=$FILE_TAG" >> $GITHUB_ENV
 
       - name: Create Bundle
         run: |
@@ -215,20 +218,20 @@ jobs:
 
       - name: Create portable tar.gz
         run: |
-          tar -czf OrbitSDR-linux-${{ matrix.arch }}.tar.gz OrbitSDR_Linux
+          tar -czf "OrbitSDR_${FILE_TAG}_linux_${{ matrix.arch }}.tar.gz" OrbitSDR_Linux
 
       - name: Create .deb package
         run: |
           chmod +x packaging/build_deb.sh
-          ./packaging/build_deb.sh OrbitSDR_Linux "${{ matrix.arch }}" "$VERSION" "orbitsdr_${VERSION}_${{ matrix.arch }}.deb"
+          ./packaging/build_deb.sh OrbitSDR_Linux "${{ matrix.arch }}" "$VERSION" "OrbitSDR_${FILE_TAG}_linux_${{ matrix.arch }}.deb"
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
         with:
           name: OrbitSDR-linux-${{ matrix.arch }}
           path: |
-            OrbitSDR-linux-${{ matrix.arch }}.tar.gz
-            orbitsdr_*.deb
+            OrbitSDR_*_linux_${{ matrix.arch }}.tar.gz
+            OrbitSDR_*_linux_${{ matrix.arch }}.deb
 
   # --------------------------------------------------------
   # MACOS (works on macOS 15 Sequoia AND macOS 26 Tahoe) - unchanged
@@ -267,11 +270,12 @@ jobs:
       - name: Determine version
         run: |
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
+            VERSION="${GITHUB_REF_NAME#v}"; FILE_TAG="$GITHUB_REF_NAME"
           else
-            VERSION="0.0.0"
+            VERSION="0.0.0"; FILE_TAG="dev"
           fi
           echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "FILE_TAG=$FILE_TAG" >> $GITHUB_ENV
 
       - name: Create .App Bundle with Icon
         run: |
@@ -364,12 +368,12 @@ jobs:
 
       - name: Zip and Upload
         run: |
-          ditto -c -k --keepParent OrbitSDR.app OrbitSDR-macOS.zip
+          ditto -c -k --keepParent OrbitSDR.app "OrbitSDR_${FILE_TAG}_macOS_arm64.zip"
 
       - uses: actions/upload-artifact@v4
         with:
           name: OrbitSDR-macOS
-          path: OrbitSDR-macOS.zip
+          path: OrbitSDR_*_macOS_arm64.zip
 
   # --------------------------------------------------------
   # RELEASE: runs only when you push a tag like v1.0.0
@@ -395,3 +399,4 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

@@ -6,6 +6,10 @@
 #ifndef AppVersion
   #define AppVersion "0.0.0"
 #endif
+; Tag used in the output file name (e.g. v0.2.0-beta.1)
+#ifndef FileTag
+  #define FileTag "dev"
+#endif
 
 [Setup]
 ; Keep this GUID constant forever: it lets new versions upgrade old installs in place.
@@ -22,7 +26,7 @@ UninstallDisplayIcon={app}\orbitsdr.exe
 SetupIconFile=..\assets\icon.ico
 LicenseFile=..\LICENSE
 OutputDir=..\installer_output
-OutputBaseFilename=OrbitSDR-Setup-{#AppVersion}-x64
+OutputBaseFilename=OrbitSDR_{#FileTag}_windows_x64_setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

@@ -20,10 +20,10 @@ Get the latest build from the **[Releases page](https://github.com/krzysztofchoj
 
 | Platform | File | Notes |
 |---|---|---|
-| **macOS 15+ (Apple Silicon)** | `OrbitSDR-macOS.zip` | Primary platform. See [first launch on macOS](#first-launch-on-macos). |
-| **Windows 10/11 x64** | `OrbitSDR-Setup-x.y.z-x64.exe` or `-portable.zip` | Installer or portable zip. |
-| **Linux x64** | `orbitsdr_x.y.z_amd64.deb` or `.tar.gz` | Ubuntu 24.04 and newer (and other distributions with glibc 2.39+). |
-| **Linux ARM64** | `orbitsdr_x.y.z_arm64.deb` or `.tar.gz` | Raspberry Pi 4/5 (64-bit Raspberry Pi OS Bookworm), other ARM boards. |
+| **macOS 15+ (Apple Silicon)** | `OrbitSDR_vX.Y.Z_macOS_arm64.zip` | Primary platform. See [first launch on macOS](#first-launch-on-macos). |
+| **Windows 10/11 x64** | `OrbitSDR_vX.Y.Z_windows_x64_setup.exe` or `_portable.zip` | Installer or portable zip. |
+| **Linux x64** | `OrbitSDR_vX.Y.Z_linux_amd64.deb` or `.tar.gz` | Ubuntu 24.04 and newer (and other distributions with glibc 2.39+). |
+| **Linux ARM64** | `OrbitSDR_vX.Y.Z_linux_arm64.deb` or `.tar.gz` | Raspberry Pi 4/5 (64-bit Raspberry Pi OS Bookworm), other ARM boards. |
 
 Development builds of every commit are in the [Actions](https://github.com/krzysztofchojka/OrbitSDR/actions) tab (you need a GitHub account to download them).
 
@@ -31,7 +31,7 @@ Development builds of every commit are in the [Actions](https://github.com/krzys
 
 The app is not notarized by Apple, so macOS blocks it the first time. You only have to allow it once:
 
-1. Unzip `OrbitSDR-macOS.zip`, move `OrbitSDR.app` to **Applications** and open it.
+1. Unzip `OrbitSDR_vX.Y.Z_macOS_arm64.zip`, move `OrbitSDR.app` to **Applications** and open it.
 2. macOS shows *"OrbitSDR" Not Opened*. Click **Done**.
 3. Open **System Settings → Privacy & Security** and scroll down to the **Security** section.
 4. Next to *"OrbitSDR" was blocked to protect your Mac*, click **Open Anyway** and confirm with your password or Touch ID.
