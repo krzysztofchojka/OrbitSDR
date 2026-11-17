@@ -1,6 +1,8 @@
 #pragma once
 #include <atomic>
 #include <thread>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
 #include "Globals.h"
 #include "AudioSink.h"
@@ -15,6 +17,79 @@
 #include "WavWriter.h"
 #include "Settings.h"
 #include "Utils.h"
+#include "orbit/RecordingTime.h"
+
+// =====================================================================
+//  The decoders run in their own thread: the DSP thread hands every
+//  block of I/Q (and the demodulated audio) over and goes on with the
+//  waterfall and the speaker. On a slow computer the decoders then skip
+//  blocks instead of making the audio stutter (counted in decoderDrops).
+// =====================================================================
+class DecoderRunner {
+public:
+    struct Job {
+        std::vector<Complex> iq;
+        std::vector<float> mono;      // demodulated audio (48 kHz mono)
+        double sr = 0, offset = 0, bw = 0, t = 0;
+        long long centerHz = 0;
+        bool reliable = true, audioIn = false, reset = false;
+    };
+
+    explicit DecoderRunner(SharedData& s) : shared(s), th([this] { run(); }) {}
+    ~DecoderRunner() {
+        { std::lock_guard<std::mutex> l(m); stop = true; }
+        cv.notify_all();
+        if (th.joinable()) th.join();
+    }
+
+    void push(Job&& j) {
+        {
+            std::lock_guard<std::mutex> l(m);
+            if (q.size() >= MAX_QUEUE) {   // the decoders are behind: drop the oldest block
+                const bool reset = q.front().reset;
+                q.pop_front();
+                if (reset && !q.empty()) q.front().reset = true;
+                shared.decoderDrops++;
+            }
+            q.push_back(std::move(j));
+        }
+        cv.notify_one();
+    }
+
+private:
+    static constexpr size_t MAX_QUEUE = 10;   // ~0.5 s of blocks
+    SharedData& shared;
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<Job> q;
+    bool stop = false;
+    std::thread th;   // last: starts after the members above exist
+
+    void run() {
+        for (;;) {
+            Job j;
+            {
+                std::unique_lock<std::mutex> l(m);
+                cv.wait(l, [this] { return stop || !q.empty(); });
+                if (stop) return;
+                j = std::move(q.front());
+                q.pop_front();
+            }
+            std::vector<SDRModule*> mods;
+            { std::lock_guard<std::mutex> l(shared.mtx); mods = shared.activeDecoders; }
+            for (SDRModule* mod : mods) {
+                if (!mod || !mod->enabled) continue;
+                if (j.reset) mod->reset();
+                mod->setAudioInput(j.audioIn);
+                mod->setStreamTime(j.t, j.reliable);
+                mod->setRadioFrequency(j.centerHz);
+                mod->setTunerBandwidth(j.bw);
+                mod->processIQ(j.iq, j.sr, j.offset);
+                if (!j.mono.empty()) mod->processAudio(j.mono);
+            }
+        }
+    }
+};
 
 inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio) {
     #ifdef _WIN32
@@ -65,6 +140,31 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
     sf::Clock waterfallTimer;
 
     int squelchHold = 0;
+    DecoderRunner decoders(shared);   // the decoders' thread (stops when dspWorker returns)
+    bool decodersReset = false;
+
+    // Stream time for the slot based decoders (see SDRModule::setStreamTime)
+    std::string streamTimePath;
+    double streamTimeStart = 0.0;
+    bool streamTimeReliable = true;
+    auto streamTimeOf = [&](IQSource* s, int samples, double rate, bool& reliable) -> double {
+        const std::string path = s->getFilePath();
+        const double blockSec = rate > 0 ? samples / rate : 0.0;
+        if (path.empty()) {
+            reliable = true;
+            const double now = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+            return now - blockSec;
+        }
+        const double dur = s->getDurationSec();
+        if (path != streamTimePath) {
+            streamTimePath = path;
+            const orbit::RecordingStart rs = orbit::recordingStart(path, dur);
+            streamTimeStart = rs.unix;
+            streamTimeReliable = rs.unix > 0 && !rs.guess;
+        }
+        reliable = streamTimeReliable;
+        return streamTimeStart + s->getProgress() * dur - blockSec;
+    };
 
     while (running) {
         std::shared_ptr<IQSource> src = nullptr;
@@ -95,7 +195,8 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
         int themeID = 0;
         float currentZoom = 1.0f;
         double viewCenter = 0.5;
-        SDRModule* activeModule = nullptr;
+        bool anyDecoder = false;
+        bool burstAgc = false;
         bool audioIn = false;
 
         {
@@ -123,7 +224,8 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
             themeID = shared.waterfallTheme;
             currentZoom = shared.zoomLevel;
             viewCenter = shared.viewCenterPct;
-            activeModule = shared.activeDecoder;
+            for (SDRModule* m : shared.activeDecoders)
+                if (m && m->enabled) { anyDecoder = true; burstAgc = burstAgc || m->wantsBurstAgc(); }
             audioIn = shared.audioInput;
         }
 
@@ -199,7 +301,6 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
         // only RAW makes sense (any other demodulator would turn the audio into noise)
         const bool audioSource = audioIn;
         if (audioSource) mode = Mode::RAW;
-        if (activeModule) activeModule->setAudioInput(audioSource);
 
         // RDS runs only in WFM mode. Its data belongs to one station, so it is
         // cleared whenever the receiver moves to a different frequency.
@@ -218,17 +319,12 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
         rdsWasActive = rdsActive;
 
         // Burst decoders (ISM) need a gain that stays put during a packet
-        src->setBurstAgc(activeModule && activeModule->enabled && activeModule->wantsBurstAgc());
+        src->setBurstAgc(burstAgc);
 
         int readCount = src->read(iqBuffer.data(), chunkSize);
         if (src->didLoop()) {
             demod.clear();
-            SDRModule* activeMod = nullptr;
-            {
-                std::lock_guard<std::mutex> l(shared.mtx);
-                activeMod = shared.activeDecoder;
-            }
-            if (activeMod) activeMod->reset();
+            decodersReset = true;   // the decoders start again with the next block
         }
 
         if (readCount > 0) {
@@ -252,10 +348,18 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
             inspector.process(chunkToProcess, sr, freqOffset, bw, shared);
 
             if (play) {
-                if (activeModule && activeModule->enabled) {
-                    activeModule->setRadioFrequency(centerHz);
-                    activeModule->setTunerBandwidth(bw);
-                    activeModule->processIQ(chunkToProcess, sr, freqOffset);
+                // the decoders' block (their thread takes it after the demodulated audio is added below)
+                DecoderRunner::Job decJob;
+                if (anyDecoder) {
+                    decJob.t = streamTimeOf(src.get(), readCount, sr, decJob.reliable);
+                    decJob.iq = chunkToProcess;
+                    decJob.sr = sr;
+                    decJob.offset = freqOffset;
+                    decJob.bw = bw;
+                    decJob.centerHz = centerHz;
+                    decJob.audioIn = audioSource;
+                    decJob.reset = decodersReset;
+                    decodersReset = false;
                 }
                 auto audioData = demod.process(chunkToProcess, freqOffset, bw, mode, stereo);
                 if (rdsActive && !demod.mpxTap.empty()) rdsDecoder.process(demod.mpxTap.data(), demod.mpxTap.size());
@@ -296,11 +400,10 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                     if (!mono.empty()) aprsDecoder.process(mono);
                 }
 
-                if (activeModule && activeModule->enabled) {
-                    std::vector<float> mono;
-                    mono.reserve(audioData.size()/2);
-                    for(size_t i=0; i<audioData.size(); i+=2) mono.push_back(audioData[i]);
-                    activeModule->processAudio(mono);
+                if (anyDecoder) {
+                    decJob.mono.reserve(audioData.size() / 2);
+                    for (size_t i = 0; i < audioData.size(); i += 2) decJob.mono.push_back(audioData[i]);
+                    decoders.push(std::move(decJob));
                 }
 
                 static float squelchEnv = 1.0f;
@@ -321,7 +424,9 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                 // Similar loudness for all modes (speaker only, the decoders above got the raw audio)
                 leveler.process(audioData);
 
-                float finalVol = muted ? 0.0f : vol;
+                bool scanMuted = false;
+                { std::lock_guard<std::mutex> l(shared.mtx); scanMuted = shared.scanMute; }
+                float finalVol = (muted || scanMuted) ? 0.0f : vol;
                 for (auto& s : audioData) {
                     if (std::isnan(s) || std::isinf(s)) s = 0.0f;
                     else s = std::clamp(s * finalVol, -1.0f, 1.0f);
@@ -373,6 +478,28 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                     tempRow[px + 3] = 255;
                 }
 
+                // Tuner band level for the scanner (full FFT, so it works at any zoom)
+                float tunerSnr = 0.0f, tunerPeak = -150.0f;
+                {
+                    static std::vector<float> mags(FFT_SIZE);
+                    for (int i = 0; i < FFT_SIZE; i++) {
+                        const int sh = (i + FFT_SIZE / 2) % FFT_SIZE;   // index 0 = lowest frequency
+                        mags[i] = 20.0f * std::log10(std::abs(fftData[sh]) / FFT_SIZE + 1e-12f);
+                    }
+                    double lo = -bw / 2.0, hi = bw / 2.0;
+                    if (mode == Mode::USB) { lo = 0.0; hi = bw; }
+                    else if (mode == Mode::LSB) { lo = -bw; hi = 0.0; }
+                    const double binHz = sr / FFT_SIZE;
+                    const int c = (int)(targetFreqPct * FFT_SIZE);
+                    const int b0 = std::clamp(c + (int)std::floor(lo / binHz), 0, FFT_SIZE - 1);
+                    const int b1 = std::clamp(c + (int)std::ceil(hi / binHz), b0, FFT_SIZE - 1);
+                    for (int b = b0; b <= b1; b++) tunerPeak = std::max(tunerPeak, mags[b]);
+                    static std::vector<float> sorted(FFT_SIZE);
+                    sorted = mags;
+                    std::nth_element(sorted.begin(), sorted.begin() + FFT_SIZE / 5, sorted.end());
+                    tunerSnr = std::max(0.0f, tunerPeak - sorted[FFT_SIZE / 5]);
+                }
+
                 int tunerBin = std::clamp((int)(targetFreqPct * FFT_SIZE), 0, FFT_SIZE - 1);
                 int shiftedTuner = (tunerBin + FFT_SIZE / 2) % FFT_SIZE;
                 float tMag = std::abs(fftData[shiftedTuner]) / FFT_SIZE;
@@ -387,6 +514,9 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                         shared.waterfallRow = tempRow;
                         shared.newWaterfallData = true;
                         shared.rds = rdsActive ? rdsDecoder.getInfo() : RdsInfo();
+                        shared.tunerSnrDb = tunerSnr;
+                        shared.tunerPeakDb = tunerPeak;
+                        shared.tunerLevelSeq++;
                         waterfallTimer.restart();
                     }
                 }

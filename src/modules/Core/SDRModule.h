@@ -36,6 +36,11 @@ public:
     virtual void setAudioInput(bool /*audio*/) {}
     // Bandwidth of the main tuner (Hz); decoder channels that follow the tuner may use it
     virtual void setTunerBandwidth(double /*hz*/) {}
+    // Time (unix UTC seconds) of the first sample of the next processIQ()/processAudio() block:
+    // the wall clock for a radio, the recording's time for a file. Slot based modes (FT8, WSPR)
+    // use it to find the slot boundaries. reliable = false: a recording whose start time is only
+    // guessed (from the file date), the decoder then has to find the slot boundaries itself.
+    virtual void setStreamTime(double /*unixUtc*/, bool /*reliable*/) {}
 
     // The channels this decoder listens to (yellow bands + handles on the tuning bar).
     // nullptr for decoders without channels. Not shown while the input is audio.

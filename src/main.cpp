@@ -24,6 +24,7 @@
 #include "APRS_Decoder.h"
 #include "Settings.h"
 #include "PlatformUtils.h"
+#include "Bookmarks.h"
 
 // Extracted Modules
 #include "Globals.h"
@@ -40,6 +41,9 @@
 #include "modules/ISM/ISM_Decoder.h"
 #include "modules/ACARS/ACARS_Decoder.h"
 #include "modules/ADSB/ADSB_Decoder.h"
+#include "modules/WSJT/WSJT_Decoder.h"
+#include "modules/VDL2/VDL2_Decoder.h"
+#include "modules/CW/CW_Decoder.h"
 
 // Satellite map and tracking
 #include "orbit/MapWindow.h"
@@ -184,6 +188,23 @@ int main() {
     adsbMod->init(ctx);
     ADSBDecoder* ptrADSB = adsbMod.get();
     modules.push_back(std::move(adsbMod));
+    auto wsjtMod = std::make_unique<WSJTDecoder>();
+    wsjtMod->init(ctx);
+    wsjtMod->log.setPath(getConfigFilePath("wsjt.log"));
+    wsjtMod->exportDir = getDefaultExportPath();
+    WSJTDecoder* ptrWSJT = wsjtMod.get();
+    modules.push_back(std::move(wsjtMod));
+    auto vdl2Mod = std::make_unique<VDL2Decoder>();
+    vdl2Mod->init(ctx);
+    vdl2Mod->log.setPath(getConfigFilePath("vdl2.log"));
+    vdl2Mod->exportDir = getDefaultExportPath();
+    VDL2Decoder* ptrVDL2 = vdl2Mod.get();
+    modules.push_back(std::move(vdl2Mod));
+    auto cwMod = std::make_unique<CWDecoder>();
+    cwMod->init(ctx);
+    cwMod->log.setPath(getConfigFilePath("cw.log"));
+    CWDecoder* ptrCW = cwMod.get();
+    modules.push_back(std::move(cwMod));
 
     auto cursorArrow = sf::Cursor::createFromSystem(sf::Cursor::Type::Arrow);
     auto cursorHand = sf::Cursor::createFromSystem(sf::Cursor::Type::Hand);
@@ -246,16 +267,18 @@ int main() {
     auto chkAIS = std::make_shared<Checkbox>("AIS (ships, 161.975 / 162.025)", font);
 
     auto btnNFM = std::make_shared<SdrButton>(36, 25, "NFM", font);
-    auto btnAM  = std::make_shared<SdrButton>(36, 25, "AM", font);
-    auto btnWFM = std::make_shared<SdrButton>(36, 25, "WFM", font);
-    auto btnUSB = std::make_shared<SdrButton>(36, 25, "USB", font);
-    auto btnLSB = std::make_shared<SdrButton>(36, 25, "LSB", font);
-    auto btnRAW = std::make_shared<SdrButton>(42, 25, "RAW", font);
-    auto btnOFF = std::make_shared<SdrButton>(36, 25, "OFF", font);
+    auto btnAM  = std::make_shared<SdrButton>(30, 25, "AM", font);
+    auto btnWFM = std::make_shared<SdrButton>(38, 25, "WFM", font);
+    auto btnUSB = std::make_shared<SdrButton>(34, 25, "USB", font);
+    auto btnLSB = std::make_shared<SdrButton>(34, 25, "LSB", font);
+    auto btnCW  = std::make_shared<SdrButton>(30, 25, "CW", font);
+    auto btnRAW = std::make_shared<SdrButton>(36, 25, "RAW", font);
+    auto btnOFF = std::make_shared<SdrButton>(32, 25, "OFF", font);
 
     auto rowModes = std::make_shared<RowContainer>();
+    rowModes->spacing = 3.0f;
     rowModes->add(btnNFM); rowModes->add(btnAM); rowModes->add(btnWFM);
-    rowModes->add(btnUSB); rowModes->add(btnLSB); rowModes->add(btnRAW); rowModes->add(btnOFF);
+    rowModes->add(btnUSB); rowModes->add(btnLSB); rowModes->add(btnCW); rowModes->add(btnRAW); rowModes->add(btnOFF);
 
     auto slBW = std::make_shared<Slider>(SIDEBAR_W - 40, 1000.0f, 200000.0f, 12500.0f, "Bandwidth (Hz)", font);
 
@@ -440,12 +463,7 @@ int main() {
             ddRate->setOptions({fileName, "[ Change File... ]"});
             ddRate->setSelection(0);
 
-            long long f = 0;
-            std::regex freqRegex(R"(_(\d+)Hz_)");
-            std::smatch match;
-            if (std::regex_search(path, match, freqRegex)) {
-                try { f = std::stoll(match[1]); } catch(...) {}
-            }
+            const long long f = orbit::frequencyFromName(path);   // SDR++, SDRuno, HDSDR, OrbitSDR ...
             currentCenterFreq = f;
             freqVFO.setFrequency(f);
             { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.centerFreq = f; }
@@ -801,8 +819,11 @@ int main() {
     slBW->onChange = [&](float v) {
         std::lock_guard<std::mutex> l(sharedData.mtx);
         sharedData.bandwidth = v;
-        std::string txt = "Bandwidth: " + (v >= 1000 ? std::to_string((int)(v/1000)) + " kHz" : std::to_string((int)v) + " Hz");
-        slBW->setText(txt);
+        char b[48];
+        if (v >= 10000) std::snprintf(b, sizeof(b), "Bandwidth: %.0f kHz", v / 1000.0f);
+        else if (v >= 1000) std::snprintf(b, sizeof(b), "Bandwidth: %.1f kHz", v / 1000.0f);
+        else std::snprintf(b, sizeof(b), "Bandwidth: %.0f Hz", v);
+        slBW->setText(b);
     };
     slBW->onChange(12500.0f);
     modDemod->addWidget(slBW);
@@ -825,11 +846,11 @@ int main() {
 
         rowModes->setEnabled(true);
         btnNFM->setActive(false); btnAM->setActive(false); btnWFM->setActive(false);
-        btnUSB->setActive(false); btnLSB->setActive(false); btnRAW->setActive(false); btnOFF->setActive(false);
+        btnUSB->setActive(false); btnLSB->setActive(false); btnCW->setActive(false); btnRAW->setActive(false); btnOFF->setActive(false);
         me->setActive(true);
         if (inputIsAudio) {   // audio input: the other demodulators make no sense
             btnNFM->setEnabled(false); btnAM->setEnabled(false); btnWFM->setEnabled(false);
-            btnUSB->setEnabled(false); btnLSB->setEnabled(false);
+            btnUSB->setEnabled(false); btnLSB->setEnabled(false); btnCW->setEnabled(false);
         }
 
         std::lock_guard<std::mutex> l(sharedData.mtx);
@@ -844,6 +865,9 @@ int main() {
         } else if (m == Mode::NFM || m == Mode::AM) {
             slBW->setLimits(4000, 40000); slBW->setValueSilent(12500);
             sharedData.bandwidth = 12500; slBW->setText("Bandwidth: 12.5 kHz");
+        } else if (m == Mode::CW) {
+            slBW->setLimits(50, 3000); slBW->setValueSilent(500);
+            sharedData.bandwidth = 500; slBW->setText("Bandwidth: 500 Hz");
         } else if (m == Mode::OFF) {
         } else {
             slBW->setLimits(1000, 10000); slBW->setValueSilent(3000);
@@ -856,6 +880,7 @@ int main() {
     btnWFM->onClick = [&](){ setMode(Mode::WFM, btnWFM.get()); };
     btnUSB->onClick = [&](){ setMode(Mode::USB, btnUSB.get()); };
     btnLSB->onClick = [&](){ setMode(Mode::LSB, btnLSB.get()); };
+    btnCW->onClick  = [&](){ setMode(Mode::CW, btnCW.get()); };
     btnRAW->onClick = [&](){ setMode(Mode::RAW, btnRAW.get()); };
     btnOFF->onClick = [&](){ setMode(Mode::OFF, btnOFF.get()); };
 
@@ -866,8 +891,145 @@ int main() {
         else if (m == Mode::RAW) setMode(Mode::RAW, btnRAW.get());
         else if (m == Mode::USB) setMode(Mode::USB, btnUSB.get());
         else if (m == Mode::LSB) setMode(Mode::LSB, btnLSB.get());
+        else if (m == Mode::CW) setMode(Mode::CW, btnCW.get());
         else setMode(Mode::OFF, btnOFF.get());
     };
+
+    // --- Bookmarks and the scanner (see Bookmarks.h) ---
+    BookmarkStore bookmarks;
+    bookmarks.load(getConfigFilePath("bookmarks.json"));
+    Scanner scanner;
+    int pendingBookmarkTune = -1;   // applied in the main loop (the tuning helpers live there)
+    sf::Clock scanClock;
+    unsigned long long lastLevelSeq = 0;
+    auto modBook = sidebar.addModule("Bookmarks / Scanner");
+    auto ddBank = std::make_shared<Dropdown>(SIDEBAR_W - 40, 25.0f, font);
+    auto btnBankNew = std::make_shared<SdrButton>(128, 25, "New bank", font);
+    auto btnBankDel = std::make_shared<SdrButton>(128, 25, "Delete bank", font);
+    auto rowBank = std::make_shared<RowContainer>();
+    rowBank->add(btnBankNew); rowBank->add(btnBankDel);
+    auto txtBookName = std::make_shared<TextInput>(SIDEBAR_W - 40, 25.0f, font);
+    auto btnBookAdd = std::make_shared<SdrButton>(128, 25, "Add current", font);
+    auto btnBookSave = std::make_shared<SdrButton>(128, 25, "Update selected", font);
+    auto rowBook = std::make_shared<RowContainer>();
+    rowBook->add(btnBookAdd); rowBook->add(btnBookSave);
+    auto bookList = std::make_shared<BookmarkList>(SIDEBAR_W - 44, font);
+    bookList->store = &bookmarks;
+    auto btnScan = std::make_shared<SdrButton>(128, 25, "Scan", font);
+    auto btnScanSkip = std::make_shared<SdrButton>(128, 25, "Skip >", font);
+    auto rowScan = std::make_shared<RowContainer>();
+    rowScan->add(btnScan); rowScan->add(btnScanSkip);
+    auto slScanThr = std::make_shared<Slider>(SIDEBAR_W - 40, 3.0f, 40.0f, 12.0f, "Stop at SNR >= 12 dB", font);
+    auto slScanHang = std::make_shared<Slider>(SIDEBAR_W - 40, 0.0f, 15.0f, 3.0f, "Resume 3 s after the signal", font);
+    auto lblScan = std::make_shared<Label>("Scanner: off", font, 11, sf::Color(150, 150, 160));
+    modBook->addWidget(std::make_shared<Label>("Bank (memory group):", font));
+    modBook->addWidget(ddBank);
+    modBook->addWidget(std::make_shared<Label>("Name (bookmark or new bank):", font));
+    modBook->addWidget(txtBookName);
+    modBook->addWidget(rowBook);
+    modBook->addWidget(rowBank);
+    modBook->addWidget(bookList);
+    modBook->addWidget(rowScan);
+    modBook->addWidget(slScanThr);
+    modBook->addWidget(slScanHang);
+    modBook->addWidget(lblScan);
+    modBook->addWidget(std::make_shared<Label>("Ticked bookmarks of the bank are scanned.", font, 11, sf::Color(130, 130, 140)));
+    modBook->addWidget(std::make_shared<Label>("Tuning by hand stops the scanner.", font, 11, sf::Color(130, 130, 140)));
+    // bank list: "All banks" + the banks; the list and the scanner show the chosen one
+    auto refreshBanks = [&](const std::string& select) {
+        std::vector<std::string> opts = {"All banks"};
+        for (const auto& b : bookmarks.banks) opts.push_back(b);
+        ddBank->setOptions(opts);
+        int sel = 0;
+        for (size_t i = 1; i < opts.size(); i++) if (opts[i] == select) sel = (int)i;
+        ddBank->setSelection(sel);
+        bookList->bankFilter = sel == 0 ? std::string() : opts[sel];
+        btnBankDel->setEnabled(sel > 0 && opts[sel] != defaultBank());
+        sidebar.recalculateLayout();
+    };
+    auto currentBank = [&]() { return bookList->bankFilter.empty() ? defaultBank() : bookList->bankFilter; };
+    refreshBanks(settingsMgr.getString("bookmark_bank", ""));
+    ddBank->onChange = [&](int idx) {
+        refreshBanks(idx > 0 && idx < (int)ddBank->options.size() ? ddBank->options[idx] : std::string());
+    };
+    btnBankNew->onClick = [&]() {
+        std::string n = txtBookName->getText();
+        while (!n.empty() && n.back() == ' ') n.pop_back();
+        if (n.empty()) { showPopup("Bookmarks", "Type the name of the new bank first."); return; }
+        bookmarks.ensureBank(n);
+        bookmarks.save();
+        txtBookName->setText("");
+        refreshBanks(n);
+    };
+    btnBankDel->onClick = [&]() {
+        const std::string b = bookList->bankFilter;
+        if (b.empty() || b == defaultBank()) return;
+        bookmarks.removeBank(b);   // its bookmarks move to "General"
+        refreshBanks(defaultBank());
+    };
+    scanner.eligible = [&](int i) { return bookList->shows(i); };
+    auto setScanUi = [&]() {
+        btnScan->setText(scanner.running() ? "Stop scan" : "Scan");
+        btnScan->setActive(scanner.running());
+        btnScanSkip->setEnabled(scanner.running());
+    };
+    setScanUi();
+    slScanThr->onChange = [&](float v) {
+        scanner.thresholdDb = v;
+        char b[48]; std::snprintf(b, sizeof(b), "Stop at SNR >= %.0f dB", v); slScanThr->setText(b);
+    };
+    slScanHang->onChange = [&](float v) {
+        scanner.hangSec = v;
+        char b[48]; std::snprintf(b, sizeof(b), "Resume %.0f s after the signal", v); slScanHang->setText(b);
+    };
+    bookList->onTune = [&](int i) {
+        if (scanner.running()) { scanner.stop(); setScanUi(); }
+        pendingBookmarkTune = i;
+        if (i >= 0 && i < (int)bookmarks.items.size()) txtBookName->setText(bookmarks.items[i].name);
+    };
+    bookList->onChanged = [&]() { sidebar.recalculateLayout(); };
+    btnBookAdd->onClick = [&]() {
+        Bookmark b;
+        b.freqHz = freqVFO.getFrequency();
+        { std::lock_guard<std::mutex> l(sharedData.mtx); b.mode = sharedData.mode; }
+        b.bandwidthHz = slBW->currentVal;
+        b.name = txtBookName->getText();
+        b.scan = true;
+        b.bank = currentBank();
+        if (b.freqHz <= 0) return;
+        bookList->selected = bookmarks.add(b);
+        bookList->ensureVisible(bookList->selected);
+        txtBookName->setText("");
+        sidebar.recalculateLayout();
+    };
+    btnBookSave->onClick = [&]() {
+        const int i = bookList->selected;
+        if (i < 0 || i >= (int)bookmarks.items.size()) { showPopup("Bookmarks", "Click a bookmark in the list first."); return; }
+        Bookmark& b = bookmarks.items[i];
+        b.name = txtBookName->getText();
+        b.freqHz = freqVFO.getFrequency();
+        { std::lock_guard<std::mutex> l(sharedData.mtx); b.mode = sharedData.mode; }
+        b.bandwidthHz = slBW->currentVal;
+        if (!bookList->bankFilter.empty()) b.bank = bookList->bankFilter;   // moves it to the chosen bank
+        const long long f = b.freqHz;
+        bookmarks.sort();
+        bookmarks.save();
+        const std::string bk = b.bank;
+        for (size_t k = 0; k < bookmarks.items.size(); k++)
+            if (bookmarks.items[k].freqHz == f && bookmarks.items[k].bank == bk) bookList->selected = (int)k;
+    };
+    scanner.tune = [&](int i) { pendingBookmarkTune = i; };
+    btnScan->onClick = [&]() {
+        if (scanner.running()) scanner.stop();
+        else scanner.start(bookmarks.items, bookList->selected, scanClock.getElapsedTime().asSeconds());
+        if (!scanner.running() && !bookmarks.items.empty()) {
+            bool any = false;
+            for (const auto& b : bookmarks.items) any = any || b.scan;
+            if (!any) showPopup("Scanner", "Tick at least one bookmark for scanning.");
+        }
+        setScanUi();
+    };
+    btnScanSkip->onClick = [&]() { scanner.skip(bookmarks.items, scanClock.getElapsedTime().asSeconds()); };
 
     // --- Input signal switch (I/Q / Audio) ---
     Mode modeBeforeAudio = Mode::NFM;
@@ -890,55 +1052,57 @@ int main() {
     //    tuning bar (see modules/Core/DecoderChannels.h). It never changes the demodulator, so
     //    the tuner and the mode stay free for listening;
     //  - with audio input (Input signal switch) it decodes the input audio;
-    //  - one decoder runs at a time.
+    //  - several decoders can run at once; each has a tab above the decoder panel.
     auto chkSSTV  = std::make_shared<Checkbox>("SSTV (slow-scan TV pictures)", font);
     auto chkWEFAX = std::make_shared<Checkbox>("WEFAX (HF weather fax)", font);
     auto chkISM   = std::make_shared<Checkbox>(ISMDecoder::available() ? "ISM (433/868 MHz sensors)"
                                                                        : "ISM (not in this build)", font);
     auto chkACARS = std::make_shared<Checkbox>("ACARS (aircraft, 131.x MHz)", font);
     auto chkADSB  = std::make_shared<Checkbox>("ADS-B (aircraft, 1090 MHz)", font);
+    auto chkVDL2  = std::make_shared<Checkbox>("VDL2 (aircraft datalink, 136.975)", font);
+    auto chkCW    = std::make_shared<Checkbox>("CW (Morse code)", font);
+    auto chkWSJT  = std::make_shared<Checkbox>(WSJTDecoder::ft8Available() ? "FT8 / FT4 / WSPR (HF digital)"
+                                                                           : "WSPR (FT8 / FT4 not in this build)", font);
 
     struct DecoderEntry { std::shared_ptr<Checkbox> chk; SDRModule* mod; };   // mod == nullptr: APRS
+    std::string selectedTab;   // the decoder whose panel is shown ("APRS" or the module's name)
     std::vector<DecoderEntry> decoders = {
         {chkAprs, nullptr}, {chkAIS, ptrAIS}, {chkSSTV, ptrSSTV},
-        {chkWEFAX, ptrWEFAX}, {chkISM, ptrISM}, {chkACARS, ptrACARS}, {chkADSB, ptrADSB} };
+        {chkWEFAX, ptrWEFAX}, {chkISM, ptrISM}, {chkACARS, ptrACARS}, {chkVDL2, ptrVDL2}, {chkADSB, ptrADSB}, {chkWSJT, ptrWSJT}, {chkCW, ptrCW} };
 
     auto activateDecoder = [&](size_t idx, bool on) {
         DecoderEntry& d = decoders[idx];
         std::lock_guard<std::mutex> l(sharedData.mtx);
         if (d.mod) {
+            auto& act = sharedData.activeDecoders;
+            act.erase(std::remove(act.begin(), act.end(), d.mod), act.end());
             if (on) {
                 if (d.mod->channelSet()) d.mod->channelSet()->clear();   // placed again for the current band
-                sharedData.activeDecoder = d.mod;
                 d.mod->enabled = true;
+                act.push_back(d.mod);
             } else {
-                if (sharedData.activeDecoder == d.mod) sharedData.activeDecoder = nullptr;
                 d.mod->enabled = false;
             }
         } else {
             if (on) aprsChannels().clear();
             sharedData.aprsEnabled = on;
         }
+        if (on) selectedTab = d.mod ? d.mod->name : std::string("APRS");   // show the one just switched on
     };
     for (size_t i = 0; i < decoders.size(); i++) {
-        decoders[i].chk->onToggle = [&, i](bool b) {
-            if (b) {
-                for (size_t j = 0; j < decoders.size(); j++) {
-                    if (j != i && decoders[j].chk->checked) { decoders[j].chk->checked = false; activateDecoder(j, false); }
-                }
-            }
-            activateDecoder(i, b);
-        };
+        decoders[i].chk->onToggle = [&, i](bool b) { activateDecoder(i, b); };
         modDecoders->addWidget(decoders[i].chk);
     }
-    modDecoders->addWidget(std::make_shared<Label>("Each decoder has its own channel (yellow)", font, 11, sf::Color(150, 150, 160)));
+    modDecoders->addWidget(std::make_shared<Label>("Several can run at once, each on its own channels", font, 11, sf::Color(150, 150, 160)));
 
     // The map window offers to switch on the decoder a satellite transmitter needs (SSTV, APRS)
     ptrADSB->onOpenMap = [&]() { mapWindow.openOrFocus(); };
     mapWindow.onEnableDecoder = [&](const std::string& name) {
         for (auto& d : decoders) {
             const std::string n = d.mod ? d.mod->name : std::string("APRS");
-            if (n == name && !d.chk->checked) { d.chk->checked = true; d.chk->onToggle(true); }
+            if (n != name) continue;
+            if (!d.chk->checked) { d.chk->checked = true; d.chk->onToggle(true); }
+            selectedTab = n;
         }
     };
 
@@ -1133,10 +1297,14 @@ int main() {
     else if (mEnum == Mode::USB) setMode(Mode::USB, btnUSB.get());
     else if (mEnum == Mode::LSB) setMode(Mode::LSB, btnLSB.get());
     else if (mEnum == Mode::RAW) setMode(Mode::RAW, btnRAW.get());
+    else if (mEnum == Mode::CW) setMode(Mode::CW, btnCW.get());
     else setMode(Mode::OFF, btnOFF.get());
 
     float savedBw = settingsMgr.getFloat("bandwidth", 12500.0f);
     slBW->setValueSilent(savedBw); slBW->onChange(savedBw);
+
+    slScanThr->setValueSilent(settingsMgr.getFloat("scan_threshold", 12.0f)); slScanThr->onChange(slScanThr->currentVal);
+    slScanHang->setValueSilent(settingsMgr.getFloat("scan_hang", 3.0f));     slScanHang->onChange(slScanHang->currentVal);
 
     float savedSq = settingsMgr.getFloat("squelch", -100.0f);
     slSq->setValueSilent(savedSq); slSq->onChange(savedSq);
@@ -1241,6 +1409,37 @@ int main() {
             std::cerr << "[Warning] bandplan.json not found." << std::endl;
         }
     }
+
+    // --- Decoder tabs above the decoder panel (one per running decoder) ---
+    // Every decoder keeps its own colour: the tab's mark and its channels on the spectrum.
+    struct DecTab { std::string name; SDRModule* mod; ChannelSet* set; sf::Color color; size_t entry; };
+    auto decoderColor = [](size_t entry) {
+        static const sf::Color pal[] = { sf::Color(255, 210, 0), sf::Color(0, 210, 255), sf::Color(255, 110, 200),
+                                         sf::Color(120, 230, 120), sf::Color(255, 150, 60), sf::Color(170, 150, 255),
+                                         sf::Color(255, 255, 140), sf::Color(90, 240, 210), sf::Color(240, 120, 120),
+                                         sf::Color(200, 200, 210), sf::Color(160, 220, 60) };
+        return pal[entry % (sizeof(pal) / sizeof(pal[0]))];
+    };
+    auto collectTabs = [&]() {
+        std::vector<DecTab> t;
+        std::vector<SDRModule*> act;
+        bool aprs;
+        { std::lock_guard<std::mutex> l(sharedData.mtx); act = sharedData.activeDecoders; aprs = sharedData.aprsEnabled; }
+        if (aprs) t.push_back({"APRS", nullptr, &aprsChannels(), decoderColor(0), 0});
+        for (SDRModule* m : act) {
+            if (!m || !m->enabled) continue;
+            size_t entry = 0;
+            for (size_t i = 0; i < decoders.size(); i++) if (decoders[i].mod == m) entry = i;
+            t.push_back({m->name, m, m->channelSet(), decoderColor(entry), entry});
+        }
+        return t;
+    };
+    const float TAB_H = 22.0f;
+    struct TabHit { sf::FloatRect tab, close; size_t entry; std::string name; };
+    std::vector<TabHit> tabHits;              // where the tabs were drawn (for the clicks)
+    unsigned long long lastDecoderDrops = 0;
+    sf::Clock decoderDropClock;               // time since the decoders last skipped a block
+    bool decoderDropSeen = false;
 
     // Smoothed values of the signal meter in the status bar
     float meterSnr = -1.0f;
@@ -1357,18 +1556,30 @@ int main() {
         float bwPct = (slBW->currentVal / hwSampleRate);
         float bwPixels = (bwPct / viewWidthPct) * layout.specW;
 
-        // --- Decoder channels: yellow bands + handles on the tuning bar ---
-        ChannelSet* chSet = nullptr;
+        // --- Running decoders: their tabs, the selected one's panel ---
+        const std::vector<DecTab> tabs = collectTabs();
         {
-            std::lock_guard<std::mutex> l(sharedData.mtx);
-            if (!inputIsAudio) {
-                if (sharedData.aprsEnabled) chSet = &aprsChannels();
-                else if (sharedData.activeDecoder && sharedData.activeDecoder->enabled) chSet = sharedData.activeDecoder->channelSet();
-            }
+            bool found = false;
+            for (const DecTab& t : tabs) if (t.name == selectedTab) found = true;
+            if (!found) selectedTab = tabs.empty() ? std::string() : tabs.back().name;
         }
-        if (chDrag.set && chDrag.set != chSet) chDrag = ChannelDrag();   // decoder switched off while dragging
-        if (chEdge.set && chEdge.set != chSet) chEdge = ChannelEdgeDrag();
-        struct ChHandle { DecoderChannel ch; float x; float rawX; int edge; };
+        const DecTab* selTab = nullptr;
+        for (const DecTab& t : tabs) if (t.name == selectedTab) selTab = &t;
+        SDRModule* panelMod = selTab ? selTab->mod : nullptr;   // nullptr + selTab: the APRS tab
+        const bool aprsShown = selTab && !selTab->mod;
+        aprsOn = aprsOn && aprsShown;   // the APRS list is the APRS tab's panel
+        const float timelineStripH = (currentSourceType == 0) ? 40.0f : 0.0f;
+        const float aprsTopY = layout.winH - timelineStripH - 200.0f;
+
+        // --- Decoder channels: coloured bands + handles on the tuning bar (all running decoders) ---
+        auto setRunning = [&](ChannelSet* cs) {
+            if (inputIsAudio) return false;
+            for (const DecTab& t : tabs) if (t.set == cs) return true;
+            return false;
+        };
+        if (chDrag.set && !setRunning(chDrag.set)) chDrag = ChannelDrag();   // decoder switched off while dragging
+        if (chEdge.set && !setRunning(chEdge.set)) chEdge = ChannelEdgeDrag();
+        struct ChHandle { DecoderChannel ch; float x; float rawX; int edge; ChannelSet* set; sf::Color col; std::string dec; };
         std::vector<ChHandle> chHandles;
         const double vfoOffsetHz = (tunePct - 0.5) * hwSampleRate;
         const long long vfoFreqHz = currentCenterFreq + (long long)std::llround(vfoOffsetHz);
@@ -1380,12 +1591,19 @@ int main() {
             return currentCenterFreq + (long long)std::llround((pct - 0.5) * hwSampleRate);
         };
         const float tbTop = (float)TOP_BAR_H + layout.specH, tbBot = tbTop + layout.tuneBarH;
-        if (chSet) {
-            for (const DecoderChannel& c : chSet->snapshot()) {
-                const double off = c.followVfo ? vfoOffsetHz : (double)(c.freqHz - currentCenterFreq);
-                const float x = offsetToX(off);
-                const int edge = x < 0.0f ? -1 : (x > layout.specW ? 1 : 0);
-                chHandles.push_back({c, std::clamp(x, 10.0f, layout.specW - 10.0f), x, edge});
+        if (!inputIsAudio) {
+            // the selected decoder's channels last: drawn on top, picked first when they overlap
+            std::vector<const DecTab*> order;
+            for (const DecTab& t : tabs) if (&t != selTab) order.push_back(&t);
+            if (selTab) order.push_back(selTab);
+            for (const DecTab* t : order) {
+                if (!t->set) continue;
+                for (const DecoderChannel& c : t->set->snapshot()) {
+                    const double off = c.followVfo ? vfoOffsetHz : (double)(c.freqHz - currentCenterFreq);
+                    const float x = offsetToX(off);
+                    const int edge = x < 0.0f ? -1 : (x > layout.specW ? 1 : 0);
+                    chHandles.push_back({c, std::clamp(x, 10.0f, layout.specW - 10.0f), x, edge, t->set, t->color, t->name});
+                }
             }
         }
         auto handleAt = [&](sf::Vector2f m) -> int {
@@ -1394,7 +1612,7 @@ int main() {
             float bestD = 10.0f;
             for (size_t i = 0; i < chHandles.size(); i++) {
                 const float d = std::abs(chHandles[i].x - m.x);
-                if (d < bestD) { bestD = d; best = (int)i; }
+                if (d <= bestD) { bestD = d; best = (int)i; }   // <=: the later (selected decoder) wins a tie
             }
             return best;
         };
@@ -1409,12 +1627,12 @@ int main() {
         // Bands whose width is the tuner's have no own edges (the grey band's edges change both).
         // SSB channels: only the edge away from the dial frequency moves.
         auto edgeAt = [&](sf::Vector2f m) -> int {
-            if (!chSet || !chSet->resizable || m.y < (float)TOP_BAR_H || m.y > (float)TOP_BAR_H + layout.specH || m.x > layout.specW) return -1;
+            if (m.y < (float)TOP_BAR_H || m.y > (float)TOP_BAR_H + layout.specH || m.x > layout.specW) return -1;
             int best = -1;
             float bestD = 6.0f;
             for (size_t i = 0; i < chHandles.size(); i++) {
                 const DecoderChannel& c = chHandles[i].ch;
-                if (chHandles[i].edge != 0 || chSet->widthFollowsTuner(c)) continue;
+                if (!chHandles[i].set->resizable || chHandles[i].edge != 0 || chHandles[i].set->widthFollowsTuner(c)) continue;
                 const double off = chCentreOffset(c);
                 if (c.sideband <= 0) { const float d = std::abs(offsetToX(c.lowOffset(off)) - m.x); if (d < bestD) { bestD = d; best = (int)i; } }
                 if (c.sideband >= 0) { const float d = std::abs(offsetToX(c.highOffset(off)) - m.x); if (d < bestD) { bestD = d; best = (int)i; } }
@@ -1425,7 +1643,7 @@ int main() {
             const float x = std::clamp(mx, 0.0f, layout.specW);
             chEdge.x = x;
             const ChHandle* h = nullptr;
-            for (const ChHandle& ch : chHandles) if (ch.ch.id == chEdge.id) h = &ch;
+            for (const ChHandle& ch : chHandles) if (ch.ch.id == chEdge.id && ch.set == chEdge.set) h = &ch;
             if (!h) return;
             const DecoderChannel& c = h->ch;
             const double hzPerPx = (hwSampleRate * viewWidthPct) / layout.specW;
@@ -1434,7 +1652,7 @@ int main() {
                      : c.sideband < 0 ? (cx - x) * hzPerPx
                                       : 2.0 * std::abs(x - cx) * hzPerPx;
             // on the grey band's edge: the tuner's width (only for channels that may follow it)
-            chEdge.snapTuner = c.followVfo && chSet->followTunerWidth &&
+            chEdge.snapTuner = c.followVfo && chEdge.set->followTunerWidth &&
                                (std::abs(x - tunerEdgeL) < 6.0f || std::abs(x - tunerEdgeR) < 6.0f);
             if (chEdge.snapTuner) w = slBW->currentVal;
             else w = std::round(w / 100.0) * 100.0;
@@ -1493,7 +1711,7 @@ int main() {
             if (!chDrag.moved) {
                 // a click: listen to the channel (tuner + the decoder's mode)
                 for (const ChHandle& h : chHandles) {
-                    if (h.ch.id != chDrag.id) continue;
+                    if (h.ch.id != chDrag.id || h.set != chDrag.set) continue;
                     if (!h.ch.followVfo) tuneVfoTo(h.ch.freqHz);
                     if (!inputIsAudio) restoreMode(h.ch.listenMode);
                 }
@@ -1558,13 +1776,14 @@ int main() {
 
         // Decoder panel at the bottom of the waterfall. With a file source the timeline
         // stays below it, so it can still be used.
-        const float timelineStripH = (currentSourceType == 0) ? 40.0f : 0.0f;
-        float decoderPanelTop = layout.winH;   // winH = no panel
-        {
-            SDRModule* dm = nullptr;
-            { std::lock_guard<std::mutex> l(sharedData.mtx); dm = sharedData.activeDecoder; }
-            if (dm && dm->enabled) decoderPanelTop = layout.winH - dm->panelHeight(layout.winH) - timelineStripH;
-        }
+        // the panel of the selected decoder (APRS: its list), the tab strip above it
+        const float panelH = panelMod ? panelMod->panelHeight(layout.winH) : aprsShown ? 200.0f : 0.0f;
+        const float panelTop = layout.winH - timelineStripH - panelH;
+        const float tabTop = panelTop - TAB_H;
+        const float decoderPanelTop = tabs.empty() ? layout.winH : tabTop;   // winH = no panel
+        // modules with a popup open get every event first
+        std::vector<SDRModule*> runningMods;
+        for (const DecTab& t : tabs) if (t.mod) runningMods.push_back(t.mod);
 
         while (const std::optional<sf::Event> ev = window.pollEvent()) {
             if (ev->is<sf::Event::Closed>()) window.close();
@@ -1602,11 +1821,11 @@ int main() {
                 continue;
             }
 
-            // Popup window of the active decoder (message details): it takes every event
+            // Popup window of a decoder (message details): it takes every event
             {
                 SDRModule* modalMod = nullptr;
-                { std::lock_guard<std::mutex> l(sharedData.mtx); modalMod = sharedData.activeDecoder; }
-                if (modalMod && modalMod->enabled && modalMod->modalOpen()) {
+                for (SDRModule* m : runningMods) if (m->enabled && m->modalOpen()) modalMod = m;
+                if (modalMod) {
                     modalMod->handleEvent(*ev, window);
                     continue;
                 }
@@ -1614,30 +1833,45 @@ int main() {
 
             if (sidebar.handleEvent(*ev, window)) continue;
 
-            // Decoder panel at the bottom of the waterfall (SSTV / WEFAX controls, picture scrolling)
-            {
-                SDRModule* panelMod = nullptr;
-                { std::lock_guard<std::mutex> l(sharedData.mtx); panelMod = sharedData.activeDecoder; }
-                if (panelMod && panelMod->enabled && panelMod->handleEvent(*ev, window)) continue;
+            // Decoder tabs: click = show its panel, x = switch the decoder off
+            if (const auto* mbt = ev->getIf<sf::Event::MouseButtonPressed>()) {
+                const sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window));
+                if (!tabs.empty() && m.y >= tabTop && m.y < tabTop + TAB_H && m.x < layout.specW) {
+                    if (mbt->button == sf::Mouse::Button::Left) {
+                        for (const TabHit& th : tabHits) {
+                            if (th.close.contains(m)) {
+                                DecoderEntry& d = decoders[th.entry];
+                                d.chk->checked = false;
+                                d.chk->onToggle(false);
+                                break;
+                            }
+                            if (th.tab.contains(m)) { selectedTab = th.name; break; }
+                        }
+                    }
+                    continue;
+                }
             }
+
+            // Decoder panel at the bottom of the waterfall (SSTV / WEFAX controls, picture scrolling)
+            if (panelMod && panelMod->enabled && panelMod->handleEvent(*ev, window)) continue;
 
             // Decoder channel handles on the tuning bar: take the press before the scale drag
             if (const auto* mbp = ev->getIf<sf::Event::MouseButtonPressed>()) {
                 if (mbp->button == sf::Mouse::Button::Left) {
                     const sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window));
                     const int e = edgeAt(m);
-                    if (e >= 0 && chSet) {
+                    if (e >= 0) {
                         chEdge = ChannelEdgeDrag();
-                        chEdge.set = chSet;
+                        chEdge.set = chHandles[e].set;
                         chEdge.id = chHandles[e].ch.id;
                         chEdge.x = m.x;
                         chEdge.widthHz = chHandles[e].ch.widthHz;
                         continue;
                     }
                     const int h = handleAt(m);
-                    if (h >= 0 && chSet) {
+                    if (h >= 0) {
                         chDrag = ChannelDrag();
-                        chDrag.set = chSet;
+                        chDrag.set = chHandles[h].set;
                         chDrag.id = chHandles[h].ch.id;
                         chDrag.startX = chDrag.x = m.x;
                         continue;
@@ -1741,7 +1975,8 @@ int main() {
 
             if (topBarHandled) continue;
 
-            bool overAprs = (aprsOn && window.mapPixelToCoords(sf::Mouse::getPosition(window)).y > (layout.winH - 200));
+            const float apY = window.mapPixelToCoords(sf::Mouse::getPosition(window)).y;
+            bool overAprs = (aprsOn && apY > aprsTopY && apY < aprsTopY + 200.0f);
 
             if (const auto* scroll = ev->getIf<sf::Event::MouseWheelScrolled>()) {
                 if (overAprs) {
@@ -1801,7 +2036,7 @@ int main() {
                 else if (mb->button == sf::Mouse::Button::Left) {
                     if (overAprs) {
                         float logX = layout.specW - 300;
-                        float overlayY = layout.winH - 200.0f;
+                        float overlayY = aprsTopY;
                         float listTopY = overlayY + 25.0f;
                         if (m.x > logX) {
                             float relY = m.y - listTopY - aprsLogScrollOffset;
@@ -1907,6 +2142,36 @@ int main() {
             }
         } // end of pollEvent loop
 
+        // --- Scanner and bookmark tuning ---
+        {
+            float snr = 0.0f;
+            unsigned long long seq = 0;
+            { std::lock_guard<std::mutex> l(sharedData.mtx); snr = sharedData.tunerSnrDb; seq = sharedData.tunerLevelSeq; }
+            const bool fresh = seq != lastLevelSeq;
+            lastLevelSeq = seq;
+            // tuning by hand stops the scanner
+            if (scanner.running() && pendingBookmarkTune < 0 && freqVFO.getFrequency() != scanner.tunedHz) { scanner.stop(); setScanUi(); }
+            const bool wasRunning = scanner.running();
+            scanner.update(bookmarks.items, scanClock.getElapsedTime().asSeconds(), snr, fresh);
+            if (wasRunning != scanner.running()) setScanUi();
+            if (pendingBookmarkTune >= 0 && pendingBookmarkTune < (int)bookmarks.items.size()) {
+                const Bookmark b = bookmarks.items[pendingBookmarkTune];
+                tuneVfoTo(b.freqHz);
+                if (!inputIsAudio) {
+                    restoreMode(b.mode);
+                    if (b.mode != Mode::OFF) { slBW->setValueSilent(b.bandwidthHz); slBW->onChange(slBW->currentVal); }
+                }
+            }
+            pendingBookmarkTune = -1;
+            const bool mute = scanner.running() && scanner.muteWanted();
+            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.scanMute = mute; }
+            bookList->active = scanner.running() ? scanner.current : -1;
+            if (scanner.running()) bookList->ensureVisible(scanner.current);
+            const std::string st = scanner.status(bookmarks.items);
+            static std::string lastSt;
+            if (st != lastSt) { lblScan->setText(st); lastSt = st; }
+        }
+
         // --- Satellite map window and frequency / Doppler tracking ---
         satCatalog.poll();
         mapWindow.frame();
@@ -1929,15 +2194,16 @@ int main() {
             }
         }
         {
+            // The decoder whose channel follows the satellite: the one the transmitter needs
+            // (e.g. SSTV) when it runs, otherwise the decoder in the selected tab
             std::string decName;
             ChannelSet* trackSet = nullptr;
             {
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                if (sharedData.aprsEnabled) { decName = "APRS"; trackSet = &aprsChannels(); }
-                else if (sharedData.activeDecoder && sharedData.activeDecoder->enabled) {
-                    decName = sharedData.activeDecoder->name;
-                    trackSet = sharedData.activeDecoder->channelSet();
-                }
+                const std::string want = orbit::demodHintFor(satTracker.tx).decoder;
+                const DecTab* t = nullptr;
+                for (const DecTab& x : tabs) if (!want.empty() && x.name == want) t = &x;
+                if (!t) t = selTab;
+                if (t) { decName = t->name; trackSet = t->set; }
             }
             if (inputIsAudio) trackSet = nullptr;
             satTracker.activeDecoderName = decName;
@@ -2038,7 +2304,8 @@ int main() {
             if (mousePos.y >= TOP_BAR_H + layout.specH - 10 && mousePos.y <= TOP_BAR_H + layout.specH + 20 && mousePos.x < layout.specW) showHand = true;
             if (volSlider.isMouseOver(window) || (currentSourceType == 0 && timeSlider.isMouseOver(window))) showHand = true;
             if (btnPlay.isMouseOver(window) || btnMute.isMouseOver(window) || btnTuningMode.isMouseOver(window) || btnMap.isMouseOver(window)) showHand = true;
-            if (aprsOn && mousePos.y > (layout.winH - 200) && mousePos.x < layout.specW) showHand = true;
+            if (aprsOn && mousePos.y > aprsTopY && mousePos.y < aprsTopY + 200.0f && mousePos.x < layout.specW) showHand = true;
+            if (!tabs.empty() && mousePos.y >= tabTop && mousePos.y < tabTop + TAB_H && mousePos.x < layout.specW) showHand = true;
         }
         if (handleAt(mousePos) >= 0) showHand = true;
         if (showAprsModal) showHand = false;
@@ -2290,8 +2557,8 @@ int main() {
             const float specBot = specTop + (float)layout.specH;
             const float wfTop = tbBot;
             const float wfBot = wfTop + (float)layout.waterfallH;
-            const sf::Color yellow(255, 210, 0);
-            const sf::Color edgeCol(255, 210, 0, 210), fillCol(255, 210, 0, 38), wfEdgeCol(255, 210, 0, 110);
+            auto withAlpha = [](sf::Color c, uint8_t a) { c.a = a; return c; };
+            auto lighter = [](sf::Color c) { return sf::Color((uint8_t)std::min(255, c.r + 60), (uint8_t)std::min(255, c.g + 60), (uint8_t)std::min(255, c.b + 60)); };
             auto vline = [&](float x, float y0, float y1, sf::Color c) {
                 sf::VertexArray ln(sf::PrimitiveType::Lines, 2);
                 ln[0].position = {x, y0}; ln[0].color = c;
@@ -2313,9 +2580,14 @@ int main() {
             for (size_t i = 0; i < chHandles.size(); i++) {
                 const ChHandle& h = chHandles[i];
                 const DecoderChannel& c = h.ch;
-                const bool dragging = (chDrag.set && chDrag.id == c.id) || (chEdge.set && chEdge.id == c.id);
+                const bool dragging = (chDrag.set == h.set && chDrag.id == c.id) || (chEdge.set == h.set && chEdge.id == c.id);
                 const double off = c.followVfo ? vfoOffsetHz : (double)(c.freqHz - currentCenterFreq);
-                const std::string title = c.name + (c.followVfo ? "  (tuner)" : "  " + mhzText(c.freqHz));
+                const sf::Color yellow = h.col;
+                const sf::Color edgeCol = withAlpha(h.col, 210), fillCol = withAlpha(h.col, 38), wfEdgeCol = withAlpha(h.col, 110);
+                // channels named by their frequency (ACARS, VDL2) get the decoder's name in front
+                const bool numericName = !c.name.empty() && c.name[0] >= '0' && c.name[0] <= '9';
+                const std::string cname = numericName ? h.dec + " " + c.name : c.name;
+                const std::string title = cname + (c.followVfo ? "  (tuner)" : numericName ? std::string() : "  " + mhzText(c.freqHz));
 
                 if (h.edge == 0) {
                     // band on the spectrum, edges on the waterfall
@@ -2325,7 +2597,7 @@ int main() {
                     if (cx1 > cx0) {
                         sf::RectangleShape band({cx1 - cx0, specBot - specTop});
                         band.setPosition({cx0, specTop});
-                        band.setFillColor(dragging ? sf::Color(255, 210, 0, 70) : fillCol);
+                        band.setFillColor(dragging ? withAlpha(h.col, 70) : fillCol);
                         window.draw(band);
                     }
                     for (float x : {x0, x1}) {
@@ -2339,7 +2611,7 @@ int main() {
                     const float hw = 12.0f, hh = layout.tuneBarH - 6.0f;
                     sf::RectangleShape grip({hw, hh});
                     grip.setPosition({std::round(h.x - hw / 2.0f), tbTop + 3.0f});
-                    grip.setFillColor((dragging || (int)i == hovered) ? sf::Color(255, 235, 120) : yellow);
+                    grip.setFillColor((dragging || (int)i == hovered) ? lighter(yellow) : yellow);
                     grip.setOutlineThickness(c.followVfo ? 2.0f : 1.0f);
                     grip.setOutlineColor(c.followVfo ? sf::Color::Red : sf::Color(60, 45, 0));
                     window.draw(grip);
@@ -2353,7 +2625,7 @@ int main() {
                     arrow.setPoint(0, {ax, my});
                     arrow.setPoint(1, {ax + dir * 10.0f, my - 7.0f});
                     arrow.setPoint(2, {ax + dir * 10.0f, my + 7.0f});
-                    arrow.setFillColor((int)i == hovered ? sf::Color(255, 235, 120) : yellow);
+                    arrow.setFillColor((int)i == hovered ? lighter(yellow) : yellow);
                     window.draw(arrow);
                     const std::string t = title + "  (outside the view)";
                     sf::Text probe(font, t, 20);
@@ -2376,11 +2648,11 @@ int main() {
                 label(what, std::min(chEdge.x + 8.0f, layout.specW - 200.0f), specTop + 28.0f, sf::Color(255, 235, 120), 22);
             } else if (hovered >= 0) {
                 const ChHandle& h = chHandles[hovered];
-                const std::string tip = h.ch.name + ":  drag = move,  drop on the tuner = follow it,  click = listen";
+                const std::string tip = h.dec + " " + h.ch.name + ":  drag = move,  drop on the tuner = follow it,  click = listen";
                 label(tip, std::clamp(h.x - 60.0f, 4.0f, layout.specW - 380.0f), tbTop - 15.0f, sf::Color(255, 235, 120), 22);
             } else if (hoveredEdge >= 0) {
                 const std::string tip = chHandles[hoveredEdge].ch.name + ":  drag the edge = channel width" +
-                    std::string(chSet->followTunerWidth && chHandles[hoveredEdge].ch.followVfo ? ",  drop on the grey edge = the tuner's width" : "");
+                    std::string(chHandles[hoveredEdge].set->followTunerWidth && chHandles[hoveredEdge].ch.followVfo ? ",  drop on the grey edge = the tuner's width" : "");
                 label(tip, std::clamp(mousePos.x + 10.0f, 4.0f, layout.specW - 420.0f), specTop + 28.0f, sf::Color(255, 235, 120), 22);
             }
         }
@@ -2482,7 +2754,7 @@ int main() {
 
         if (aprsOn) {
             float aprsH = 200.0f;
-            float overlayY = layout.winH - aprsH;
+            float overlayY = aprsTopY;
 
             sf::RectangleShape bg({layout.specW, aprsH});
             bg.setPosition({0, overlayY});
@@ -2628,15 +2900,11 @@ int main() {
             }
         }
 
-        SDRModule* decoderUI = nullptr;
-        {
-            std::lock_guard<std::mutex> l(sharedData.mtx);
-            decoderUI = sharedData.activeDecoder;
-        }
+        SDRModule* decoderUI = panelMod;
 
         if (decoderUI && decoderUI->enabled) {
-            float tableH = decoderUI->panelHeight(layout.winH);
-            float tableY = layout.winH - tableH - timelineStripH;
+            float tableH = panelH;
+            float tableY = panelTop;
             if (timelineStripH > 0.0f) {   // background for the timeline below the panel
                 sf::RectangleShape strip({layout.specW, timelineStripH});
                 strip.setPosition({0, layout.winH - timelineStripH});
@@ -2882,12 +3150,55 @@ int main() {
             infoTxt.setFillColor(sf::Color::Yellow);
         }
 
-        // Popup window of the active decoder, above everything else
+        // --- Decoder tabs (above the panel) ---
+        tabHits.clear();
         {
-            SDRModule* modalMod = nullptr;
-            { std::lock_guard<std::mutex> l(sharedData.mtx); modalMod = sharedData.activeDecoder; }
-            if (modalMod && modalMod->enabled && modalMod->modalOpen()) modalMod->drawModal(window);
+            const unsigned long long drops = sharedData.decoderDrops.load();
+            if (drops != lastDecoderDrops) { lastDecoderDrops = drops; decoderDropClock.restart(); decoderDropSeen = true; }
         }
+        if (!tabs.empty()) {
+            sf::RectangleShape strip({layout.specW, TAB_H});
+            strip.setPosition({0.0f, tabTop});
+            strip.setFillColor(sf::Color(24, 25, 30, 250));
+            window.draw(strip);
+            auto tabText = [&](const std::string& str, float x, float y, sf::Color c) {
+                sf::Text t(font, sf::String::fromUtf8(str.begin(), str.end()), 22);
+                t.setScale({0.5f, 0.5f});
+                t.setFillColor(c);
+                t.setPosition({std::round(x), std::round(y)});
+                window.draw(t);
+                return t.getGlobalBounds().size.x;
+            };
+            float tx = 4.0f;
+            for (const DecTab& t : tabs) {
+                sf::Text probe(font, sf::String::fromUtf8(t.name.begin(), t.name.end()), 22);
+                const float tw = probe.getGlobalBounds().size.x * 0.5f + 40.0f;
+                const bool sel = (&t == selTab);
+                sf::RectangleShape bg({tw, TAB_H - 3.0f});
+                bg.setPosition({tx, tabTop + 3.0f});
+                bg.setFillColor(sel ? sf::Color(20, 22, 27) : sf::Color(40, 42, 50));
+                bg.setOutlineThickness(1.0f);
+                bg.setOutlineColor(sel ? Theme::Accent : sf::Color(60, 60, 68));
+                window.draw(bg);
+                sf::RectangleShape mark({4.0f, TAB_H - 9.0f});
+                mark.setPosition({tx + 5.0f, tabTop + 6.0f});
+                mark.setFillColor(t.color);
+                window.draw(mark);
+                tabText(t.name, tx + 13.0f, tabTop + 5.0f, sel ? sf::Color::White : sf::Color(180, 180, 190));
+                const sf::FloatRect closeR({tx + tw - 16.0f, tabTop + 3.0f}, {16.0f, TAB_H - 3.0f});
+                const bool overClose = closeR.contains(mousePos);
+                tabText("x", tx + tw - 12.0f, tabTop + 4.0f, overClose ? sf::Color(255, 120, 120) : sf::Color(130, 130, 140));
+                tabHits.push_back({sf::FloatRect({tx, tabTop}, {tw, TAB_H}), closeR, t.entry, t.name});
+                tx += tw + 3.0f;
+            }
+            if (decoderDropSeen && decoderDropClock.getElapsedTime().asSeconds() < 5.0f)
+                tabText("Decoders can't keep up (CPU): some blocks were skipped. Switch some off or lower the sample rate.",
+                        tx + 10.0f, tabTop + 5.0f, sf::Color(255, 140, 90));
+        }
+
+        // Popup window of a decoder, above everything else
+        for (SDRModule* m : runningMods)
+            if (m->enabled && m->modalOpen()) { m->drawModal(window); break; }
         window.display();
     }
 
@@ -2903,6 +3214,9 @@ int main() {
     saveMgr.set("mode_index", (int)sharedData.mode);
     saveMgr.set("bandwidth", slBW->currentVal);
     saveMgr.set("squelch", slSq->currentVal);
+    saveMgr.set("scan_threshold", slScanThr->currentVal);
+    saveMgr.set("scan_hang", slScanHang->currentVal);
+    saveMgr.set("bookmark_bank", bookList->bankFilter);
     saveMgr.set("stereo", chkStereo->checked);
     saveMgr.set("rds", chkRds->checked);
     saveMgr.set("picture_path", pictureDirCustom);

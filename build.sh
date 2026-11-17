@@ -60,9 +60,11 @@ echo "Compiling with modules: $MODULE_SOURCES"
 
 # rtl_433 (ISM decoder): downloaded and compiled once into .cache/
 . scripts/rtl433.sh
+# ft8_lib (FT8 / FT4 decoder): vendored in deps/ft8_lib, compiled once into .cache/
+. scripts/ft8lib.sh
 
-$CXX -std=c++17 -O3 $SDR_FLAGS $RTL433_FLAGS $FINAL_INCLUDES \
-    $SRC_DIR/main.cpp $MODULE_SOURCES $RTL433_LIB \
+$CXX -std=c++17 -O3 $SDR_FLAGS $RTL433_FLAGS $FT8LIB_FLAGS $FINAL_INCLUDES \
+    $SRC_DIR/main.cpp $MODULE_SOURCES $RTL433_LIB $FT8LIB_LIB \
     -o $OUT_FILE $FINAL_LIBS $EXTRAS
 
 if [ $? -ne 0 ]; then

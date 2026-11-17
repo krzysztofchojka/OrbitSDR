@@ -58,6 +58,11 @@ inline std::string getAcarsLogFilePath() {
     return getConfigDir() + PATH_SEP + "acars.log";
 }
 
+// Any other file in the settings folder (wsjt.log, vdl2.log, bookmarks.json ...)
+inline std::string getConfigFilePath(const std::string& name) {
+    return getConfigDir() + PATH_SEP + name;
+}
+
 // Folder offered first when exporting decoder logs (the user's Documents folder)
 inline std::string getDefaultExportPath() {
     #ifdef _WIN32

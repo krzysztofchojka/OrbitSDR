@@ -1,8 +1,8 @@
 #pragma once
 
 // =====================================================================
-//  Positions heard by the decoders (AIS ships, APRS stations, ACARS
-//  aircraft, later ADS-B), shown on the satellite map.
+//  Positions heard by the decoders (AIS ships, APRS stations, ACARS / ADS-B
+//  aircraft, FT8 / WSPR stations by their locator), shown on the satellite map.
 //
 //  Decoders call positionBus().report(...) from their DSP thread; the map
 //  reads snapshot() on the UI thread. Every report is stamped with the
@@ -19,7 +19,7 @@
 #include <atomic>
 #include <chrono>
 
-enum class PosKind { AIS = 0, APRS = 1, ACARS = 2, ADSB = 3, Count = 4 };
+enum class PosKind { AIS = 0, APRS = 1, ACARS = 2, ADSB = 3, HF = 4, Count = 5 };
 
 inline const char* posKindName(PosKind k) {
     switch (k) {
@@ -27,6 +27,7 @@ inline const char* posKindName(PosKind k) {
     case PosKind::APRS: return "APRS";
     case PosKind::ACARS: return "ACARS";
     case PosKind::ADSB: return "ADS-B";
+    case PosKind::HF: return "HF";   // FT8 / FT4 / WSPR stations (grid locator)
     default: return "?";
     }
 }

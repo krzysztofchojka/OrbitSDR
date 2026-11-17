@@ -107,11 +107,23 @@ class ChannelSet {
         return false;
     }
 
+    // alwaysTuner: the channel that follows the tuner, next to the known frequencies
+    void addTunerChannel(long long vfoHz) {
+        auto c = make(vfoHz);
+        c.followVfo = true; c.autoPlaced = true; c.fallback = false;
+        channels.push_back(c);
+    }
+    bool hasTunerChannel() const {
+        for (const auto& c : channels) if (c.followVfo) return true;
+        return false;
+    }
+
     void placeAll(long long centre, double rate, long long vfoHz) {
         channels.clear();
         auto in = presetsInBand(centre, rate);
         if (in.size() > maxChannels) in.resize(maxChannels);
         for (long long f : in) { auto c = make(f); c.autoPlaced = true; channels.push_back(c); }
+        if (alwaysTuner) { addTunerChannel(vfoHz); return; }
         if (channels.empty()) {
             auto c = make(vfoHz);
             c.followVfo = true; c.autoPlaced = true; c.fallback = true;
@@ -125,8 +137,12 @@ class ChannelSet {
             return c.autoPlaced && !c.followVfo && !fits(c.freqHz, centre, rate); }), channels.end());
         auto in = presetsInBand(centre, rate);
         for (long long f : in) {
-            if (channels.size() >= maxChannels + (hasFallback() ? 1 : 0)) break;
+            if (channels.size() >= maxChannels + (hasFallback() || (alwaysTuner && hasTunerChannel()) ? 1 : 0)) break;
             if (!hasChannelAt(f)) { auto c = make(f); c.autoPlaced = true; channels.push_back(c); }
+        }
+        if (alwaysTuner) {
+            if (!hasTunerChannel()) addTunerChannel(vfoHz);
+            return;
         }
         bool anyFixed = false;
         for (const auto& c : channels) if (!c.fallback) anyFixed = true;
@@ -159,6 +175,9 @@ public:
     bool followTunerWidth = false;
     // The decoder demodulates with the channel width, so the user may drag the band edges
     bool resizable = false;
+    // Keep a channel on the tuner even when known frequencies are in band (FT8: decode
+    // what you are looking at as well as the standard dial frequencies)
+    bool alwaysTuner = false;
 
     bool multi() const { return maxChannels > 1; }
 

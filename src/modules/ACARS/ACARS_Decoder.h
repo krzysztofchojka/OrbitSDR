@@ -449,7 +449,7 @@ public:
 
         if (list.empty()) {
             sf::Text e = text(tuned ? "No messages yet. Tune near 131.650 MHz (Europe) or 131.550 / 130.025 MHz to cover several ACARS channels."
-                                    : "No messages yet. ACARS bursts are short: wait for aircraft nearby.", 24, sf::Color(110, 110, 120));
+                                    : "No messages yet. In Europe most ACARS now goes over VDL2 (136.975 MHz): try the VDL2 decoder.", 24, sf::Color(110, 110, 120));
             e.setPosition({tableRect.position.x, tableBodyY + 4.0f});
             win.draw(e);
         }

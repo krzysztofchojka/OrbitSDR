@@ -6,7 +6,11 @@
 #include <algorithm>
 #include <complex>
 
-enum class Mode { AM, NFM, WFM, LSB, USB, RAW, OFF };
+// CW was added last: the saved "mode_index" of older versions stays valid
+enum class Mode { AM, NFM, WFM, LSB, USB, RAW, OFF, CW };
+
+// CW: a carrier on the tuned frequency is heard as this tone
+inline constexpr double CW_PITCH_HZ = 700.0;
 
 struct Biquad {
     float b0 = 1.0f, b1 = 0.0f, b2 = 0.0f;
@@ -92,6 +96,10 @@ public:
     static constexpr float AGC_TARGET = 0.6f;
 
     Biquad notchL, notchR, cutoffL, cutoffR, audioCutoff;
+    // CW: narrow channel filter (6th order, on I and Q) and the beat oscillator
+    Biquad cwI[3], cwQ[3];
+    Complex cwBfoPhase = Complex(1.0, 0.0);
+    Complex cwBfoStep = Complex(1.0, 0.0);
     bool filtersConfigured = false;
 
     // Optional copy of the WFM multiplex signal (at sampleRateIn) for the RDS decoder.
@@ -114,6 +122,8 @@ public:
         if (sampleRateIn > 0) pllFreq = (19000.0 / sampleRateIn) * 2.0 * PI;
 
         notchL.reset(); notchR.reset(); cutoffL.reset(); cutoffR.reset(); audioCutoff.reset();
+        for (int i = 0; i < 3; i++) { cwI[i].reset(); cwQ[i].reset(); }
+        cwBfoPhase = Complex(1.0, 0.0);
         channelFir.reset();
         currentPhasor = Complex(1.0, 0.0);
         ssbNcoPhase = Complex(1.0, 0.0);
@@ -188,6 +198,13 @@ public:
                 channelFir.configure(firCutoff, (float)sampleRateOut, 101); // Runs on the decimated signal!
                 audioCutoff.configureLowPass(2700.0f, (float)sampleRateOut);
 
+                if (mode == Mode::CW) {
+                    // Butterworth 6th order low-pass at half the bandwidth (the FIR alone is too wide)
+                    static const float q[3] = {0.5176f, 0.7071f, 1.9319f};
+                    const float fc = std::max(25.0f, (float)bandwidthHz / 2.0f);
+                    for (int i = 0; i < 3; i++) { cwI[i].configureLowPass(fc, (float)sampleRateOut, q[i]); cwQ[i].configureLowPass(fc, (float)sampleRateOut, q[i]); }
+                    cwBfoStep = std::polar(1.0, 2.0 * PI * CW_PITCH_HZ / sampleRateOut);
+                }
                 if (mode == Mode::USB) {
                     ssbNcoStep = std::polar(1.0, -2.0 * PI * (bandwidthHz / 2.0) / sampleRateOut);
                     ssbRestoreStep = std::polar(1.0, 2.0 * PI * (bandwidthHz / 2.0) / sampleRateOut);
@@ -323,6 +340,15 @@ public:
                             ssbRestorePhase /= std::abs(ssbRestorePhase);
                             audioNcoNormCounter = 0;
                         }
+                    } else if (mode == Mode::CW) {
+                        // the carrier sits at 0 Hz: narrow filter, then shift it up to the pitch
+                        channelFir.push(decimated);
+                        filtered = channelFir.compute();
+                        float fi = (float)filtered.real(), fq = (float)filtered.imag();
+                        for (int k = 0; k < 3; k++) { fi = cwI[k].process(fi); fq = cwQ[k].process(fq); }
+                        filtered = Complex(fi, fq) * cwBfoPhase;
+                        cwBfoPhase *= cwBfoStep;
+                        if (++audioNcoNormCounter >= 256) { cwBfoPhase /= std::abs(cwBfoPhase); audioNcoNormCounter = 0; }
                     } else {
                         // AM and NFM just pass through the FIR
                         channelFir.push(decimated);
@@ -355,7 +381,7 @@ public:
                             audioLpfState += audioAlpha * (rawAudio - audioLpfState);
                         }
                     } 
-                    else if (mode == Mode::LSB || mode == Mode::USB || mode == Mode::RAW) {
+                    else if (mode == Mode::LSB || mode == Mode::USB || mode == Mode::RAW || mode == Mode::CW) {
                         rawAudio = filtered.real();
                         if (mode != Mode::RAW) {
                             rawAudio *= 2.0f; 

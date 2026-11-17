@@ -24,6 +24,8 @@ echo "------------------------------------------"
 
 # --- rtl_433 (ISM decoder): downloaded and compiled once into .cache/ ---
 . scripts/rtl433.sh
+# --- ft8_lib (FT8 / FT4 decoder): vendored in deps/ft8_lib, compiled once into .cache/ ---
+. scripts/ft8lib.sh
 
 # --- COMPILATION ---
 windres -I assets assets/resource.rc -O coff -o resource.res
@@ -33,11 +35,13 @@ g++ -std=c++17 -O3 \
     -D_USE_MATH_DEFINES \
     -Wno-macro-redefined \
     $RTL433_FLAGS \
+    $FT8LIB_FLAGS \
     -I"$SFML_PATH/include" \
     -I"$SDR_INC" \
     "$SRC_DIR/main.cpp" \
     resource.res \
     $RTL433_LIB \
+    $FT8LIB_LIB \
     -o "$OUT_FILE" \
     -L"$SFML_PATH/lib" \
     -lcomdlg32 -lole32 -lws2_32 -lwininet \

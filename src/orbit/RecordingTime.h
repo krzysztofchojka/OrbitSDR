@@ -82,6 +82,28 @@ inline double wavAuxiStart(const std::string& path) {
     return 0;
 }
 
+// Centre frequency from a recording's file name, 0 = not found. Accepts the common
+// patterns: OrbitSDR / SDR++ "_99900048Hz_", SDRuno "_137100000Hz.wav",
+// HDSDR "_137100kHz_RF", "7.074MHz". A number that looks like a sample rate after
+// "SR" / "sr" is skipped.
+inline long long frequencyFromName(const std::string& path) {
+    const std::string name = std::filesystem::path(path).filename().string();
+    static const std::regex re(R"((^|[^0-9A-Za-z.])(\d+(?:\.\d+)?)\s?(Hz|kHz|KHz|MHz|GHz)(?=$|[^A-Za-z]))");
+    for (auto it = std::sregex_iterator(name.begin(), name.end(), re); it != std::sregex_iterator(); ++it) {
+        const std::smatch& m = *it;
+        const size_t pos = (size_t)m.position(2);
+        if (pos >= 2 && (name.compare(pos - 2, 2, "SR") == 0 || name.compare(pos - 2, 2, "sr") == 0)) continue;
+        double v = 0;
+        try { v = std::stod(m[2].str()); } catch (...) { continue; }
+        const std::string u = m[3].str();
+        if (u == "kHz" || u == "KHz") v *= 1e3;
+        else if (u == "MHz") v *= 1e6;
+        else if (u == "GHz") v *= 1e9;
+        if (v >= 1000.0 && v < 1e11) return (long long)std::llround(v);
+    }
+    return 0;
+}
+
 inline RecordingStart recordingStart(const std::string& path, double durationSec) {
     RecordingStart r;
     if (const double a = wavAuxiStart(path); a > 0) {

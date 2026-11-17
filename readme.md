@@ -10,8 +10,8 @@
 OrbitSDR is a C++17 / SFML receiver that stays small and responsive while decoding several digital modes at once. Plug in an SDRplay or an RTL-SDR, enable a decoder, and it tunes its own channel to the right frequency. You can keep listening to something else in the meantime.
 
 - **Built for Apple Silicon (M1 and newer) and SDRplay.** That is the main development and test platform. No Homebrew or drivers needed for RTL-SDR, everything is bundled in the `.app`. For SDRPlay you have to install official [SDRPlay Api](https://sdrplay.com/hardware-api/).
-- **Eight decoders built in:** APRS, AIS, ACARS, ADS-B, ISM sensors (rtl_433), RDS, SSTV and WEFAX.
-- **Every decoder runs on its own channel.** Decode AIS, watch the 433 MHz sensors and listen to FM radio at the same time, all within one bandwidth.
+- **Eleven decoders built in:** APRS, AIS, ACARS, VDL2, ADS-B, ISM sensors (rtl_433), RDS, SSTV, WEFAX, FT8 / FT4 / WSPR and CW (Morse).
+- **Several decoders at once, each on its own channel.** Decode AIS and APRS, watch the 433 MHz sensors and listen to FM radio at the same time, all within one bandwidth. Every running decoder has a tab above the decoder panel; the decoders run in their own thread, so the audio never waits for them.
 - **Tested on real signals:** ships in harbours, weather stations and car tyre sensors in the city, APRS, SSTV, HF radiofax and RDS.
 
 ## Download
@@ -65,14 +65,18 @@ xattr -dr com.apple.quarantine /Applications/OrbitSDR.app
 | **RDS** | FM broadcast | Station name, RadioText, PI, programme type, TP/TA, clock time. Also used to tune the WFM gain automatically. |
 | **SSTV** | 145.800 MHz (ISS), HF | Robot 36/72, Martin M1/M2, Scottie S1/S2/DX, PD50–PD290. VIS auto-detection, slant correction, PNG export. |
 | **WEFAX** | HF radiofax stations | Automatic start/stop, phasing, LPM/IOC selection, slant correction, PNG export. |
+| **VDL2** | 136.650–136.975 MHz | VDL Mode 2 aircraft datalink (most European ACARS traffic today): ACARS messages, aircraft position and destination from XID frames, ground station positions. All VDL2 channels in the bandwidth are decoded at once (2 MS/s around 136.8 MHz covers them all). |
+| **FT8 / FT4 / WSPR** | HF and 6 m / 2 m dial frequencies (e.g. 7.074, 14.074 MHz) | Every known dial frequency in the bandwidth is decoded at once (FT8, FT4 and WSPR side by side), plus a channel on the tuner (USB: put the tuner just below the signals, its mode is chosen in the panel). Recordings without a start time in the file name are fine too: the slot timing is found automatically (times marked "~"). Message, SNR, time offset; stations with a locator appear on the map. Uses UTC time slots, so the computer clock must be right. Also decodes the USB audio of a transceiver (Input: Audio). |
+| **CW** | anywhere | Morse decoder: finds and follows the tone inside its channel, learns the speed (5–50 WPM). |
 
-Decoded ISM, ACARS and APRS messages are logged to `ism.log`, `acars.log` and `aprs.log` in the settings folder. **Export** saves the messages of the current session to a file. Click a row in any decoder table to see all of its fields.
+Decoded messages are logged in the settings folder (`ism.log`, `acars.log`, `vdl2.log`, `wsjt.log`, `cw.log`, `aprs.log`). **Export** saves the messages of the current session to a file. Click a row in any decoder table to see all of its fields.
 
 ## Features
 
-- **Demodulation:** AM, NFM, USB, LSB, WFM stereo, RAW.
+- **Demodulation:** AM, NFM, USB, LSB, CW (700 Hz tone, narrow filter down to 50 Hz), WFM stereo, RAW.
+- **Bookmarks and scanner:** save the tuned frequency with its mode and bandwidth (Bookmarks / Scanner in the sidebar, stored in `bookmarks.json`), grouped in banks (e.g. "2 m repeaters", "Airband"); the list and the scanner show the chosen bank. Click a bookmark to tune to it. **Scan** steps through the ticked bookmarks, stops on a signal above the SNR threshold, stays while it is there and resumes after the hang time; the speaker is muted while it searches. Tuning by hand stops the scan.
 - **Waterfall and spectrum:** drag to tune, zoom, axis panning, frequency snapping, band plan overlay.
-- **Decoder channels:** each decoder has its own channel(s), shown as yellow bands on the spectrum with a handle on the tuning bar. When you enable a decoder its channels jump to the known frequencies inside the received band. Otherwise they follow the tuner.
+- **Decoder channels:** each decoder has its own channel(s), shown as coloured bands on the spectrum (the colour of its tab) with a handle on the tuning bar. When you enable a decoder its channels jump to the known frequencies inside the received band. Otherwise they follow the tuner.
   - Drag a handle to move a channel. It snaps to known frequencies and to the tuner.
   - Drop it on the tuner to make it follow the tuner.
   - Click it to listen to that channel.
@@ -104,6 +108,7 @@ OrbitSDR is under active development. macOS on Apple Silicon and Windows with SD
 
 - AIS, ISM, APRS, RDS, SSTV and WEFAX have been tested on real off-air signals.
 - **ACARS has only been tested with recordings so far.** If you live near an airport, please try it and [report the result](https://github.com/krzysztofchojka/OrbitSDR/issues).
+- **VDL2, FT8 / FT4 / WSPR and CW are new and have been tested with generated signals only.** Reports with real signals (and recordings that don't decode) are very welcome.
 - More digital decoders are planned.
 
 Bug reports, recordings of signals that don't decode, and feature requests are very welcome in [Issues](https://github.com/krzysztofchojka/OrbitSDR/issues). If OrbitSDR is useful to you, a ⭐ helps other people find it.
@@ -165,8 +170,14 @@ The rtl_433 sources are not stored in this repository. The build scripts call `s
 - Without network access and with an empty cache, OrbitSDR still builds, just without the ISM decoder.
 - `RTL433_DISABLE=1` skips rtl_433 on purpose. `ORBITSDR_CACHE=/path` moves the cache.
 
+### ft8_lib (FT8 / FT4 decoder)
+
+[ft8_lib](https://github.com/kgoba/ft8_lib) (MIT) is kept in `deps/ft8_lib`. The build scripts call `scripts/ft8lib.sh`, which compiles it once with the C compiler into `.cache/`. If that fails, OrbitSDR is built without FT8 / FT4 (WSPR still works).
+
 ## License and credits
 
 OrbitSDR is licensed under the [GNU GPL v3](LICENSE).
 
-It uses [SFML](https://www.sfml-dev.org/), [miniaudio](https://miniaud.io/), [librtlsdr](https://osmocom.org/projects/rtl-sdr), [rtl_433](https://github.com/merbanan/rtl_433) (GPL-2.0-or-later) and the [SDRplay API](https://www.sdrplay.com/).
+It uses [SFML](https://www.sfml-dev.org/), [miniaudio](https://miniaud.io/), [librtlsdr](https://osmocom.org/projects/rtl-sdr), [rtl_433](https://github.com/merbanan/rtl_433) (GPL-2.0-or-later), [ft8_lib](https://github.com/kgoba/ft8_lib) (MIT) and the [SDRplay API](https://www.sdrplay.com/).
+
+The WSPR decoder is a C++ port of wsprd from [WSJT-X](https://wsjt.sourceforge.io/) (K1JT, K9AN; GPL v3), the VDL2 decoder follows [dumpvdl2](https://github.com/szpajder/dumpvdl2) (Tomasz Lemiech; GPL v3) with the Reed-Solomon decoder of Phil Karn's libfec (LGPL).

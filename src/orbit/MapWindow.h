@@ -120,6 +120,7 @@ public:
         placeNames = s.getBool("map_place_names", true);
         const int kinds = s.getInt("map_pos_kinds", 15);
         for (int i = 0; i < (int)PosKind::Count; i++) showKind[i] = (kinds >> i) & 1;
+        showKind[(int)PosKind::HF] = s.getBool("map_pos_hf", true);   // added later: own key, on by default
         posWindowIdx = std::clamp(s.getInt("map_pos_window", 2), 0, (int)POS_WINDOWS.size() - 1);
         syncPanelFromState();
     }
@@ -138,6 +139,7 @@ public:
         int kinds = 0;
         for (int i = 0; i < (int)PosKind::Count; i++) if (showKind[i]) kinds |= 1 << i;
         s.set("map_pos_kinds", kinds);
+        s.set("map_pos_hf", showKind[(int)PosKind::HF]);
         s.set("map_pos_window", posWindowIdx);
     }
 
@@ -182,14 +184,14 @@ private:
     int baseLayer = 0;          // 0 satellite photos, 1 street map, 2 Blue Marble only
     bool placeNames = true;     // borders + names over the photos
     std::set<int> layersDrawn;  // for the attribution line
-    bool showKind[(int)PosKind::Count] = {true, true, true, true};
+    bool showKind[(int)PosKind::Count] = {true, true, true, true, true};
     int posWindowIdx = 2;
     inline static const std::vector<std::pair<double, const char*>> POS_WINDOWS = {
         {15 * 60.0, "15 min"}, {3600.0, "1 h"}, {6 * 3600.0, "6 h"}, {24 * 3600.0, "24 h"}, {1e12, "all"}};
     std::vector<PosTrack> posTracks;   // this frame
     int hoveredPos = -1;               // index into posTracks
     sf::Vector2f hoveredPosUi;
-    SdrButton tbKind[(int)PosKind::Count] = {{64, 24, "AIS", font}, {64, 24, "APRS", font}, {70, 24, "ACARS", font}, {66, 24, "ADS-B", font}};
+    SdrButton tbKind[(int)PosKind::Count] = {{64, 24, "AIS", font}, {64, 24, "APRS", font}, {70, 24, "ACARS", font}, {66, 24, "ADS-B", font}, {56, 24, "HF", font}};
     SdrButton tbWindow{92, 24, "Last 6 h", font};
 
     // map picture
@@ -1167,6 +1169,7 @@ private:
         switch (p.kind) {
         case PosKind::AIS: return p.symCode == 'B' ? Icon::Square : p.symCode == 'N' ? Icon::Diamond : Icon::Ship;
         case PosKind::ACARS: case PosKind::ADSB: return Icon::Plane;
+        case PosKind::HF: return Icon::Tower;
         default: break;
         }
         const std::string n = aprspos::symbolName(p.symTable, p.symCode);
@@ -1187,6 +1190,7 @@ private:
         case PosKind::APRS: return sf::Color(255, 120, 90);
         case PosKind::ACARS: return sf::Color(215, 150, 255);
         case PosKind::ADSB: return sf::Color(255, 220, 0);
+        case PosKind::HF: return sf::Color(120, 235, 140);
         default: return sf::Color::White;
         }
     }
@@ -1850,7 +1854,7 @@ private:
                                    panel.isAnyWidgetHovered(*win) || tbNow.isMouseOver(*win) || tbM1h.isMouseOver(*win) ||
                                    tbM10.isMouseOver(*win) || tbP10.isMouseOver(*win) || tbP1h.isMouseOver(*win) ||
                                    tbWindow.isMouseOver(*win) || tbKind[0].isMouseOver(*win) || tbKind[1].isMouseOver(*win) ||
-                                   tbKind[2].isMouseOver(*win) || tbKind[3].isMouseOver(*win);
+                                   tbKind[2].isMouseOver(*win) || tbKind[3].isMouseOver(*win) || tbKind[4].isMouseOver(*win);
         static auto curArrow = sf::Cursor::createFromSystem(sf::Cursor::Type::Arrow);
         static auto curHand = sf::Cursor::createFromSystem(sf::Cursor::Type::Hand);
         static auto curCross = sf::Cursor::createFromSystem(sf::Cursor::Type::Cross);

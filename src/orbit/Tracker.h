@@ -39,8 +39,9 @@ inline DemodHint demodHintFor(const Transmitter& t) {
     DemodHint h;
     const std::string m = upper(t.mode), d = upper(t.desc);
     if (m == "APT") { h.mode = Mode::NFM; h.bandwidthHz = 40000; h.text = "NFM 40 kHz (APT)"; }
-    else if (m == "CW" || m == "USB" || m == "SSB" || upper(t.type) == "TRANSPONDER") {
-        h.mode = Mode::USB; h.bandwidthHz = m == "CW" ? 1000 : 2800; h.text = m == "CW" ? "USB 1 kHz (CW)" : "USB 2.8 kHz";
+    else if (m == "CW") { h.mode = Mode::CW; h.bandwidthHz = 500; h.text = "CW 500 Hz"; }
+    else if (m == "USB" || m == "SSB" || upper(t.type) == "TRANSPONDER") {
+        h.mode = Mode::USB; h.bandwidthHz = 2800; h.text = "USB 2.8 kHz";
     }
     else if (m == "LSB") { h.mode = Mode::LSB; h.bandwidthHz = 2800; h.text = "LSB 2.8 kHz"; }
     else if (m == "AM") { h.mode = Mode::AM; h.bandwidthHz = 10000; h.text = "AM 10 kHz"; }

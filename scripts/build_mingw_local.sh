@@ -43,6 +43,8 @@ SDR_LIB="$(pwd)/deps/sdrplay/lib/windows"
 
 # 3b. rtl_433 (ISM decoder): downloaded and compiled once into .cache/
 . scripts/rtl433.sh
+# --- ft8_lib (FT8 / FT4 decoder): vendored in deps/ft8_lib, compiled once into .cache/ ---
+. scripts/ft8lib.sh
 
 # 4. Compilation
 echo "------------------------------------------"
@@ -55,11 +57,13 @@ g++ -std=c++17 -O3 \
     -DENABLE_SDRPLAY \
     -D_USE_MATH_DEFINES \
     $RTL433_FLAGS \
+    $FT8LIB_FLAGS \
     -I"$SFML_PATH/include" \
     -I"$SDR_INC" \
     "$SRC_DIR/main.cpp" \
     "$BUILD_DIR/resource.res" \
     $RTL433_LIB \
+    $FT8LIB_LIB \
     -o "$OUT_FILE" \
     -L"$SFML_PATH/lib" \
     -lcomdlg32 -lole32 -lws2_32 -lwininet \

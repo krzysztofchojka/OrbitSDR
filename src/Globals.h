@@ -4,6 +4,7 @@
 #include <vector>
 #include <deque>
 #include <mutex>
+#include <atomic>
 #include <memory>
 #include "Demodulator.h"
 #include "RDS_Decoder.h"
@@ -78,7 +79,10 @@ struct SharedData {
     bool aprsEnabled = false;
     bool rdsEnabled = false;
     RdsInfo rds;               // latest RDS data, written by the DSP worker
-    SDRModule* activeDecoder = nullptr;
+    // Decoders switched on (several can run at once, each on its own channels), in the order
+    // they were switched on. They run in their own thread (see DecoderRunner in DSPWorker.h).
+    std::vector<SDRModule*> activeDecoders;
+    std::atomic<unsigned long long> decoderDrops {0};   // blocks the decoders had to skip (CPU too slow)
     // Input signal type (Source / Input switch): false = I/Q from a radio, true = demodulated audio
     bool audioInput = false;
     
@@ -88,6 +92,13 @@ struct SharedData {
     float zoomLevel = 1.0f;
     int waterfallTheme = 0;
     
+    // Signal at the tuner from the full FFT (independent of the zoom): the strongest bin inside
+    // the tuner's band above the noise floor (20th percentile of all bins). Used by the scanner.
+    float tunerSnrDb = 0.0f;
+    float tunerPeakDb = -150.0f;
+    unsigned long long tunerLevelSeq = 0;   // +1 with every new value
+    bool scanMute = false;                  // the scanner mutes the speaker while it searches
+
     std::vector<double> inspectorSpectrum; 
     std::vector<uint8_t> inspectorWaterfallRow; 
     bool newInspectorData = false;
