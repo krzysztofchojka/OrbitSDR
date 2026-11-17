@@ -212,6 +212,9 @@ int main() {
     #ifdef _WIN32
     autoUiScale = detectWindowsUiScale((void*)window.getNativeHandle());
     std::cout << "[INFO] Detected Windows UI scale: " << autoUiScale << std::endl;
+    #elif defined(__APPLE__)
+    autoUiScale = detectMacUiScale(window);
+    std::cout << "[INFO] Detected macOS backing scale: " << autoUiScale << std::endl;
     #endif
     auto getUiScale = [&]() -> float {
         int idx = std::clamp(uiScaleIdx, 0, (int)UI_SCALE_VALUES.size() - 1);
@@ -548,6 +551,8 @@ int main() {
             newSource = std::make_shared<FileSource>();
             std::string path = pathOverride.empty() ? "None" : pathOverride;
             success = newSource->open(path);
+            if (!success && path != "None")
+                showPopup("Error", "Could not open the file:\n" + path + "\n\nOnly WAV files are supported: stereo (I/Q) or mono (audio).");
             {
                 std::lock_guard<std::mutex> l(cur->sd.mtx);
                 cur->sd.currentFilename = path;
@@ -1203,7 +1208,7 @@ int main() {
     auto chkVDL2  = std::make_shared<Checkbox>("VDL2 (aircraft datalink, 136.975)", font);
     auto chkCW    = std::make_shared<Checkbox>("CW (Morse code)", font);
     auto chkNAVTEX = std::make_shared<Checkbox>("NAVTEX (518 / 490 kHz)", font);
-    auto chkDSC   = std::make_shared<Checkbox>("DSC (VHF ch70, MF/HF)", font);
+    auto chkDSC   = std::make_shared<Checkbox>("DSC (VHF ch70 156.525, MF/HF)", font);
     auto chkWSJT  = std::make_shared<Checkbox>(WSJTDecoder::ft8Available() ? "FT8 / FT4 / WSPR (HF digital)"
                                                                            : "WSPR (FT8 / FT4 not in this build)", font);
 
@@ -1287,6 +1292,15 @@ int main() {
     };
     modDisp->addWidget(slZoom);
 
+    // A copy of the zoom slider in the bottom right corner of the waterfall (on the status
+    // bar, or on the decoder panel when one is open). Drives the sidebar slider.
+    Slider slZoomBar(180, 1.0f, 16.0f, 1.0f, "Zoom", font);
+    auto zoomBarText = [](float v) { char b[32]; std::snprintf(b, sizeof(b), "Zoom: %.1fx", v); return std::string(b); };
+    slZoomBar.onChange = [&](float v) {
+        slZoom->setValueSilent(v);
+        if (slZoom->onChange) slZoom->onChange(slZoom->currentVal);
+    };
+
     auto ddTheme = std::make_shared<Dropdown>(SIDEBAR_W - 40, 25.0f, font);
     ddTheme->setOptions(THEME_NAMES);
     ddTheme->setSelection(0);
@@ -1300,6 +1314,7 @@ int main() {
         btnMute.updateStyle();
         btnMap.updateStyle();
         volSlider.updateStyle();
+        slZoomBar.updateStyle();
         timeSlider.updateStyle();
         sidebar.updateStyle();
     };
@@ -1968,6 +1983,7 @@ int main() {
                 agcLimitedByRds = cur->sd.source->isAgcLimited();
             }
         }
+        if (!(hwSampleRate > 0.0)) hwSampleRate = 2e6;   // no source open: keep the scale math finite
 
         // Show the gain the software AGC has chosen next to the RF gain slider
         if (chkAgc->checked) {
@@ -2040,6 +2056,16 @@ int main() {
         }
 
         slZoom->update(window);
+        // the corner zoom slider: placed every frame (the timeline strip comes and goes)
+        {
+            const float zbTimelineH = (cur->sourceType == 0) ? TIMELINE_H : 0.0f;
+            slZoomBar.setPosition(layout.specW - 180.0f - 20.0f, layout.winH - zbTimelineH - 40.0f + 4.0f);
+            if (slZoomBar.isDragging && !sf::Mouse::isButtonPressed(sf::Mouse::Button::Left)) slZoomBar.isDragging = false;
+            slZoomBar.update(window);
+            if (!slZoomBar.isDragging) slZoomBar.setValueSilent(slZoom->currentVal);
+            static float zbShown = -1.0f;
+            if (std::abs(zbShown - slZoomBar.currentVal) > 0.01f) { zbShown = slZoomBar.currentVal; slZoomBar.setText(zoomBarText(zbShown)); }
+        }
 
         double visibleFraction = 1.0 / currentZoom;
         double viewStartPct = viewCenter - visibleFraction / 2.0;
@@ -2228,6 +2254,7 @@ int main() {
                     sr = cur->sd.source->getSampleRate();
                 }
             }
+            if (!(sr > 0.0)) return;   // no source open (a file that failed to load): nothing to tune
 
             double clickViewPct = mouseX / layout.specW;
             double clickedAbsolutePct = viewStartPct + clickViewPct * viewWidthPct;
@@ -2279,6 +2306,9 @@ int main() {
         const float panelTop = layout.winH - timelineStripH - panelH;
         const float tabTop = panelTop - TAB_H;
         const float decoderPanelTop = tabs.empty() ? layout.winH : tabTop;   // winH = no panel
+        // everything below this is bottom UI (status bar / decoder panel / timeline): clicks
+        // and the mouse wheel there must not tune
+        const float bottomUiTop = std::min(decoderPanelTop, layout.winH - timelineStripH - 40.0f);
         // modules with a popup open get every event first
         std::vector<SDRModule*> runningMods;
         for (const DecTab& t : tabs) if (t.mod) runningMods.push_back(t.mod);
@@ -2370,6 +2400,9 @@ int main() {
                     continue;
                 }
             }
+
+            // The corner zoom slider sits on top of the status bar / decoder panel
+            if (slZoomBar.handleEvent(*ev, window)) continue;
 
             // Decoder panel at the bottom of the waterfall (SSTV / WEFAX controls, picture scrolling)
             if (panelMod && panelMod->enabled && panelMod->handleEvent(*ev, window)) continue;
@@ -2500,7 +2533,7 @@ int main() {
                     if (aprsLogScrollOffset > 0.0f) aprsLogScrollOffset = 0.0f;
                 } else {
                     sf::Vector2f m = window.mapPixelToCoords(sf::Vector2i((int)scroll->position.x, (int)scroll->position.y));
-                    if (m.y > TOP_BAR_H && m.x < layout.specW) {
+                    if (m.y > TOP_BAR_H && m.y < bottomUiTop && m.x < layout.specW) {
                         long long step = STEP_VALUES[ddSnap->selectedIndex];
                         if (step == 0) step = 100;
 
@@ -2566,6 +2599,7 @@ int main() {
                     }
 
                     bool overTimeline = (cur->sourceType == 0) && (timeSlider.isDragging || (m.y > layout.winH - TIMELINE_H));
+                    if (m.y >= bottomUiTop) overTimeline = true;   // status bar / decoder panel: no tuning
                     bool inFreqScaleZone = (m.y >= TOP_BAR_H + layout.specH && m.y <= TOP_BAR_H + layout.specH + layout.tuneBarH && m.x < layout.specW);
 
                     float leftEdge = visualCenterX - bwPixels / 2.0f;
@@ -2646,7 +2680,7 @@ int main() {
                     }
                 }
 
-                const bool overDecoderPanel = (m.y >= decoderPanelTop && m.y < layout.winH - timelineStripH);
+                const bool overDecoderPanel = (m.y >= bottomUiTop);
                 if (!overAprs && !overDecoderPanel && m.x >= 0 && m.x < layout.specW && m.y >= TOP_BAR_H && m.y < (TOP_BAR_H + layout.specH + layout.waterfallH)) {
                     std::lock_guard<std::mutex> l(cur->sd.mtx);
                     cur->sd.mouseX_spectrum = m.x;
@@ -2861,6 +2895,7 @@ int main() {
 
         if (sidebar.isMouseOver(window)) {
             if (sidebar.isAnyWidgetHovered(window)) showHand = true;
+            if (slZoomBar.isMouseOver(window) || slZoomBar.isDragging) showHand = true;
         } else {
             if (freqVFO.isHovered) showHand = true;
             if (mousePos.y >= TOP_BAR_H + layout.specH - 10 && mousePos.y <= TOP_BAR_H + layout.specH + 20 && mousePos.x < layout.specW) showHand = true;
@@ -3658,6 +3693,8 @@ int main() {
                 window.draw(ov);
             }
         }
+
+        slZoomBar.draw(window);
 
         if (cur->sourceType == 0) {   // the file's timeline on its own grey strip (with any decoder, also APRS)
             sf::RectangleShape strip({layout.specW, TIMELINE_H});
