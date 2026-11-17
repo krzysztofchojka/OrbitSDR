@@ -72,6 +72,8 @@ public:
     std::string satName;
     TrackMode mode = TrackMode::Off;
     TrackTarget target = TrackTarget::Tuner;
+    int rxId = 1;               // the receiver (tab) whose tuner / decoder channel is tuned
+    std::string decoderName;    // TrackTarget::Decoder: this decoder's channel ("" = automatic)
     long long downlinkHz = 0;
     Transmitter tx;            // the chosen transmitter (mode hints)
     bool setDemodMode = true;  // also switch the demodulator when tracking starts on the tuner
@@ -88,6 +90,9 @@ public:
     std::string applyStatus;   // e.g. "enable a decoder first"
     bool demodApplied = false; // set once main.cpp has switched the demodulator
     std::string activeDecoderName;   // written by main.cpp every frame
+    // the receivers (tabs) and their running decoders, for the map's choices (main.cpp, every frame)
+    struct RxChoice { int id = 0; std::string name; std::vector<std::string> decoders; };
+    std::vector<RxChoice> receivers;
 
     bool active() const { return mode != TrackMode::Off && norad != 0 && downlinkHz > 0; }
 
@@ -131,6 +136,8 @@ public:
         minElDeg = std::clamp((double)s.getFloat("trk_min_el", 0.0f), 0.0, 45.0);
         target = s.getInt("trk_target", 0) == 1 ? TrackTarget::Decoder : TrackTarget::Tuner;
         setDemodMode = s.getBool("trk_set_mode", true);
+        rxId = std::max(1, s.getInt("trk_rx", 1));
+        decoderName = s.getString("trk_decoder", "");
     }
     void saveSettings(SettingsManager& s) const {
         s.set("trk_lat", obs.latDeg);
@@ -138,6 +145,8 @@ public:
         s.set("trk_alt", obs.altM);
         s.set("trk_min_el", minElDeg);
         s.set("trk_target", (int)target);
+        s.set("trk_rx", rxId);
+        s.set("trk_decoder", decoderName);
         s.set("trk_set_mode", setDemodMode);
     }
 };

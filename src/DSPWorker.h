@@ -169,11 +169,10 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
     std::vector<double> localFftHistory(INTERNAL_WATERFALL_WIDTH, -100.0);
     std::vector<Complex> fftBuffer(FFT_SIZE, {0,0});
     int fftBufferIdx = 0;
-    float smoothedRssi = -100.0f;
+    float squelchLevel = -150.0f;   // tuner band level for the squelch (dB)
     WavWriter recorder;
     sf::Clock waterfallTimer;
 
-    float squelchEnv = 1.0f;   // per receiver (several DSP threads run at once)
     double paceSamples = -1.0; // background file playback: samples played since paceStart
     auto paceStart = std::chrono::steady_clock::now();
     std::vector<float> fftMags(FFT_SIZE), fftSorted(FFT_SIZE);
@@ -456,19 +455,8 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                     decoders.push(std::move(decJob));
                 }
 
-                if (sqThr > -99.0f) {
-                    if (smoothedRssi < sqThr) {
-                        squelchEnv *= 0.9f; // Soft close (fade-out)
-                    } else {
-                        squelchEnv = 1.0f;  // Instant open
-                    }
-                    if (squelchEnv < 0.001f) squelchEnv = 0.0f; // True digital silence on the speaker
-                    
-                    // Multiply the samples by the envelope
-                    for (auto& s : audioData) {
-                        s *= squelchEnv;
-                    }
-                }
+                // Squelch: open or closed, nothing in between (no fade, no averaging of the level)
+                if (sqThr > -99.0f && squelchLevel < sqThr) std::fill(audioData.begin(), audioData.end(), 0.0f);
 
                 // Similar loudness for all modes (speaker only, the decoders above got the raw audio)
                 leveler.process(audioData);
@@ -549,10 +537,7 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                     tunerSnr = std::max(0.0f, tunerPeak - sorted[FFT_SIZE / 5]);
                 }
 
-                int tunerBin = std::clamp((int)(targetFreqPct * FFT_SIZE), 0, FFT_SIZE - 1);
-                int shiftedTuner = (tunerBin + FFT_SIZE / 2) % FFT_SIZE;
-                float tMag = std::abs(fftData[shiftedTuner]) / FFT_SIZE;
-                smoothedRssi = smoothedRssi * 0.8f + (20.0f * std::log10(tMag + 1e-12f)) * 0.2f;
+                squelchLevel = tunerPeak;   // the strongest bin in the tuner's band, this FFT frame
 
                 {
                     std::unique_lock<std::mutex> lock(shared.mtx, std::try_to_lock);

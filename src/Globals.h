@@ -17,6 +17,7 @@ inline const int INTERNAL_WATERFALL_WIDTH = 2048;
 inline const int WATERFALL_HEIGHT_PX = 1024;
 inline const double AUDIO_RATE = 48000.0;
 inline const int TOPBAR_DRAW_H = 60;                  // the dark bar with the frequency, play, MAP ...
+inline const float TIMELINE_H = 48.0f;                 // a file's timeline strip at the bottom
 inline const int RX_TAB_H = 24;                       // the receiver tabs below it
 inline const int TOP_BAR_H = TOPBAR_DRAW_H + RX_TAB_H; // where the spectrum and the sidebar start
 inline const int SIDEBAR_W = 320;

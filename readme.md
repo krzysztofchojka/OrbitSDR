@@ -10,8 +10,8 @@
 OrbitSDR is a C++17 / SFML receiver that stays small and responsive while decoding several digital modes at once. Plug in an SDRplay or an RTL-SDR, enable a decoder, and it tunes its own channel to the right frequency. You can keep listening to something else in the meantime.
 
 - **Built for Apple Silicon (M1 and newer) and SDRplay.** That is the main development and test platform. No Homebrew or drivers needed for RTL-SDR, everything is bundled in the `.app`. For SDRPlay you have to install official [SDRPlay Api](https://sdrplay.com/hardware-api/).
-- **Eleven decoders built in:** APRS, AIS, ACARS, VDL2, ADS-B, ISM sensors (rtl_433), RDS, SSTV, WEFAX, FT8 / FT4 / WSPR and CW (Morse).
-- **Several receivers at once, in tabs.** "+ Add receiver" below the top bar opens another tab with its own source (a second RTL-SDR, an SDRplay, rtl_tcp, a file ...), waterfall, settings and decoders, e.g. APRS on 2 m in one tab and ADS-B on 1090 MHz in another. The tabs not shown keep receiving and decoding (no waterfall is drawn for them). The speaker icon on each tab switches that receiver's sound on or off, so e.g. FM broadcast from one radio can play in the background while you watch another; the sounds of several tabs are mixed. The tabs and their sources are restored at the next start.
+- **Thirteen decoders built in:** APRS, AIS, ACARS, VDL2, ADS-B, ISM sensors (rtl_433), RDS, SSTV, WEFAX, FT8 / FT4 / WSPR, CW (Morse), NAVTEX and DSC.
+- **Several receivers at once, in tabs.** "+ Add receiver" below the top bar opens another tab with its own source (a second RTL-SDR, an SDRplay, rtl_tcp, a file ...), waterfall, settings and decoders, e.g. APRS on 2 m in one tab and ADS-B on 1090 MHz in another. The tabs not shown keep receiving and decoding (no waterfall is drawn for them). The speaker icon on each tab switches that receiver's sound on or off, so e.g. FM broadcast from one radio can play in the background while you watch another; the sounds of several tabs are mixed. Each tab can also play on its own output device (**Audio Output** in the sidebar), e.g. RX1 on the speakers and RX2 on headphones or a virtual cable (VB-Cable, BlackHole) into another program. The tabs and their sources are restored at the next start.
 - **Several decoders at once, each on its own channel.** Decode AIS and APRS, watch the 433 MHz sensors and listen to FM radio at the same time, all within one bandwidth. Every running decoder has a tab above the decoder panel; the decoders run in their own thread, so the audio never waits for them.
 - **Tested on real signals:** ships in harbours, weather stations and car tyre sensors in the city, APRS, SSTV, HF radiofax and RDS.
 
@@ -69,8 +69,10 @@ xattr -dr com.apple.quarantine /Applications/OrbitSDR.app
 | **VDL2** | 136.650–136.975 MHz | VDL Mode 2 aircraft datalink (most European ACARS traffic today): ACARS messages, aircraft position and destination from XID frames, ground station positions. All VDL2 channels in the bandwidth are decoded at once (2 MS/s around 136.8 MHz covers them all). |
 | **FT8 / FT4 / WSPR** | HF and 6 m / 2 m dial frequencies (e.g. 7.074, 14.074 MHz) | Every known dial frequency in the bandwidth is decoded at once (FT8, FT4 and WSPR side by side), plus a channel on the tuner (USB: put the tuner just below the signals, its mode is chosen in the panel). Recordings without a start time in the file name are fine too: the slot timing is found automatically (times marked "~"). Message, SNR, time offset; stations with a locator appear on the map. Uses UTC time slots, so the computer clock must be right. Also decodes the USB audio of a transceiver (Input: Audio). |
 | **CW** | anywhere | Morse decoder: finds and follows the tone inside its channel, learns the speed (5–50 WPM). |
+| **NAVTEX** | 518 / 490 kHz, 4209.5 kHz | Maritime safety broadcasts (SITOR-B): navigational and weather warnings, forecasts, search and rescue. Station, subject and number of each message; the text appears while it is being received. All NAVTEX frequencies in the bandwidth are decoded at once (USB/CW to listen). |
+| **DSC** | 156.525 MHz (VHF ch 70), 2187.5 / 4207.5 / 6312 / 8414.5 / 12577 / 16804.5 kHz | Digital Selective Calling (GMDSS): distress, urgency, safety and routine calls between ships and coast stations. MMSI of caller and called station, nature of distress, position, working channel. Distress calls are shown in red; positions go on the map (with the ship's AIS track, same MMSI). Also decodes a scanner's FM audio (Input: Audio). |
 
-Decoded messages are logged in the settings folder (`ism.log`, `acars.log`, `vdl2.log`, `wsjt.log`, `cw.log`, `aprs.log`). **Export** saves the messages of the current session to a file. Click a row in any decoder table to see all of its fields.
+Decoded messages are logged in the settings folder (`ism.log`, `acars.log`, `vdl2.log`, `wsjt.log`, `cw.log`, `navtex.log`, `dsc.log`, `aprs.log`). **Export** saves the messages of the current session to a file. Click a row in any decoder table to see all of its fields.
 
 ## Features
 
@@ -90,7 +92,7 @@ Decoded messages are logged in the settings folder (`ism.log`, `acars.log`, `vdl
   - live positions, footprints (coverage above your minimum elevation), ground tracks, day/night shading and the sun,
   - satellite groups from CelesTrak (amateur, weather, stations, CubeSats, SatNOGS...), search by name or NORAD number, favourites, and your own TLEs (paste from the clipboard or import a file),
   - details of the selected satellite: azimuth / elevation, range, range rate, sunlight / eclipse, polar plot of the pass, the next passes (click one to jump the map to it),
-  - transmitters from the SatNOGS DB with **Track freq** (tune once) or **Track Doppler** (follow the pass). Either the tuner or the active decoder's channel is tuned, so SSTV from the ISS decodes while you listen to something else. Manual fine tuning during tracking is kept as an offset,
+  - transmitters from the SatNOGS DB with **Track freq** (tune once) or **Track Doppler** (follow the pass). You choose the receiver (tab) and what is tuned: its tuner or a decoder's channel (a chosen decoder, or automatically the one the transmitter needs). Tracking keeps working while another tab is shown, so SSTV from the ISS decodes while you listen to something else. Manual fine tuning during tracking is kept as an offset,
   - TLEs are cached for offline use: refreshed after 24 hours, marked stale after 4 days.
 
 <details>
@@ -109,7 +111,7 @@ OrbitSDR is under active development. macOS on Apple Silicon and Windows with SD
 
 - AIS, ISM, APRS, RDS, SSTV and WEFAX have been tested on real off-air signals.
 - **ACARS has only been tested with recordings so far.** If you live near an airport, please try it and [report the result](https://github.com/krzysztofchojka/OrbitSDR/issues).
-- **VDL2, FT8 / FT4 / WSPR and CW are new and have been tested with generated signals only.** Reports with real signals (and recordings that don't decode) are very welcome.
+- **VDL2, FT8 / FT4 / WSPR, CW, NAVTEX and DSC are new and have been tested with generated signals only.** Reports with real signals (and recordings that don't decode) are very welcome.
 - More digital decoders are planned.
 
 Bug reports, recordings of signals that don't decode, and feature requests are very welcome in [Issues](https://github.com/krzysztofchojka/OrbitSDR/issues). If OrbitSDR is useful to you, a ⭐ helps other people find it.
@@ -181,4 +183,4 @@ OrbitSDR is licensed under the [GNU GPL v3](LICENSE).
 
 It uses [SFML](https://www.sfml-dev.org/), [miniaudio](https://miniaud.io/), [librtlsdr](https://osmocom.org/projects/rtl-sdr), [rtl_433](https://github.com/merbanan/rtl_433) (GPL-2.0-or-later), [ft8_lib](https://github.com/kgoba/ft8_lib) (MIT) and the [SDRplay API](https://www.sdrplay.com/).
 
-The WSPR decoder is a C++ port of wsprd from [WSJT-X](https://wsjt.sourceforge.io/) (K1JT, K9AN; GPL v3), the VDL2 decoder follows [dumpvdl2](https://github.com/szpajder/dumpvdl2) (Tomasz Lemiech; GPL v3) with the Reed-Solomon decoder of Phil Karn's libfec (LGPL).
+The WSPR decoder is a C++ port of wsprd from [WSJT-X](https://wsjt.sourceforge.io/) (K1JT, K9AN; GPL v3), the VDL2 decoder follows [dumpvdl2](https://github.com/szpajder/dumpvdl2) (Tomasz Lemiech; GPL v3) with the Reed-Solomon decoder of Phil Karn's libfec (LGPL). The NAVTEX and DSC decoders follow the ones in [SDRangel](https://github.com/f4exb/sdrangel) (Jon Beniston; GPL v3), the CCIR 476 tables are taken from there.

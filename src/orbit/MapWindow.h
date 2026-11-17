@@ -229,7 +229,10 @@ private:
     long long chosenHz = 0;
 
     // --- widgets ---
-    std::shared_ptr<Dropdown> ddGroup, ddTx, ddTarget, ddFootprints, ddTime, ddLayer;
+    std::shared_ptr<Dropdown> ddGroup, ddTx, ddTarget, ddRx, ddFootprints, ddTime, ddLayer;
+    std::vector<int> rxOptIds;                 // ddRx option -> receiver id
+    std::vector<std::string> targetOptDec;     // ddTarget option -> decoder name ([0] tuner, [1] "" automatic)
+    std::string trackChoicesKey;               // what the two lists were built from
     std::shared_ptr<Checkbox> chkPlaceNames;
     std::shared_ptr<SdrButton> btnRefresh, btnPaste, btnImport, btnFav, btnUseFreq, btnOff, btnFreq, btnDoppler, btnPick, btnApplyQth;
     std::shared_ptr<TextInput> txtSearch, txtFreq;
@@ -397,13 +400,26 @@ private:
         rowT->add(btnOff, bw); rowT->add(btnFreq, bw); rowT->add(btnDoppler, bw);
         mRad->addWidget(rowT);
 
+        // which receiver (tab) and which of its channels follows the satellite
+        mRad->addWidget(std::make_shared<Label>("Receiver:", font, 11, sf::Color(150, 150, 160)));
+        ddRx = std::make_shared<Dropdown>(CW, 24.0f, font);
+        ddRx->setOptions({"RX1"});
+        ddRx->onChange = [this](int i) {
+            if (i < 0 || i >= (int)rxOptIds.size() || rxOptIds[i] == trk.rxId) return;
+            trk.rxId = rxOptIds[i];
+            trk.lastCommandHz = 0; trk.userOffsetHz = 0; trk.demodApplied = false; trk.applyStatus.clear();
+            trackChoicesKey.clear();
+        };
+        mRad->addWidget(ddRx);
         mRad->addWidget(std::make_shared<Label>("Tune:", font, 11, sf::Color(150, 150, 160)));
         ddTarget = std::make_shared<Dropdown>(CW, 24.0f, font);
-        ddTarget->setOptions({"Tuner (VFO, what you hear)", "Active decoder's channel"});
-        ddTarget->setSelection((int)trk.target);
+        ddTarget->setOptions({"Tuner (VFO, what you hear)", "Decoder channel (automatic)"});
         ddTarget->onChange = [this](int i) {
-            trk.target = i == 1 ? TrackTarget::Decoder : TrackTarget::Tuner;
+            if (i < 0 || i >= (int)targetOptDec.size()) return;
+            if (i == 0) trk.target = TrackTarget::Tuner;
+            else { trk.target = TrackTarget::Decoder; trk.decoderName = targetOptDec[i]; }
             trk.lastCommandHz = 0; trk.userOffsetHz = 0; trk.applyStatus.clear();
+            trackChoicesKey.clear();
         };
         mRad->addWidget(ddTarget);
         chkSetMode = std::make_shared<Checkbox>("Switch demodulator to the transmitter's mode", font, trk.setDemodMode);
@@ -518,7 +534,7 @@ private:
         wTimeInfo->onDraw = [this](sf::RenderWindow& w, const sf::FloatRect& r) { drawTimeInfo(w, r); };
         mTime->addWidget(wTimeInfo);
 
-        allDropdowns = {ddGroup, ddTx, ddTarget, ddFootprints, ddTime, ddLayer};
+        allDropdowns = {ddGroup, ddTx, ddRx, ddTarget, ddFootprints, ddTime, ddLayer};
 
         tbM1h.onClick = [this]() { simOffsetSec -= 3600; };
         tbM10.onClick = [this]() { simOffsetSec -= 600; };
@@ -545,11 +561,60 @@ private:
     bool pendingSearchSwitch = false;
     uint64_t searchVersionSeen = 0;
 
+    // The receiver / tune lists from what main.cpp reported (rebuilt only when it changes,
+    // never while one of them is open)
+    void refreshTrackChoices() {
+        if (!ddRx || !ddTarget || ddRx->isOpen || ddTarget->isOpen) return;
+        const SatTracker::RxChoice* sel = nullptr;
+        for (const auto& r : trk.receivers) if (r.id == trk.rxId) sel = &r;
+        std::string key = std::to_string(trk.rxId) + "|" + std::to_string((int)trk.target) + "|" + trk.decoderName + "|";
+        for (const auto& r : trk.receivers) {
+            key += std::to_string(r.id) + ":" + r.name + ";";
+            if (&r == sel) for (const auto& d : r.decoders) key += d + ",";
+        }
+        if (key == trackChoicesKey) return;
+        trackChoicesKey = key;
+
+        std::vector<std::string> rxOpts;
+        rxOptIds.clear();
+        int rxSel = 0;
+        for (const auto& r : trk.receivers) {
+            if (r.id == trk.rxId) rxSel = (int)rxOptIds.size();
+            rxOptIds.push_back(r.id);
+            rxOpts.push_back(r.name);
+        }
+        if (!sel) {   // the chosen receiver's tab was closed
+            rxSel = (int)rxOptIds.size();
+            rxOptIds.push_back(trk.rxId);
+            rxOpts.push_back("RX" + std::to_string(trk.rxId) + " (closed)");
+        }
+        ddRx->setOptions(rxOpts);
+        ddRx->setSelection(rxSel);
+
+        std::vector<std::string> tOpts = {"Tuner (VFO, what you hear)", "Decoder channel (automatic)"};
+        targetOptDec = {std::string(), std::string()};
+        int tSel = trk.target == TrackTarget::Tuner ? 0 : 1;
+        bool haveChosen = trk.decoderName.empty();
+        if (sel) for (const auto& d : sel->decoders) {
+            if (trk.target == TrackTarget::Decoder && d == trk.decoderName) { tSel = (int)tOpts.size(); haveChosen = true; }
+            tOpts.push_back("Decoder channel: " + d);
+            targetOptDec.push_back(d);
+        }
+        if (!haveChosen) {   // a decoder chosen before that is off now
+            if (trk.target == TrackTarget::Decoder) tSel = (int)tOpts.size();
+            tOpts.push_back("Decoder channel: " + trk.decoderName + " (off)");
+            targetOptDec.push_back(trk.decoderName);
+        }
+        ddTarget->setOptions(tOpts);
+        ddTarget->setSelection(tSel);
+    }
+
     void syncPanelFromState() {
         for (size_t i = 0; i < satGroups().size(); i++) if (satGroups()[i].id == groupId) ddGroup->setSelection((int)i);
         chkNight->checked = showNight; chkGrid->checked = showGrid; chkTracks->checked = showTracks; chkLabels->checked = allLabels;
         ddFootprints->setSelection(footprintMode);
-        ddTarget->setSelection((int)trk.target);
+        trackChoicesKey.clear();
+        refreshTrackChoices();
         chkSetMode->checked = trk.setDemodMode;
         slMinEl->setValueSilent((float)trk.minElDeg);
         slMinEl->onChange((float)trk.minElDeg);
@@ -1566,6 +1631,7 @@ private:
         refreshTransmitters();
         clampCamera();
 
+        refreshTrackChoices();
         // button states
         btnFav->setText(cat.favorites.count(selected) ? "Unfavorite" : "Favorite");
         const bool trackingThis = trk.active() && trk.norad == selected;

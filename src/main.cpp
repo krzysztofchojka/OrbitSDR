@@ -44,6 +44,8 @@
 #include "modules/WSJT/WSJT_Decoder.h"
 #include "modules/VDL2/VDL2_Decoder.h"
 #include "modules/CW/CW_Decoder.h"
+#include "modules/Maritime/NAVTEX_Decoder.h"
+#include "modules/Maritime/DSC_Decoder.h"
 
 // Satellite map and tracking
 #include "orbit/MapWindow.h"
@@ -101,6 +103,7 @@ struct Receiver {
     float gain = 0.0f, gainMin = 0.0f, gainMax = 50.0f;
     std::string hostText;
     bool uiSaved = false;
+    std::string audioDevice;              // its output device by name ("" = system default)
 
     // decoders of this receiver
     std::vector<std::unique_ptr<SDRModule>> owned;
@@ -114,6 +117,8 @@ struct Receiver {
     ADSBDecoder* adsb = nullptr;
     WSJTDecoder* wsjt = nullptr;
     CWDecoder* cw = nullptr;
+    NAVTEXDecoder* navtex = nullptr;
+    DSCDecoder* dsc = nullptr;
 
     // a short name for the tab
     std::string title() const {
@@ -158,8 +163,6 @@ int main() {
     AudioSink audio;
     std::vector<std::string> deviceNames;
     for (const auto& dev : audio.availableDevices) deviceNames.push_back(dev.name);
-    audio.initDevice(0, (int)AUDIO_RATE);
-    audio.start();
 
     // The receivers (tabs); `cur` is the one shown. Created below, once the font exists.
     std::vector<std::unique_ptr<Receiver>> receivers;
@@ -304,11 +307,18 @@ int main() {
         rx->wsjt->exportDir = getDefaultExportPath();
         rx->cw = add(new CWDecoder());
         rx->cw->log.setPath(getConfigFilePath("cw.log"));
+        rx->navtex = add(new NAVTEXDecoder());
+        rx->navtex->log.setPath(getConfigFilePath("navtex.log"));
+        rx->navtex->exportDir = getDefaultExportPath();
+        rx->dsc = add(new DSCDecoder());
+        rx->dsc->log.setPath(getConfigFilePath("dsc.log"));
+        rx->dsc->exportDir = getDefaultExportPath();
         // the order of the Decoders checkboxes
-        rx->decMods = { nullptr, rx->ais, rx->sstv, rx->wefax, rx->ism, rx->acars, rx->vdl2, rx->adsb, rx->wsjt, rx->cw };
+        rx->decMods = { nullptr, rx->ais, rx->sstv, rx->wefax, rx->ism, rx->acars, rx->vdl2, rx->adsb, rx->wsjt, rx->cw, rx->navtex, rx->dsc };
         rx->sd.visible = false;
         rx->sd.audioOut = true;          // its speaker button on the tab (on by default)
         rx->sd.audioStream = rx->id;     // its own stream in the speaker's mix
+        audio.setDevice(rx->sd.audioStream, 0);
         rx->dsp = std::thread(dspWorker, std::ref(rx->running), std::ref(rx->sd), std::ref(audio));
         receivers.push_back(std::move(r));
         return rx;
@@ -933,11 +943,16 @@ int main() {
     auto modAudio = sidebar.addModule("Audio Output");
     auto ddAudio = std::make_shared<Dropdown>(SIDEBAR_W - 40, 25.0f, font);
     ddAudio->setOptions(deviceNames);
+    // per receiver: each tab can play on its own device (speakers, headphones, a virtual cable)
+    auto lblAudioDev = std::make_shared<Label>("Output of this receiver (per tab):", font, 11, sf::Color(150, 150, 160));
     ddAudio->onChange = [&](int idx) {
-        audio.stop();
-        audio.initDevice(idx, (int)AUDIO_RATE);
-        audio.start();   // always running: it mixes every receiver that has its speaker on
+        if (!audio.setDevice(cur->sd.audioStream, idx)) {
+            ddAudio->setSelection(0);
+            idx = 0;
+        }
+        cur->audioDevice = audio.deviceName(idx);
     };
+    modAudio->addWidget(lblAudioDev);
     modAudio->addWidget(ddAudio);
 
     auto modDemod = sidebar.addModule("Demodulator");
@@ -1187,19 +1202,21 @@ int main() {
     auto chkADSB  = std::make_shared<Checkbox>("ADS-B (aircraft, 1090 MHz)", font);
     auto chkVDL2  = std::make_shared<Checkbox>("VDL2 (aircraft datalink, 136.975)", font);
     auto chkCW    = std::make_shared<Checkbox>("CW (Morse code)", font);
+    auto chkNAVTEX = std::make_shared<Checkbox>("NAVTEX (518 / 490 kHz)", font);
+    auto chkDSC   = std::make_shared<Checkbox>("DSC (VHF ch70, MF/HF)", font);
     auto chkWSJT  = std::make_shared<Checkbox>(WSJTDecoder::ft8Available() ? "FT8 / FT4 / WSPR (HF digital)"
                                                                            : "WSPR (FT8 / FT4 not in this build)", font);
 
     // The checkboxes; the modules are the shown receiver's (cur->decMods[i], nullptr = APRS)
     struct DecoderEntry { std::shared_ptr<Checkbox> chk; };
     std::vector<DecoderEntry> decoders = {
-        {chkAprs}, {chkAIS}, {chkSSTV}, {chkWEFAX}, {chkISM}, {chkACARS}, {chkVDL2}, {chkADSB}, {chkWSJT}, {chkCW} };
+        {chkAprs}, {chkAIS}, {chkSSTV}, {chkWEFAX}, {chkISM}, {chkACARS}, {chkVDL2}, {chkADSB}, {chkWSJT}, {chkCW}, {chkNAVTEX}, {chkDSC} };
 
-    auto activateDecoder = [&](size_t idx, bool on) {
-        SDRModule* const mod = cur->decMods[idx];
-        std::lock_guard<std::mutex> l(cur->sd.mtx);
+    auto activateDecoderOn = [&](Receiver* r, size_t idx, bool on) {
+        SDRModule* const mod = r->decMods[idx];
+        std::lock_guard<std::mutex> l(r->sd.mtx);
         if (mod) {
-            auto& act = cur->sd.activeDecoders;
+            auto& act = r->sd.activeDecoders;
             act.erase(std::remove(act.begin(), act.end(), mod), act.end());
             if (on) {
                 if (mod->channelSet()) mod->channelSet()->clear();   // placed again for the current band
@@ -1209,11 +1226,12 @@ int main() {
                 mod->enabled = false;
             }
         } else {
-            if (on) cur->sd.aprsCh.clear();
-            cur->sd.aprsEnabled = on;
+            if (on) r->sd.aprsCh.clear();
+            r->sd.aprsEnabled = on;
         }
-        if (on) cur->selectedTab = mod ? mod->name : std::string("APRS");   // show the one just switched on
+        if (on) r->selectedTab = mod ? mod->name : std::string("APRS");   // show the one just switched on
     };
+    auto activateDecoder = [&](size_t idx, bool on) { activateDecoderOn(cur, idx, on); };
     for (size_t i = 0; i < decoders.size(); i++) {
         decoders[i].chk->onToggle = [&, i](bool b) { activateDecoder(i, b); };
         modDecoders->addWidget(decoders[i].chk);
@@ -1221,13 +1239,22 @@ int main() {
     modDecoders->addWidget(std::make_shared<Label>("Several can run at once, each on its own channels", font, 11, sf::Color(150, 150, 160)));
 
     // The map window offers to switch on the decoder a satellite transmitter needs (SSTV, APRS)
+    // on the receiver chosen for tracking in the map (its tab may be in the background)
     mapWindow.onEnableDecoder = [&](const std::string& name) {
+        Receiver* r = cur;
+        for (auto& rxp : receivers) if (rxp->id == satTracker.rxId) r = rxp.get();
         for (size_t i = 0; i < decoders.size(); i++) {
             DecoderEntry& d = decoders[i];
-            const std::string n = cur->decMods[i] ? cur->decMods[i]->name : std::string("APRS");
+            const std::string n = r->decMods[i] ? r->decMods[i]->name : std::string("APRS");
             if (n != name) continue;
-            if (!d.chk->checked) { d.chk->checked = true; d.chk->onToggle(true); }
-            cur->selectedTab = n;
+            if (r == cur) {
+                if (!d.chk->checked) { d.chk->checked = true; d.chk->onToggle(true); }
+            } else {
+                bool on;
+                { std::lock_guard<std::mutex> l(r->sd.mtx); on = r->decMods[i] ? r->decMods[i]->enabled : r->sd.aprsEnabled; }
+                if (!on) activateDecoderOn(r, i, true);
+            }
+            r->selectedTab = n;
         }
     };
 
@@ -1373,7 +1400,7 @@ int main() {
         volSlider.setPosition(layout.winW - 170, 10);
         btnMute.setPosition(layout.winW - 220, 10);
         sidebar.setGeometry(layout.sidebarX, TOP_BAR_H, layout.winH - TOP_BAR_H);
-        timeSlider.setPosition(20, layout.winH - 30);
+        timeSlider.setPosition(20, layout.winH - TIMELINE_H + 6.0f);
         timeSlider.setWidth(layout.specW - 40);
 
         wSpr.setPosition({0, TOP_BAR_H + layout.specH + layout.tuneBarH});
@@ -1545,16 +1572,16 @@ int main() {
                                          sf::Color(200, 200, 210), sf::Color(160, 220, 60) };
         return pal[entry % (sizeof(pal) / sizeof(pal[0]))];
     };
-    auto collectTabs = [&]() {
+    auto collectTabs = [&](Receiver* r) {
         std::vector<DecTab> t;
         std::vector<SDRModule*> act;
         bool aprs;
-        { std::lock_guard<std::mutex> l(cur->sd.mtx); act = cur->sd.activeDecoders; aprs = cur->sd.aprsEnabled; }
-        if (aprs) t.push_back({"APRS", nullptr, &cur->sd.aprsCh, decoderColor(0), 0});
+        { std::lock_guard<std::mutex> l(r->sd.mtx); act = r->sd.activeDecoders; aprs = r->sd.aprsEnabled; }
+        if (aprs) t.push_back({"APRS", nullptr, &r->sd.aprsCh, decoderColor(0), 0});
         for (SDRModule* m : act) {
             if (!m || !m->enabled) continue;
             size_t entry = 0;
-            for (size_t i = 0; i < cur->decMods.size(); i++) if (cur->decMods[i] == m) entry = i;
+            for (size_t i = 0; i < r->decMods.size(); i++) if (r->decMods[i] == m) entry = i;
             t.push_back({m->name, m, m->channelSet(), decoderColor(entry), entry});
         }
         return t;
@@ -1572,7 +1599,6 @@ int main() {
     //  The receivers not shown keep running: no waterfall, no speaker.
     // =====================================================================
     bool appMuted = false;
-    Receiver* trackRx = nullptr;            // satellite tracking runs on this receiver
     struct RxAction { int kind = 0; Receiver* rx = nullptr; };   // 1 add, 2 close, 3 switch
     RxAction rxAction;
     struct RxTabHit { sf::FloatRect tab, close, speaker; Receiver* rx; };
@@ -1593,6 +1619,7 @@ int main() {
     };
 
     auto applyUi = [&](Receiver* r) {
+        ddAudio->setSelection(audio.deviceOf(r->sd.audioStream));
         // source
         ddSourceType->setSelection(r->sourceType);
         updateRadioControls(r->sourceType);
@@ -1730,7 +1757,6 @@ int main() {
             for (auto& x : receivers) if (x.get() != r) { other = x.get(); break; }
             switchReceiver(other);
         }
-        if (trackRx == r) trackRx = nullptr;
         const int stream = r->sd.audioStream;
         for (auto it = receivers.begin(); it != receivers.end(); ++it)
             if (it->get() == r) { receivers.erase(it); break; }   // stops its DSP thread and source
@@ -1896,8 +1922,14 @@ int main() {
             slBW->onChange(slBW->currentVal);
         }
         switchReceiver(first);
-        for (size_t i = 0; i < receivers.size(); i++)
-            receivers[i]->sd.audioOut = settingsMgr.getBool("rx" + std::to_string(i + 1) + "_speaker", true);
+        for (size_t i = 0; i < receivers.size(); i++) {
+            Receiver& r = *receivers[i];
+            r.sd.audioOut = settingsMgr.getBool("rx" + std::to_string(i + 1) + "_speaker", true);
+            // the output device by name (stored hex: settings values lose spaces)
+            const std::string dev = fromHex(settingsMgr.getString("rx" + std::to_string(i + 1) + "_audio_dev", ""));
+            if (!dev.empty() && audio.deviceIndex(dev) > 0 && audio.setDevice(r.sd.audioStream, audio.deviceIndex(dev))) r.audioDevice = dev;
+        }
+        ddAudio->setSelection(audio.deviceOf(cur->sd.audioStream));
     }
 
     while (window.isOpen()) {
@@ -2022,7 +2054,7 @@ int main() {
         float bwPixels = (bwPct / viewWidthPct) * layout.specW;
 
         // --- Running decoders: their tabs, the selected one's panel ---
-        const std::vector<DecTab> tabs = collectTabs();
+        const std::vector<DecTab> tabs = collectTabs(cur);
         {
             bool found = false;
             for (const DecTab& t : tabs) if (t.name == cur->selectedTab) found = true;
@@ -2033,7 +2065,7 @@ int main() {
         SDRModule* panelMod = selTab ? selTab->mod : nullptr;   // nullptr + selTab: the APRS tab
         const bool aprsShown = selTab && !selTab->mod;
         aprsOn = aprsOn && aprsShown;   // the APRS list is the APRS tab's panel
-        const float timelineStripH = (cur->sourceType == 0) ? 40.0f : 0.0f;
+        const float timelineStripH = (cur->sourceType == 0) ? TIMELINE_H : 0.0f;
         const float aprsTopY = layout.winH - timelineStripH - 200.0f;
 
         // --- Decoder channels: coloured bands + handles on the tuning bar (all running decoders) ---
@@ -2399,7 +2431,6 @@ int main() {
                 }
                 if (s) {
                     btnPlay.setText("||"); btnPlay.setActive(true);
-                    audio.start();
                     { std::lock_guard<std::mutex> l(cur->sd.sourceMtx); if (cur->sd.source) cur->sd.source->start(); }
                 } else {
                     btnPlay.setText(">"); btnPlay.setActive(false);
@@ -2534,7 +2565,7 @@ int main() {
                         }
                     }
 
-                    bool overTimeline = (cur->sourceType == 0) && (timeSlider.isDragging || (m.y > layout.winH - 40));
+                    bool overTimeline = (cur->sourceType == 0) && (timeSlider.isDragging || (m.y > layout.winH - TIMELINE_H));
                     bool inFreqScaleZone = (m.y >= TOP_BAR_H + layout.specH && m.y <= TOP_BAR_H + layout.specH + layout.tuneBarH && m.x < layout.specW);
 
                     float leftEdge = visualCenterX - bwPixels / 2.0f;
@@ -2679,79 +2710,113 @@ int main() {
             }
         }
         {
-            // The decoder whose channel follows the satellite: the one the transmitter needs
-            // (e.g. SSTV) when it runs, otherwise the decoder in the selected tab
+            // The map's choices: every receiver (tab) and its running decoders
+            auto rxDecTabs = [&](Receiver* r) { return r == cur ? tabs : collectTabs(r); };
+            satTracker.receivers.clear();
+            for (auto& rxp : receivers) {
+                orbit::SatTracker::RxChoice c;
+                c.id = rxp->id;
+                c.name = rxp->title();
+                for (const DecTab& t : rxDecTabs(rxp.get())) c.decoders.push_back(t.name);
+                satTracker.receivers.push_back(std::move(c));
+            }
+            // Tracking runs on the chosen receiver, also while another tab is shown
+            Receiver* R = nullptr;
+            for (auto& rxp : receivers) if (rxp->id == satTracker.rxId) R = rxp.get();
+
+            // The decoder whose channel follows the satellite: the one chosen in the map;
+            // automatic: the one the transmitter needs (e.g. SSTV) when it runs, otherwise
+            // the decoder in the receiver's selected tab
             std::string decName;
             ChannelSet* trackSet = nullptr;
-            {
-                const std::string want = orbit::demodHintFor(satTracker.tx).decoder;
+            if (R) {
+                const std::vector<DecTab> rt = rxDecTabs(R);
+                const std::string hint = orbit::demodHintFor(satTracker.tx).decoder;
                 const DecTab* t = nullptr;
-                for (const DecTab& x : tabs) if (!want.empty() && x.name == want) t = &x;
-                if (!t) t = selTab;
+                if (!satTracker.decoderName.empty()) {
+                    for (const DecTab& x : rt) if (x.name == satTracker.decoderName) t = &x;
+                } else {
+                    for (const DecTab& x : rt) if (!hint.empty() && x.name == hint) t = &x;
+                    if (!t) for (const DecTab& x : rt) if (x.name == R->selectedTab) t = &x;
+                    if (!t && !rt.empty()) t = &rt.back();
+                }
                 if (t) { decName = t->name; trackSet = t->set; }
+                if (R->inputIsAudio) trackSet = nullptr;
             }
-            if (cur->inputIsAudio) trackSet = nullptr;
             satTracker.activeDecoderName = decName;
 
-            // Tracking belongs to the receiver it was started on; in another tab it pauses
-            if (!satTracker.active()) trackRx = nullptr;
-            else if (!trackRx) trackRx = cur;
-            const bool trackHere = !trackRx || trackRx == cur;
             // real time, or the recording's / manual time set in the map's Time module
             const bool trackWants = satTracker.update(satCatalog, mapWindow.trackerJd());
-            if (trackWants && !trackHere)
-                satTracker.applyStatus = "Tracking runs on RX" + std::to_string(trackRx->id) + ": open its tab";
-            if (trackWants && trackHere) {
+            if (trackWants && !R)
+                satTracker.applyStatus = "RX" + std::to_string(satTracker.rxId) + " is closed: choose a receiver";
+            if (trackWants && R) {
                 satTracker.applyStatus.clear();
-                const double rate = hwSampleRate > 0 ? hwSampleRate : 2e6;
+                const bool shown = (R == cur);
+                double rate = 2e6;
+                bool rHw = false;
+                {
+                    std::lock_guard<std::mutex> l(R->sd.sourceMtx);
+                    if (R->sd.source) { rate = R->sd.source->getSampleRate(); rHw = R->sd.source->isHardware(); }
+                }
+                if (rate <= 0) rate = 2e6;
                 // Retunes the radio so `hz` lies in the received band, away from the DC spike;
                 // the tuner (VFO) goes onto `hz` as well
                 auto recentreOn = [&](long long hz) {
                     const long long c = hz + (long long)std::llround(rate * 0.25);
-                    cur->centerFreq = c;
+                    R->centerFreq = c;
                     {
-                        std::lock_guard<std::mutex> l(cur->sd.mtx);
-                        cur->sd.centerFreq = c;
-                        cur->sd.tunedFreqPercent = 0.5 + (double)(hz - c) / rate;
-                        cur->sd.viewCenterPct = 0.5;
+                        std::lock_guard<std::mutex> l(R->sd.mtx);
+                        R->sd.centerFreq = c;
+                        R->sd.tunedFreqPercent = 0.5 + (double)(hz - c) / rate;
+                        R->sd.viewCenterPct = 0.5;
                     }
-                    cur->pendingCenterFreq = c;
-                    cur->debouncer.restart();
-                    freqVFO.setFrequency(hz);
+                    R->pendingCenterFreq = c;
+                    R->debouncer.restart();
+                    if (shown) freqVFO.setFrequency(hz);
                 };
                 auto inBand = [&](long long hz, double width) {
-                    return std::abs((double)(hz - cur->centerFreq)) + width / 2.0 < rate * 0.45;
+                    return std::abs((double)(hz - R->centerFreq)) + width / 2.0 < rate * 0.45;
                 };
 
                 if (satTracker.target == orbit::TrackTarget::Tuner) {
                     // demodulator mode of the transmitter, once per tracking start
-                    if (satTracker.setDemodMode && !satTracker.demodApplied && !cur->inputIsAudio) {
+                    if (satTracker.setDemodMode && !satTracker.demodApplied && !R->inputIsAudio) {
                         const orbit::DemodHint h = orbit::demodHintFor(satTracker.tx);
-                        restoreMode(h.mode);
-                        slBW->setValueSilent((float)h.bandwidthHz);
-                        slBW->onChange(slBW->currentVal);
+                        if (shown) {
+                            restoreMode(h.mode);
+                            slBW->setValueSilent((float)h.bandwidthHz);
+                            slBW->onChange(slBW->currentVal);
+                        } else {   // the widgets show another receiver: set its SharedData (shown when its tab opens)
+                            std::lock_guard<std::mutex> l(R->sd.mtx);
+                            R->sd.mode = h.mode;
+                            R->sd.bandwidth = h.bandwidthHz;
+                        }
                     }
                     satTracker.demodApplied = true;
                     double pct;
-                    { std::lock_guard<std::mutex> l(cur->sd.mtx); pct = cur->sd.tunedFreqPercent; }
-                    const long long curHz = cur->centerFreq + (long long)std::llround((pct - 0.5) * rate);
+                    { std::lock_guard<std::mutex> l(R->sd.mtx); pct = R->sd.tunedFreqPercent; }
+                    const long long curHz = R->centerFreq + (long long)std::llround((pct - 0.5) * rate);
                     satTracker.noteRadioFrequency(curHz);
                     const long long want = satTracker.wantHz;
+                    double bwNow;
+                    { std::lock_guard<std::mutex> l(R->sd.mtx); bwNow = R->sd.bandwidth; }
                     if (std::llabs(want - curHz) >= 5 && trackClock.getElapsedTime().asMilliseconds() >= 100) {
-                        if (isHw && !inBand(want, slBW->currentVal)) recentreOn(want);
-                        else if (!isHw && !inBand(want, 0.0)) satTracker.applyStatus = "Outside the file's band";
+                        if (rHw && !inBand(want, bwNow)) recentreOn(want);
+                        else if (!rHw && !inBand(want, 0.0)) satTracker.applyStatus = "Outside the file's band";
                         else {
-                            std::lock_guard<std::mutex> l(cur->sd.mtx);
-                            cur->sd.tunedFreqPercent = 0.5 + (double)(want - cur->centerFreq) / rate;
-                            freqVFO.setFrequency(want);
+                            std::lock_guard<std::mutex> l(R->sd.mtx);
+                            R->sd.tunedFreqPercent = 0.5 + (double)(want - R->centerFreq) / rate;
+                            if (shown) freqVFO.setFrequency(want);
                         }
                         satTracker.lastCommandHz = want;
                         trackClock.restart();
                     } else if (satTracker.lastCommandHz == 0) satTracker.lastCommandHz = curHz;
                 } else {
-                    if (!trackSet) satTracker.applyStatus = cur->inputIsAudio ? "Audio input: decoder channels are not used"
-                                                                         : "Switch on a decoder (e.g. SSTV) to track its channel";
-                    else {
+                    if (!trackSet) {
+                        if (R->inputIsAudio) satTracker.applyStatus = "Audio input: decoder channels are not used";
+                        else if (!satTracker.decoderName.empty()) satTracker.applyStatus = "Switch on " + satTracker.decoderName + " on RX" + std::to_string(R->id);
+                        else satTracker.applyStatus = "Switch on a decoder (e.g. SSTV) on RX" + std::to_string(R->id);
+                    } else {
                         const auto chans = trackSet->snapshot();
                         if (chans.empty()) satTracker.applyStatus = "Waiting for the decoder's channel...";
                         else {
@@ -2760,7 +2825,7 @@ int main() {
                             const long long want = satTracker.wantHz;
                             if ((ch.followVfo || std::llabs(want - ch.freqHz) >= 5) && trackClock.getElapsedTime().asMilliseconds() >= 100) {
                                 trackSet->moveTo(ch.id, want);
-                                if (isHw && !inBand(want, ch.widthHz)) recentreOn(want);
+                                if (rHw && !inBand(want, ch.widthHz)) recentreOn(want);
                                 satTracker.lastCommandHz = want;
                                 trackClock.restart();
                             }
@@ -3428,17 +3493,59 @@ int main() {
             }
         }
 
+        // --- Decoder tabs (above the panel; drawn first: the panel's drop-down lists open over them) ---
+        tabHits.clear();
+        {
+            // per receiver: switching to a tab that skipped blocks long ago is no new warning
+            const unsigned long long drops = cur->sd.decoderDrops.load();
+            if (drops > cur->seenDrops) { decoderDropClock.restart(); decoderDropSeen = true; }
+            cur->seenDrops = drops;
+        }
+        if (!tabs.empty()) {
+            sf::RectangleShape strip({layout.specW, TAB_H});
+            strip.setPosition({0.0f, tabTop});
+            strip.setFillColor(sf::Color(24, 25, 30, 250));
+            window.draw(strip);
+            auto tabText = [&](const std::string& str, float x, float y, sf::Color c) {
+                sf::Text t(font, sf::String::fromUtf8(str.begin(), str.end()), 22);
+                t.setScale({0.5f, 0.5f});
+                t.setFillColor(c);
+                t.setPosition({std::round(x), std::round(y)});
+                window.draw(t);
+                return t.getGlobalBounds().size.x;
+            };
+            float tx = 4.0f;
+            for (const DecTab& t : tabs) {
+                sf::Text probe(font, sf::String::fromUtf8(t.name.begin(), t.name.end()), 22);
+                const float tw = probe.getGlobalBounds().size.x * 0.5f + 40.0f;
+                const bool sel = (&t == selTab);
+                sf::RectangleShape bg({tw, TAB_H - 3.0f});
+                bg.setPosition({tx, tabTop + 3.0f});
+                bg.setFillColor(sel ? sf::Color(20, 22, 27) : sf::Color(40, 42, 50));
+                bg.setOutlineThickness(1.0f);
+                bg.setOutlineColor(sel ? Theme::Accent : sf::Color(60, 60, 68));
+                window.draw(bg);
+                sf::RectangleShape mark({4.0f, TAB_H - 9.0f});
+                mark.setPosition({tx + 5.0f, tabTop + 6.0f});
+                mark.setFillColor(t.color);
+                window.draw(mark);
+                tabText(t.name, tx + 13.0f, tabTop + 5.0f, sel ? sf::Color::White : sf::Color(180, 180, 190));
+                const sf::FloatRect closeR({tx + tw - 16.0f, tabTop + 3.0f}, {16.0f, TAB_H - 3.0f});
+                const bool overClose = closeR.contains(mousePos);
+                tabText("x", tx + tw - 12.0f, tabTop + 4.0f, overClose ? sf::Color(255, 120, 120) : sf::Color(130, 130, 140));
+                tabHits.push_back({sf::FloatRect({tx, tabTop}, {tw, TAB_H}), closeR, t.entry, t.name});
+                tx += tw + 3.0f;
+            }
+            if (decoderDropSeen && decoderDropClock.getElapsedTime().asSeconds() < 5.0f)
+                tabText("Decoders can't keep up (CPU): some blocks were skipped. Switch some off or lower the sample rate.",
+                        tx + 10.0f, tabTop + 5.0f, sf::Color(255, 140, 90));
+        }
+
         SDRModule* decoderUI = panelMod;
 
         if (decoderUI && decoderUI->enabled) {
             float tableH = panelH;
             float tableY = panelTop;
-            if (timelineStripH > 0.0f) {   // background for the timeline below the panel
-                sf::RectangleShape strip({layout.specW, timelineStripH});
-                strip.setPosition({0, layout.winH - timelineStripH});
-                strip.setFillColor(sf::Color(30, 30, 35));
-                window.draw(strip);
-            }
             decoderUI->draw(window, 0, tableY, layout.specW, tableH);
         }
         else {
@@ -3552,7 +3659,15 @@ int main() {
             }
         }
 
-        if (cur->sourceType == 0) timeSlider.draw(window);
+        if (cur->sourceType == 0) {   // the file's timeline on its own grey strip (with any decoder, also APRS)
+            sf::RectangleShape strip({layout.specW, TIMELINE_H});
+            strip.setPosition({0, layout.winH - TIMELINE_H});
+            strip.setFillColor(sf::Color(30, 30, 35));
+            strip.setOutlineThickness(1.0f);
+            strip.setOutlineColor(sf::Color(60, 60, 60));
+            window.draw(strip);
+            timeSlider.draw(window);
+        }
         sidebar.draw(window);
 
         window.draw(topBar);
@@ -3679,54 +3794,6 @@ int main() {
             infoTxt.setFillColor(sf::Color::Yellow);
         }
 
-        // --- Decoder tabs (above the panel) ---
-        tabHits.clear();
-        {
-            // per receiver: switching to a tab that skipped blocks long ago is no new warning
-            const unsigned long long drops = cur->sd.decoderDrops.load();
-            if (drops > cur->seenDrops) { decoderDropClock.restart(); decoderDropSeen = true; }
-            cur->seenDrops = drops;
-        }
-        if (!tabs.empty()) {
-            sf::RectangleShape strip({layout.specW, TAB_H});
-            strip.setPosition({0.0f, tabTop});
-            strip.setFillColor(sf::Color(24, 25, 30, 250));
-            window.draw(strip);
-            auto tabText = [&](const std::string& str, float x, float y, sf::Color c) {
-                sf::Text t(font, sf::String::fromUtf8(str.begin(), str.end()), 22);
-                t.setScale({0.5f, 0.5f});
-                t.setFillColor(c);
-                t.setPosition({std::round(x), std::round(y)});
-                window.draw(t);
-                return t.getGlobalBounds().size.x;
-            };
-            float tx = 4.0f;
-            for (const DecTab& t : tabs) {
-                sf::Text probe(font, sf::String::fromUtf8(t.name.begin(), t.name.end()), 22);
-                const float tw = probe.getGlobalBounds().size.x * 0.5f + 40.0f;
-                const bool sel = (&t == selTab);
-                sf::RectangleShape bg({tw, TAB_H - 3.0f});
-                bg.setPosition({tx, tabTop + 3.0f});
-                bg.setFillColor(sel ? sf::Color(20, 22, 27) : sf::Color(40, 42, 50));
-                bg.setOutlineThickness(1.0f);
-                bg.setOutlineColor(sel ? Theme::Accent : sf::Color(60, 60, 68));
-                window.draw(bg);
-                sf::RectangleShape mark({4.0f, TAB_H - 9.0f});
-                mark.setPosition({tx + 5.0f, tabTop + 6.0f});
-                mark.setFillColor(t.color);
-                window.draw(mark);
-                tabText(t.name, tx + 13.0f, tabTop + 5.0f, sel ? sf::Color::White : sf::Color(180, 180, 190));
-                const sf::FloatRect closeR({tx + tw - 16.0f, tabTop + 3.0f}, {16.0f, TAB_H - 3.0f});
-                const bool overClose = closeR.contains(mousePos);
-                tabText("x", tx + tw - 12.0f, tabTop + 4.0f, overClose ? sf::Color(255, 120, 120) : sf::Color(130, 130, 140));
-                tabHits.push_back({sf::FloatRect({tx, tabTop}, {tw, TAB_H}), closeR, t.entry, t.name});
-                tx += tw + 3.0f;
-            }
-            if (decoderDropSeen && decoderDropClock.getElapsedTime().asSeconds() < 5.0f)
-                tabText("Decoders can't keep up (CPU): some blocks were skipped. Switch some off or lower the sample rate.",
-                        tx + 10.0f, tabTop + 5.0f, sf::Color(255, 140, 90));
-        }
-
         // Popup window of a decoder, above everything else
         for (SDRModule* m : runningMods)
             if (m->enabled && m->modalOpen()) { m->drawModal(window); break; }
@@ -3737,8 +3804,10 @@ int main() {
     if (!receivers.empty() && cur != receivers[0].get()) switchReceiver(receivers[0].get());
     SettingsManager saveMgr;
     saveMgr.set("rx_count", (int)receivers.size());
-    for (size_t i = 0; i < receivers.size(); i++)
+    for (size_t i = 0; i < receivers.size(); i++) {
         saveMgr.set("rx" + std::to_string(i + 1) + "_speaker", receivers[i]->sd.audioOut.load());
+        saveMgr.set("rx" + std::to_string(i + 1) + "_audio_dev", toHex(receivers[i]->audioDevice));
+    }
     for (size_t i = 1; i < receivers.size(); i++) {
         Receiver* r = receivers[i].get();
         const std::string k = "rx" + std::to_string(i + 1) + "_";

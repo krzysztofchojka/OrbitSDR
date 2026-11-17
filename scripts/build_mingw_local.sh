@@ -11,11 +11,13 @@ echo "------------------------------------------"
 echo "Checking and installing system packages..."
 pacman -S --needed --noconfirm \
     mingw-w64-ucrt-x86_64-gcc \
+    mingw-w64-ucrt-x86_64-binutils \
     mingw-w64-ucrt-x86_64-rtl-sdr \
     mingw-w64-ucrt-x86_64-make \
     unzip \
     curl \
-    wget
+    wget \
+    coreutils
 
 # 2. Download and prepare SFML 3.0 for MinGW
 if [ ! -d "sfml" ]; then
@@ -126,6 +128,9 @@ else
     rm -f rtlsdr_v4.zip
 fi
 
+echo "------------------------------------------"
+if [ "$FT8LIB_OK" = "1" ]; then echo "FT8 / FT4: included (ft8_lib)"; else echo "FT8 / FT4: NOT included (see the [ft8_lib] messages above); WSPR still works"; fi
+if [ "$RTL433_OK" = "1" ]; then echo "ISM (rtl_433): included"; else echo "ISM (rtl_433): NOT included (see the [rtl_433] messages above)"; fi
 echo "------------------------------------------"
 echo "DONE! The complete application is located in the folder: /$BUILD_DIR"
 echo "------------------------------------------"
