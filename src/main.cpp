@@ -49,6 +49,88 @@
 #include "orbit/MapWindow.h"
 #include "MacWindowFix.h"
 
+// =====================================================================
+//  One receiver = one tab: a source (radio, file, sound card, rtl_tcp),
+//  its own DSP thread, its own decoders and the UI state that belongs to
+//  it (frequency, source choice ...). The UI shows one receiver at a time
+//  (`cur` in main); the others keep receiving and decoding in the
+//  background without drawing anything.
+// =====================================================================
+// Settings values lose spaces, commas and quotes (see SettingsManager::load): device ids
+// (sound card names ...) are stored as hex
+inline std::string toHex(const std::string& s) {
+    static const char* d = "0123456789abcdef";
+    std::string o;
+    for (unsigned char c : s) { o += d[c >> 4]; o += d[c & 15]; }
+    return o;
+}
+inline std::string fromHex(const std::string& h) {
+    std::string o;
+    for (size_t i = 0; i + 1 < h.size(); i += 2) {
+        auto v = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : 0; };
+        o += (char)(v(h[i]) * 16 + v(h[i + 1]));
+    }
+    return o;
+}
+
+struct Receiver {
+    int id = 1;
+    SharedData sd;
+    std::atomic<bool> running {true};
+    std::thread dsp;
+
+    // UI state of this receiver
+    long long centerFreq = 0, pendingCenterFreq = 0;
+    int sourceType = 0;
+    bool tcpConnected = false;
+    std::string tcpAddr;
+    std::vector<SDRDeviceItem> cachedDevices;
+    bool inputIsAudio = false;
+    bool stickyCenter = false;
+    Mode modeBeforeAudio = Mode::NFM;
+    std::string selectedTab;              // decoder tab shown in the decoder panel
+    int openType = -1;                    // the device this receiver has open (type + id), so
+    std::string openDevice;               // another receiver doesn't try to open it too
+    float pendingRfGain = -999.0f;
+    sf::Clock debouncer, gainDebouncer;
+    // sidebar widgets that are not mirrored in SharedData (saved when the tab is left)
+    std::vector<std::string> deviceOptions = {"No Devices Found"}, rateOptions = {"None"};
+    int deviceSel = 0, rateSel = 0;
+    bool agc = true;
+    float gain = 0.0f, gainMin = 0.0f, gainMax = 50.0f;
+    std::string hostText;
+    bool uiSaved = false;
+
+    // decoders of this receiver
+    std::vector<std::unique_ptr<SDRModule>> owned;
+    std::vector<SDRModule*> decMods;      // in the order of the Decoders checkboxes (nullptr = APRS)
+    AISDecoder* ais = nullptr;
+    SSTVModule* sstv = nullptr;
+    WEFAXModule* wefax = nullptr;
+    ISMDecoder* ism = nullptr;
+    ACARSDecoder* acars = nullptr;
+    VDL2Decoder* vdl2 = nullptr;
+    ADSBDecoder* adsb = nullptr;
+    WSJTDecoder* wsjt = nullptr;
+    CWDecoder* cw = nullptr;
+
+    // a short name for the tab
+    std::string title() const {
+        static const char* kinds[] = {"File", "RTL-SDR", "SDRplay", "Sound card", "rtl_tcp"};
+        std::string t = "RX" + std::to_string(id) + "  " + kinds[std::clamp(sourceType, 0, 4)];
+        long long f = centerFreq;
+        if (f > 0) { char b[32]; std::snprintf(b, sizeof(b), "  %.3f", f / 1e6); t += b; }
+        return t;
+    }
+
+    ~Receiver() {
+        running = false;
+        if (dsp.joinable()) dsp.join();
+        std::lock_guard<std::mutex> l(sd.sourceMtx);
+        if (sd.source) { sd.source->stop(); sd.source->close(); }
+    }
+};
+
 int main() {
     #ifdef _WIN32
     HMODULE hUser32 = LoadLibraryA("user32.dll");
@@ -72,24 +154,15 @@ int main() {
         savedFreq = 97800000;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(sourceMtx);
-        currentSource = std::make_shared<FileSource>();
-        if (currentSource->open("None")) {}
-    }
-
     AudioSink audio;
     std::vector<std::string> deviceNames;
     for (const auto& dev : audio.availableDevices) deviceNames.push_back(dev.name);
     audio.initDevice(0, (int)AUDIO_RATE);
     audio.start();
 
-    SharedData sharedData;
-    sharedData.aprsHistory = loadLastLogLinesAsPackets(getAprsLogFilePath(), 20);
-    sharedData.centerFreq = savedFreq;
-
-    std::atomic<bool> dspRunning {true};
-    std::thread dspThread(dspWorker, std::ref(dspRunning), std::ref(sharedData), std::ref(audio));
+    // The receivers (tabs); `cur` is the one shown. Created below, once the font exists.
+    std::vector<std::unique_ptr<Receiver>> receivers;
+    Receiver* cur = nullptr;
 
     sf::ContextSettings settings;
     settings.antiAliasingLevel = 8;
@@ -143,68 +216,12 @@ int main() {
     };
     std::function<void()> applyUiScale; // assigned after updateLayout is defined
 
-    // --- RTL-TCP connection state ---
-    bool tcpConnected = false;
-    std::string tcpAddr;
-
-    std::vector<std::unique_ptr<SDRModule>> modules;
-    auto aisMod = std::make_unique<AISDecoder>();
-    ModuleContext ctx = { (float)AUDIO_RATE, font };
-    aisMod->init(ctx);
-    modules.push_back(std::move(aisMod));
-    AISDecoder* ptrAIS = (AISDecoder*)modules[0].get();
-
     // Image decoders save their pictures into the picture folder: the one chosen by the
     // user, or OrbitSDR inside the system Pictures folder
     std::string pictureDirCustom = settingsMgr.getString("picture_path", "");
     std::string pictureDirDefault = getDefaultPicturesPath();
     auto pictureDir = [&]() { return pictureDirCustom.empty() ? pictureDirDefault : pictureDirCustom; };
     auto setPictureDir = [&](const std::string& d) { pictureDirCustom = d; };
-    auto sstvMod = std::make_unique<SSTVModule>();
-    sstvMod->init(ctx);
-    sstvMod->saveDir = pictureDir;
-    sstvMod->setSaveDir = setPictureDir;
-    SSTVModule* ptrSSTV = sstvMod.get();
-    modules.push_back(std::move(sstvMod));
-    auto wefaxMod = std::make_unique<WEFAXModule>();
-    wefaxMod->init(ctx);
-    wefaxMod->saveDir = pictureDir;
-    wefaxMod->setSaveDir = setPictureDir;
-    WEFAXModule* ptrWEFAX = wefaxMod.get();
-    modules.push_back(std::move(wefaxMod));
-    auto ismMod = std::make_unique<ISMDecoder>();
-    ismMod->init(ctx);
-    ismMod->log.setPath(getIsmLogFilePath());
-    ismMod->exportDir = getDefaultExportPath();
-    ISMDecoder* ptrISM = ismMod.get();
-    auto acarsMod = std::make_unique<ACARSDecoder>();
-    acarsMod->init(ctx);
-    acarsMod->log.setPath(getAcarsLogFilePath());
-    acarsMod->exportDir = getDefaultExportPath();
-    ACARSDecoder* ptrACARS = acarsMod.get();
-    modules.push_back(std::move(acarsMod));
-    modules.push_back(std::move(ismMod));
-    auto adsbMod = std::make_unique<ADSBDecoder>();
-    adsbMod->init(ctx);
-    ADSBDecoder* ptrADSB = adsbMod.get();
-    modules.push_back(std::move(adsbMod));
-    auto wsjtMod = std::make_unique<WSJTDecoder>();
-    wsjtMod->init(ctx);
-    wsjtMod->log.setPath(getConfigFilePath("wsjt.log"));
-    wsjtMod->exportDir = getDefaultExportPath();
-    WSJTDecoder* ptrWSJT = wsjtMod.get();
-    modules.push_back(std::move(wsjtMod));
-    auto vdl2Mod = std::make_unique<VDL2Decoder>();
-    vdl2Mod->init(ctx);
-    vdl2Mod->log.setPath(getConfigFilePath("vdl2.log"));
-    vdl2Mod->exportDir = getDefaultExportPath();
-    VDL2Decoder* ptrVDL2 = vdl2Mod.get();
-    modules.push_back(std::move(vdl2Mod));
-    auto cwMod = std::make_unique<CWDecoder>();
-    cwMod->init(ctx);
-    cwMod->log.setPath(getConfigFilePath("cw.log"));
-    CWDecoder* ptrCW = cwMod.get();
-    modules.push_back(std::move(cwMod));
 
     auto cursorArrow = sf::Cursor::createFromSystem(sf::Cursor::Type::Arrow);
     auto cursorHand = sf::Cursor::createFromSystem(sf::Cursor::Type::Hand);
@@ -220,7 +237,6 @@ int main() {
 
     SdrButton btnTuningMode(40, 40, "FIX", font);
     btnTuningMode.setColor(sf::Color(80, 80, 80));
-    bool stickyCenterMode = false;
 
     SdrButton btnPlay(40, 40, ">", font);
     btnPlay.setColor(sf::Color(116, 57, 57));
@@ -237,16 +253,68 @@ int main() {
     mapWindow.icon = &icon;
     mapWindow.loadSettings(settingsMgr);
     // "Time: recording being played": the map follows the IQ file's playback position
-    mapWindow.recordingInfo = [](std::string& path, double& progress, double& durationSec) {
-        std::lock_guard<std::mutex> l(sourceMtx);
-        if (!currentSource) return false;
-        path = currentSource->getFilePath();   // empty for radios and the sound card
+    mapWindow.recordingInfo = [&](std::string& path, double& progress, double& durationSec) {
+        std::lock_guard<std::mutex> l(cur->sd.sourceMtx);
+        if (!cur->sd.source) return false;
+        path = cur->sd.source->getFilePath();   // empty for radios and the sound card
         if (path.empty()) return false;
-        progress = currentSource->getProgress();
-        durationSec = currentSource->getDurationSec();
+        progress = cur->sd.source->getProgress();
+        durationSec = cur->sd.source->getDurationSec();
         return true;
     };
     sf::Clock trackClock;
+
+    // --- Receivers: each gets a source (none yet), a DSP thread and its own decoders ---
+    int nextRxId = 1;
+    auto newReceiver = [&]() -> Receiver* {
+        auto r = std::make_unique<Receiver>();
+        Receiver* rx = r.get();
+        rx->id = nextRxId++;
+        {
+            std::lock_guard<std::mutex> l(rx->sd.sourceMtx);
+            rx->sd.source = std::make_shared<FileSource>();   // idle placeholder, reads nothing
+            rx->sd.source->open("None");
+        }
+        rx->sd.aprsHistory = loadLastLogLinesAsPackets(getAprsLogFilePath(), 20);
+        rx->centerFreq = rx->sd.centerFreq = savedFreq;
+        rx->hostText = settingsMgr.getString("rtltcp_host", "127.0.0.1:1234");
+        ModuleContext ctx = { (float)AUDIO_RATE, font };
+        auto add = [&](auto* m) { rx->owned.emplace_back(m); m->init(ctx); return m; };
+        rx->ais = add(new AISDecoder());
+        rx->sstv = add(new SSTVModule());
+        rx->sstv->saveDir = pictureDir;
+        rx->sstv->setSaveDir = setPictureDir;
+        rx->wefax = add(new WEFAXModule());
+        rx->wefax->saveDir = pictureDir;
+        rx->wefax->setSaveDir = setPictureDir;
+        rx->ism = add(new ISMDecoder());
+        rx->ism->log.setPath(getIsmLogFilePath());
+        rx->ism->exportDir = getDefaultExportPath();
+        rx->acars = add(new ACARSDecoder());
+        rx->acars->log.setPath(getAcarsLogFilePath());
+        rx->acars->exportDir = getDefaultExportPath();
+        rx->vdl2 = add(new VDL2Decoder());
+        rx->vdl2->log.setPath(getConfigFilePath("vdl2.log"));
+        rx->vdl2->exportDir = getDefaultExportPath();
+        rx->adsb = add(new ADSBDecoder());
+        rx->adsb->onOpenMap = [&]() { mapWindow.openOrFocus(); };
+        rx->wsjt = add(new WSJTDecoder());
+        rx->wsjt->log.setPath(getConfigFilePath("wsjt.log"));
+        rx->wsjt->exportDir = getDefaultExportPath();
+        rx->cw = add(new CWDecoder());
+        rx->cw->log.setPath(getConfigFilePath("cw.log"));
+        // the order of the Decoders checkboxes
+        rx->decMods = { nullptr, rx->ais, rx->sstv, rx->wefax, rx->ism, rx->acars, rx->vdl2, rx->adsb, rx->wsjt, rx->cw };
+        rx->sd.visible = false;
+        rx->sd.audioOut = true;          // its speaker button on the tab (on by default)
+        rx->sd.audioStream = rx->id;     // its own stream in the speaker's mix
+        rx->dsp = std::thread(dspWorker, std::ref(rx->running), std::ref(rx->sd), std::ref(audio));
+        receivers.push_back(std::move(r));
+        return rx;
+    };
+    cur = newReceiver();
+    cur->sd.visible = true;
+    cur->sd.audioOut = true;
 
     // Volume slider: the position maps to -40 .. +8 dB, so the low levels are easy to set
     auto volumeGain = [](float pos) { return pos <= 0.001f ? 0.0f : std::pow(10.0f, (pos * 48.0f - 40.0f) / 20.0f); };
@@ -285,7 +353,6 @@ int main() {
     // Input signal type: I/Q from a radio, or audio that is already demodulated (sound card,
     // a receiver's audio output, audio recordings). Set automatically when a source is opened,
     // the user can change it. Every demodulator and decoder follows this switch.
-    bool inputIsAudio = false;
     std::function<void(bool)> applyInputType;   // assigned once the demodulator buttons exist
     auto lblInput = std::make_shared<Label>("Input signal:", font);
     auto btnInIQ = std::make_shared<SdrButton>(136, 25, "I/Q (radio)", font);
@@ -317,22 +384,19 @@ int main() {
     auto slGain = std::make_shared<Slider>(SIDEBAR_W - 40, 0.0f, 50.0f, 0.0f, "RF Gain (dB)", font);
     auto chkAgc = std::make_shared<Checkbox>("Automatic Gain Control (AGC)", font, true);
 
-    int currentSourceType = 0;
-    sf::Clock gainDebouncer;
-    float pendingRfGain = -999.0f;
 
     slGain->onChange = [&](float v) {
-        std::lock_guard<std::mutex> l(sharedData.mtx);
-        sharedData.rfGain = v;
+        std::lock_guard<std::mutex> l(cur->sd.mtx);
+        cur->sd.rfGain = v;
         std::stringstream ss;
         ss << std::fixed << std::setprecision(1);
-        if (currentSourceType == 1 || currentSourceType == 4) {
+        if (cur->sourceType == 1 || cur->sourceType == 4) {
             ss << "RF Gain: " << v << " dB";
         } else {
             ss << "RF Gain (dB): " << (int)v;
         }
         slGain->setText(ss.str());
-        pendingRfGain = v;
+        cur->pendingRfGain = v;
     };
 
     chkAgc->onToggle = [&](bool b) {
@@ -340,16 +404,16 @@ int main() {
             // Switching to manual: carry on from the gain the AGC had chosen, and show it as manual
             float agcGain = -1.0f;
             {
-                std::lock_guard<std::mutex> l(sourceMtx);
-                if (currentSource) agcGain = currentSource->getAutoGainDb();
+                std::lock_guard<std::mutex> l(cur->sd.sourceMtx);
+                if (cur->sd.source) agcGain = cur->sd.source->getAutoGainDb();
             }
             if (agcGain >= 0.0f) slGain->setValueSilent(agcGain);
             slGain->onChange(slGain->currentVal);   // updates the label and queues the gain
         }
-        std::lock_guard<std::mutex> l(sharedData.mtx);
-        sharedData.rfGain = b ? -1.0f : slGain->currentVal;
+        std::lock_guard<std::mutex> l(cur->sd.mtx);
+        cur->sd.rfGain = b ? -1.0f : slGain->currentVal;
         slGain->setEnabled(!b);
-        pendingRfGain = b ? -1.0f : slGain->currentVal;
+        cur->pendingRfGain = b ? -1.0f : slGain->currentVal;
     };
     slGain->setEnabled(false);
 
@@ -357,41 +421,41 @@ int main() {
     auto ddAntenna = std::make_shared<Dropdown>(SIDEBAR_W - 40, 25.0f, font);
     ddAntenna->setOptions({"Antenna A / Default", "Antenna B", "Antenna C / Hi-Z"});
     ddAntenna->onChange = [&](int idx) {
-        hwState.antennaIndex = idx;
-        std::lock_guard<std::mutex> l(sourceMtx);
-        if(currentSource) currentSource->setHardwareOption("antenna", idx);
+        cur->sd.hw.antennaIndex = idx;
+        std::lock_guard<std::mutex> l(cur->sd.sourceMtx);
+        if(cur->sd.source) cur->sd.source->setHardwareOption("antenna", idx);
     };
 
     auto lblDirectSamp = std::make_shared<Label>("Direct Sampling (RTL):", font);
     auto ddDirectSamp = std::make_shared<Dropdown>(SIDEBAR_W - 40, 25.0f, font);
     ddDirectSamp->setOptions({"Off (Default)", "I-ADC", "Q-ADC"});
     ddDirectSamp->onChange = [&](int idx) {
-        hwState.directSampling = idx;
-        std::lock_guard<std::mutex> l(sourceMtx);
-        if(currentSource) currentSource->setHardwareOption("direct_sampling", idx);
+        cur->sd.hw.directSampling = idx;
+        std::lock_guard<std::mutex> l(cur->sd.sourceMtx);
+        if(cur->sd.source) cur->sd.source->setHardwareOption("direct_sampling", idx);
     };
 
     auto rowFilters = std::make_shared<RowContainer>();
     auto chkFmNotch = std::make_shared<Checkbox>("FM Notch", font);
     chkFmNotch->onToggle = [&](bool b) {
-        hwState.fmNotch = b;
-        std::lock_guard<std::mutex> l(sourceMtx);
-        if(currentSource) currentSource->setHardwareOption("fm_notch", b?1:0);
+        cur->sd.hw.fmNotch = b;
+        std::lock_guard<std::mutex> l(cur->sd.sourceMtx);
+        if(cur->sd.source) cur->sd.source->setHardwareOption("fm_notch", b?1:0);
     };
     auto chkMwNotch = std::make_shared<Checkbox>("MW Notch", font);
     chkMwNotch->onToggle = [&](bool b) {
-        hwState.mwNotch = b;
-        std::lock_guard<std::mutex> l(sourceMtx);
-        if(currentSource) currentSource->setHardwareOption("mw_notch", b?1:0);
+        cur->sd.hw.mwNotch = b;
+        std::lock_guard<std::mutex> l(cur->sd.sourceMtx);
+        if(cur->sd.source) cur->sd.source->setHardwareOption("mw_notch", b?1:0);
     };
     rowFilters->add(chkFmNotch);
     rowFilters->add(chkMwNotch);
 
     auto chkBiasT = std::make_shared<Checkbox>("Bias-T Power", font);
     chkBiasT->onToggle = [&](bool b) {
-        hwState.biasT = b;
-        std::lock_guard<std::mutex> l(sourceMtx);
-        if(currentSource) currentSource->setHardwareOption("bias_t", b?1:0);
+        cur->sd.hw.biasT = b;
+        std::lock_guard<std::mutex> l(cur->sd.sourceMtx);
+        if(cur->sd.source) cur->sd.source->setHardwareOption("bias_t", b?1:0);
     };
 
     auto updateRadioControls = [&](int sourceIdx) {
@@ -404,25 +468,23 @@ int main() {
             modRadio->addWidget(lblDirectSamp);
             modRadio->addWidget(ddDirectSamp);
             modRadio->addWidget(chkBiasT);
-            ddDirectSamp->setSelection(hwState.directSampling);
-            chkBiasT->checked = hwState.biasT;
+            ddDirectSamp->setSelection(cur->sd.hw.directSampling);
+            chkBiasT->checked = cur->sd.hw.biasT;
         } else if (sourceIdx == 2) {
             modRadio->addWidget(lblAntenna);
             modRadio->addWidget(ddAntenna);
             modRadio->addWidget(rowFilters);
             modRadio->addWidget(chkBiasT);
-            ddAntenna->setSelection(hwState.antennaIndex);
-            chkFmNotch->checked = hwState.fmNotch;
-            chkMwNotch->checked = hwState.mwNotch;
-            chkBiasT->checked = hwState.biasT;
+            ddAntenna->setSelection(cur->sd.hw.antennaIndex);
+            chkFmNotch->checked = cur->sd.hw.fmNotch;
+            chkMwNotch->checked = cur->sd.hw.mwNotch;
+            chkBiasT->checked = cur->sd.hw.biasT;
         }
         sidebar.recalculateLayout();
         sidebar.updateStyle();
     };
     updateRadioControls(0);
 
-    long long currentCenterFreq = savedFreq;
-    long long pendingCenterFreq = 0;
 
     // Startup restores the last source silently; errors are only explained when the user
     // picks a source or refreshes the device list
@@ -430,15 +492,17 @@ int main() {
 
     std::function<void(int, std::string, int, std::string)> doOpenSource = [&](int sourceIdx, std::string deviceID, int rateIdx, std::string pathOverride) {
         {
-            std::lock_guard<std::mutex> lock(sourceMtx);
-            if (currentSource) {
-                currentSource->stop();
-                currentSource->close();
-                currentSource = nullptr;
+            std::lock_guard<std::mutex> lock(cur->sd.sourceMtx);
+            if (cur->sd.source) {
+                cur->sd.source->stop();
+                cur->sd.source->close();
+                cur->sd.source = nullptr;
             }
         }
+        cur->openType = -1;
+        cur->openDevice.clear();
         // Whatever happens next, we are not connected to an RTL-TCP server any more
-        tcpConnected = false;
+        cur->tcpConnected = false;
         btnConnect->setText("Connect");
         btnConnect->setActive(false);
 
@@ -447,7 +511,7 @@ int main() {
         std::shared_ptr<IQSource> newSource;
         uint32_t targetRate = 0;
         bool success = false;
-        currentSourceType = sourceIdx;
+        cur->sourceType = sourceIdx;
         updateRadioControls(sourceIdx);
         if (sourceIdx != 0 && sourceIdx != 3 && applyInputType) applyInputType(false);   // radios: always I/Q
 
@@ -456,17 +520,17 @@ int main() {
             std::string path = pathOverride.empty() ? "None" : pathOverride;
             success = newSource->open(path);
             {
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                sharedData.currentFilename = path;
+                std::lock_guard<std::mutex> l(cur->sd.mtx);
+                cur->sd.currentFilename = path;
             }
             std::string fileName = path.substr(path.find_last_of("/\\") + 1);
             ddRate->setOptions({fileName, "[ Change File... ]"});
             ddRate->setSelection(0);
 
             const long long f = orbit::frequencyFromName(path);   // SDR++, SDRuno, HDSDR, OrbitSDR ...
-            currentCenterFreq = f;
+            cur->centerFreq = f;
             freqVFO.setFrequency(f);
-            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.centerFreq = f; }
+            { std::lock_guard<std::mutex> l(cur->sd.mtx); cur->sd.centerFreq = f; }
         }
         else if (sourceIdx == 1) {
             targetRate = (rateIdx < RTL_RATES_VAL.size()) ? RTL_RATES_VAL[rateIdx] : 2048000;
@@ -476,19 +540,19 @@ int main() {
             success = rtl->open(deviceID, targetRate);
             newSource = rtl;
 
-            if (currentCenterFreq < 1000000) currentCenterFreq = 97800000;
-            freqVFO.setFrequency(currentCenterFreq);
-            newSource->setCenterFrequency(currentCenterFreq);
+            if (cur->centerFreq < 1000000) cur->centerFreq = 97800000;
+            freqVFO.setFrequency(cur->centerFreq);
+            newSource->setCenterFrequency(cur->centerFreq);
             {
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                sharedData.tunedFreqPercent = 0.5;
-                sharedData.viewCenterPct = 0.5;
-                sharedData.centerFreq = currentCenterFreq;
+                std::lock_guard<std::mutex> l(cur->sd.mtx);
+                cur->sd.tunedFreqPercent = 0.5;
+                cur->sd.viewCenterPct = 0.5;
+                cur->sd.centerFreq = cur->centerFreq;
             }
             slGain->setLimits(0.0f, 49.6f);
             slGain->setText("RF Gain: AGC");
-            newSource->setHardwareOption("direct_sampling", hwState.directSampling);
-            newSource->setHardwareOption("bias_t", hwState.biasT ? 1 : 0);
+            newSource->setHardwareOption("direct_sampling", cur->sd.hw.directSampling);
+            newSource->setHardwareOption("bias_t", cur->sd.hw.biasT ? 1 : 0);
         }
         else if (sourceIdx == 2) {
             targetRate = (rateIdx < SDRPLAY_RATES_VAL.size()) ? SDRPLAY_RATES_VAL[rateIdx] : 2000000;
@@ -498,24 +562,24 @@ int main() {
             success = sdr->open(deviceID, targetRate);
             newSource = sdr;
 
-            if (currentCenterFreq < 1000000) currentCenterFreq = 97800000;
-            freqVFO.setFrequency(currentCenterFreq);
-            newSource->setCenterFrequency(currentCenterFreq);
+            if (cur->centerFreq < 1000000) cur->centerFreq = 97800000;
+            freqVFO.setFrequency(cur->centerFreq);
+            newSource->setCenterFrequency(cur->centerFreq);
             {
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                sharedData.tunedFreqPercent = 0.5;
-                sharedData.viewCenterPct = 0.5;
-                sharedData.centerFreq = currentCenterFreq;
+                std::lock_guard<std::mutex> l(cur->sd.mtx);
+                cur->sd.tunedFreqPercent = 0.5;
+                cur->sd.viewCenterPct = 0.5;
+                cur->sd.centerFreq = cur->centerFreq;
             }
             slGain->setLimits(0.0f, 50.0f);
             chkAgc->checked = true;
             slGain->setEnabled(false);
-            sharedData.rfGain = -1.0f;
+            cur->sd.rfGain = -1.0f;
 
-            newSource->setHardwareOption("antenna", hwState.antennaIndex);
-            newSource->setHardwareOption("fm_notch", hwState.fmNotch ? 1 : 0);
-            newSource->setHardwareOption("mw_notch", hwState.mwNotch ? 1 : 0);
-            newSource->setHardwareOption("bias_t", hwState.biasT ? 1 : 0);
+            newSource->setHardwareOption("antenna", cur->sd.hw.antennaIndex);
+            newSource->setHardwareOption("fm_notch", cur->sd.hw.fmNotch ? 1 : 0);
+            newSource->setHardwareOption("mw_notch", cur->sd.hw.mwNotch ? 1 : 0);
+            newSource->setHardwareOption("bias_t", cur->sd.hw.biasT ? 1 : 0);
         }
         else if (sourceIdx == 3) {
             // Sound card / line-in used as a baseband source
@@ -529,13 +593,13 @@ int main() {
             newSource = audioIn;
 
             // Baseband signal: no hardware centre frequency, show 0 Hz (same as file playback)
-            currentCenterFreq = 0;
+            cur->centerFreq = 0;
             freqVFO.setFrequency(0);
             {
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                sharedData.tunedFreqPercent = 0.5;
-                sharedData.viewCenterPct = 0.5;
-                sharedData.centerFreq = 0;
+                std::lock_guard<std::mutex> l(cur->sd.mtx);
+                cur->sd.tunedFreqPercent = 0.5;
+                cur->sd.viewCenterPct = 0.5;
+                cur->sd.centerFreq = 0;
             }
         }
         else if (sourceIdx == 4) {
@@ -546,19 +610,19 @@ int main() {
             success = tcp->open(deviceID, targetRate);   // deviceID = "host:port"
             newSource = tcp;
 
-            if (currentCenterFreq < 1000000) currentCenterFreq = 97800000;
-            freqVFO.setFrequency(currentCenterFreq);
-            newSource->setCenterFrequency(currentCenterFreq);
+            if (cur->centerFreq < 1000000) cur->centerFreq = 97800000;
+            freqVFO.setFrequency(cur->centerFreq);
+            newSource->setCenterFrequency(cur->centerFreq);
             {
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                sharedData.tunedFreqPercent = 0.5;
-                sharedData.viewCenterPct = 0.5;
-                sharedData.centerFreq = currentCenterFreq;
+                std::lock_guard<std::mutex> l(cur->sd.mtx);
+                cur->sd.tunedFreqPercent = 0.5;
+                cur->sd.viewCenterPct = 0.5;
+                cur->sd.centerFreq = cur->centerFreq;
             }
             slGain->setLimits(0.0f, 49.6f);
             slGain->setText("RF Gain: AGC");
-            newSource->setHardwareOption("direct_sampling", hwState.directSampling);
-            newSource->setHardwareOption("bias_t", hwState.biasT ? 1 : 0);
+            newSource->setHardwareOption("direct_sampling", cur->sd.hw.directSampling);
+            newSource->setHardwareOption("bias_t", cur->sd.hw.biasT ? 1 : 0);
         }
 
         if (!success && sourceIdx != 0) {
@@ -567,57 +631,55 @@ int main() {
         }
 
         {
-            std::lock_guard<std::mutex> lock(sourceMtx);
-            currentSource = newSource;
+            std::lock_guard<std::mutex> lock(cur->sd.sourceMtx);
+            cur->sd.source = newSource;
         }
+        if (sourceIdx >= 1 && sourceIdx <= 3) { cur->openType = sourceIdx; cur->openDevice = deviceID; }
         // Sound card and mono WAV files are audio, everything else is I/Q (the user can change it)
         if (applyInputType) applyInputType(newSource && newSource->isAudio());
 
         // RTL-TCP connected successfully -> the button turns into "Disconnect"
         if (sourceIdx == 4) {
-            tcpConnected = true;
-            tcpAddr = deviceID;
+            cur->tcpConnected = true;
+            cur->tcpAddr = deviceID;
             btnConnect->setText("Disconnect");
             btnConnect->setActive(true);
         }
 
         {
-            std::lock_guard<std::mutex> lock(sharedData.mtx);
-            sharedData.isPlaying = false;
-            sharedData.isRecording = false;
+            std::lock_guard<std::mutex> lock(cur->sd.mtx);
+            cur->sd.isPlaying = false;
+            cur->sd.isRecording = false;
         }
-        audio.stop();
         btnPlay.setText(">");
         btnPlay.setActive(false);
-        audio.clear();
+        audio.clear(cur->sd.audioStream);
     };
 
     // Cleanly drops the RTL-TCP connection and leaves the app in an idle (no source) state
     std::function<void()> doDisconnectTcp = [&]() {
         {
-            std::lock_guard<std::mutex> lock(sourceMtx);
-            if (currentSource) {
-                currentSource->stop();
-                currentSource->close();
+            std::lock_guard<std::mutex> lock(cur->sd.sourceMtx);
+            if (cur->sd.source) {
+                cur->sd.source->stop();
+                cur->sd.source->close();
             }
-            currentSource = std::make_shared<FileSource>();   // idle placeholder, reads nothing
+            cur->sd.source = std::make_shared<FileSource>();   // idle placeholder, reads nothing
         }
         {
-            std::lock_guard<std::mutex> lock(sharedData.mtx);
-            sharedData.isPlaying = false;
-            sharedData.isRecording = false;
+            std::lock_guard<std::mutex> lock(cur->sd.mtx);
+            cur->sd.isPlaying = false;
+            cur->sd.isRecording = false;
         }
-        audio.stop();
         btnPlay.setText(">");
         btnPlay.setActive(false);
-        audio.clear();
+        audio.clear(cur->sd.audioStream);
 
-        tcpConnected = false;
+        cur->tcpConnected = false;
         btnConnect->setText("Connect");
         btnConnect->setActive(false);
     };
 
-    std::vector<SDRDeviceItem> cachedDevices;
 
     std::function<void()> refreshSourceUI = [&]() {
         modSource->widgets.clear();
@@ -632,7 +694,7 @@ int main() {
         if (ddSourceType->selectedIndex == 0) {
             modSource->addWidget(std::make_shared<Label>("Loaded File:", font));
             std::string fname;
-            { std::lock_guard<std::mutex> l(sharedData.mtx); fname = sharedData.currentFilename; }
+            { std::lock_guard<std::mutex> l(cur->sd.mtx); fname = cur->sd.currentFilename; }
             if (fname == "None" || fname.empty()) {
                 ddRate->setOptions({"[ Select File... ]"});
             } else {
@@ -658,8 +720,15 @@ int main() {
     };
 
     // No SDRplay device: tell the user why (service stopped / API missing / no device).
-    // May refill cachedDevices when the user lets us start the API service.
+    // May refill cur->cachedDevices when the user lets us start the API service.
     auto explainNoSdrplay = [&]() {
+        // the API only lists devices nobody uses: is it open in another tab?
+        for (auto& r : receivers)
+            if (r.get() != cur && r->openType == 2) {
+                showPopup("SDRplay", "The SDRplay device is already open in RX" + std::to_string(r->id) +
+                          ".\n\nA device can be used by one tab at a time.");
+                return;
+            }
 #ifdef _WIN32
         const std::string svc = sdrplayServiceState();
         if (svc == "stopped") {
@@ -674,9 +743,9 @@ int main() {
                 for (int i = 0; i < 20 && sdrplayServiceState() != "running"; i++)
                     std::this_thread::sleep_for(std::chrono::milliseconds(250));
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                cachedDevices = SdrPlaySource::getDeviceList();
+                cur->cachedDevices = SdrPlaySource::getDeviceList();
             }
-            if (cachedDevices.empty() && answer == IDYES)
+            if (cur->cachedDevices.empty() && answer == IDYES)
                 showPopup("SDRplay", "No SDRplay device found yet.\n\nIf the service didn't start, open 'Services' (services.msc), select 'SDRplay API Service' and click Start - or restart the computer.");
         } else if (svc == "missing") {
             showPopup("SDRPlay Info", "The SDRplay API is not installed.\n\nIf you want to use SDRPlay, please install the official API from:\nhttps://www.sdrplay.com/downloads/");
@@ -684,13 +753,24 @@ int main() {
             showPopup("SDRPlay Info", "No SDRPlay device found.\n\nCheck the USB connection and close other programs that use the device (e.g. SDRuno or SDRconnect).");
         }
 #else
-        showPopup("SDRPlay Info", "No SDRPlay device found or SDRPlay API Service is not installed.\n\nIf you want to use SDRPlay, please install the official API from:\nhttps://www.sdrplay.com/downloads/");
+        showPopup("SDRPlay Info", "No SDRplay device found.\n\n"
+                  "- Close SDRconnect / SDRuno / another OrbitSDR: they keep the device, and the SDRplay API "
+                  "(which OrbitSDR uses) then doesn't see it. SDRconnect works without the API, so it can still show the device.\n"
+                  "- Check the USB cable, then press Refresh Device List.\n"
+                  "- No API installed? Get it from https://www.sdrplay.com/downloads/");
 #endif
+    };
+
+    // The receiver (other than the shown one) that has this device open, or nullptr
+    auto deviceUser = [&](int type, const std::string& id) -> Receiver* {
+        for (auto& r : receivers)
+            if (r.get() != cur && r->openType == type && r->openDevice == id) return r.get();
+        return nullptr;
     };
 
     ddSourceType->onChange = [&](int idx) {
         // Switching away from RTL-TCP while connected: drop the connection first
-        if (idx != 4 && tcpConnected) doDisconnectTcp();
+        if (idx != 4 && cur->tcpConnected) doDisconnectTcp();
 
         if (idx == 0) {
             std::string path = openFileDialog();
@@ -700,61 +780,86 @@ int main() {
             } else refreshSourceUI();
         }
         else if (idx == 4) {
-            if (!tcpConnected) {
+            if (!cur->tcpConnected) {
                 ddRate->setOptions(RTL_SAMPLE_RATES_TXT);
                 ddRate->setSelection(2);
             }
             refreshSourceUI();   // shows host:port, connection is made only by the Connect button
         } else {
-            cachedDevices.clear();
+            // Release this tab's own device first: the drivers only list devices nobody has
+            // open (picking SDRplay again while it runs here showed "No Devices Found")
+            if (cur->openType >= 1) {
+                {
+                    std::lock_guard<std::mutex> lock(cur->sd.sourceMtx);
+                    if (cur->sd.source) { cur->sd.source->stop(); cur->sd.source->close(); }
+                    cur->sd.source = std::make_shared<FileSource>();   // idle placeholder
+                }
+                cur->openType = -1;
+                cur->openDevice.clear();
+                { std::lock_guard<std::mutex> l(cur->sd.mtx); cur->sd.isPlaying = false; }
+                btnPlay.setText(">");
+                btnPlay.setActive(false);
+            }
+            cur->cachedDevices.clear();
             std::vector<std::string> names;
 
-            if (idx == 1) cachedDevices = RtlSdrSource::getDeviceList();
+            if (idx == 1) cur->cachedDevices = RtlSdrSource::getDeviceList();
             else if (idx == 2) {
-                cachedDevices = SdrPlaySource::getDeviceList();
-                if (cachedDevices.empty() && !quietSourceErrors) explainNoSdrplay();
+                cur->cachedDevices = SdrPlaySource::getDeviceList();
+                if (cur->cachedDevices.empty() && !quietSourceErrors) explainNoSdrplay();
             }
-            else if (idx == 3) cachedDevices = AudioCaptureSource::getDeviceList();
+            else if (idx == 3) cur->cachedDevices = AudioCaptureSource::getDeviceList();
 
-            for(auto& d : cachedDevices) names.push_back(d.name);
+            for(auto& d : cur->cachedDevices) names.push_back(d.name);
             if (names.empty()) names.push_back("No Devices Found");
             ddDevice->setOptions(names);
 
             refreshSourceUI();
 
-            if (!cachedDevices.empty()) {
-                doOpenSource(idx, cachedDevices[0].id, 0, "");
+            // the first device no other receiver is using
+            int pick = -1;
+            for (size_t d = 0; d < cur->cachedDevices.size() && pick < 0; d++)
+                if (!deviceUser(idx, cur->cachedDevices[d].id)) pick = (int)d;
+            if (pick >= 0) {
+                ddDevice->setSelection(pick);
+                doOpenSource(idx, cur->cachedDevices[pick].id, 0, "");
+            } else if (!cur->cachedDevices.empty() && !quietSourceErrors) {
+                showPopup("Source", "Every device of this type is already used by another receiver (tab).");
             }
         }
     };
 
     ddDevice->onChange = [&](int idx) {
-        if (idx >= 0 && idx < cachedDevices.size()) {
-            doOpenSource(ddSourceType->selectedIndex, cachedDevices[idx].id, ddRate->selectedIndex, "");
+        if (idx >= 0 && idx < (int)cur->cachedDevices.size()) {
+            if (Receiver* u = deviceUser(ddSourceType->selectedIndex, cur->cachedDevices[idx].id)) {
+                showPopup("Source", "This device is already used by RX" + std::to_string(u->id) + ".");
+                return;
+            }
+            doOpenSource(ddSourceType->selectedIndex, cur->cachedDevices[idx].id, ddRate->selectedIndex, "");
         }
     };
 
     btnRefresh->onClick = [&]() {
         {
-            std::lock_guard<std::mutex> lock(sourceMtx);
-            if (currentSource) {
-                currentSource->stop();
-                currentSource->close();
-                currentSource = nullptr;
+            std::lock_guard<std::mutex> lock(cur->sd.sourceMtx);
+            if (cur->sd.source) {
+                cur->sd.source->stop();
+                cur->sd.source->close();
+                cur->sd.source = nullptr;
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
         int idx = ddSourceType->selectedIndex;
-        if (idx == 1) cachedDevices = RtlSdrSource::getDeviceList();
+        if (idx == 1) cur->cachedDevices = RtlSdrSource::getDeviceList();
         else if (idx == 2) {
-            cachedDevices = SdrPlaySource::getDeviceList();
-            if (cachedDevices.empty()) explainNoSdrplay();
+            cur->cachedDevices = SdrPlaySource::getDeviceList();
+            if (cur->cachedDevices.empty()) explainNoSdrplay();
         }
-        else if (idx == 3) cachedDevices = AudioCaptureSource::getDeviceList();
+        else if (idx == 3) cur->cachedDevices = AudioCaptureSource::getDeviceList();
 
         std::vector<std::string> names;
-        for(auto& d : cachedDevices) names.push_back(d.name);
+        for(auto& d : cur->cachedDevices) names.push_back(d.name);
 
         if (names.empty()) {
             names.push_back("No Devices Found");
@@ -762,13 +867,13 @@ int main() {
         } else {
             ddDevice->setOptions(names);
             ddDevice->setSelection(0);
-            doOpenSource(idx, cachedDevices[0].id, ddRate->selectedIndex, "");
+            doOpenSource(idx, cur->cachedDevices[0].id, ddRate->selectedIndex, "");
         }
     };
 
     // Connect <-> Disconnect toggle
     btnConnect->onClick = [&]() {
-        if (tcpConnected) {
+        if (cur->tcpConnected) {
             doDisconnectTcp();
             return;
         }
@@ -779,7 +884,7 @@ int main() {
 
     // Enter in the host field only CONNECTS (it must never disconnect an active session)
     txtHost->onSubmit = [&](const std::string&) {
-        if (!tcpConnected && btnConnect->onClick) btnConnect->onClick();
+        if (!cur->tcpConnected && btnConnect->onClick) btnConnect->onClick();
     };
 
     ddRate->onChange = [&](int idx) {
@@ -795,9 +900,9 @@ int main() {
         }
         else if (ddSourceType->selectedIndex == 4) {
             // Changing the sample rate re-connects to the same server, but only while connected
-            if (tcpConnected && !tcpAddr.empty()) doOpenSource(4, tcpAddr, idx, "");
-        } else if (ddSourceType->selectedIndex != 0 && !cachedDevices.empty()) {
-            doOpenSource(ddSourceType->selectedIndex, cachedDevices[ddDevice->selectedIndex].id, idx, "");
+            if (cur->tcpConnected && !cur->tcpAddr.empty()) doOpenSource(4, cur->tcpAddr, idx, "");
+        } else if (ddSourceType->selectedIndex != 0 && !cur->cachedDevices.empty()) {
+            doOpenSource(ddSourceType->selectedIndex, cur->cachedDevices[ddDevice->selectedIndex].id, idx, "");
         }
     };
 
@@ -809,7 +914,7 @@ int main() {
     ddAudio->onChange = [&](int idx) {
         audio.stop();
         audio.initDevice(idx, (int)AUDIO_RATE);
-        if (sharedData.isPlaying) audio.start();
+        audio.start();   // always running: it mixes every receiver that has its speaker on
     };
     modAudio->addWidget(ddAudio);
 
@@ -817,8 +922,8 @@ int main() {
     modDemod->addWidget(rowModes);
 
     slBW->onChange = [&](float v) {
-        std::lock_guard<std::mutex> l(sharedData.mtx);
-        sharedData.bandwidth = v;
+        std::lock_guard<std::mutex> l(cur->sd.mtx);
+        cur->sd.bandwidth = v;
         char b[48];
         if (v >= 10000) std::snprintf(b, sizeof(b), "Bandwidth: %.0f kHz", v / 1000.0f);
         else if (v >= 1000) std::snprintf(b, sizeof(b), "Bandwidth: %.1f kHz", v / 1000.0f);
@@ -829,49 +934,49 @@ int main() {
     modDemod->addWidget(slBW);
 
     auto slSq = std::make_shared<Slider>(SIDEBAR_W - 40, -100.0f, 0.0f, -100.0f, "Squelch (dB)", font);
-    slSq->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.squelchThreshold = v; };
+    slSq->onChange = [&](float v) { std::lock_guard<std::mutex> l(cur->sd.mtx); cur->sd.squelchThreshold = v; };
     modDemod->addWidget(slSq);
 
     auto chkStereo = std::make_shared<Checkbox>("Stereo (WFM only)", font);
-    chkStereo->onToggle = [&](bool b) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.stereoEnabled = b; };
+    chkStereo->onToggle = [&](bool b) { std::lock_guard<std::mutex> l(cur->sd.mtx); cur->sd.stereoEnabled = b; };
     modDemod->addWidget(chkStereo);
 
     auto chkRds = std::make_shared<Checkbox>("RDS (WFM only)", font);
-    chkRds->onToggle = [&](bool b) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.rdsEnabled = b; };
+    chkRds->onToggle = [&](bool b) { std::lock_guard<std::mutex> l(cur->sd.mtx); cur->sd.rdsEnabled = b; };
     modDemod->addWidget(chkRds);
 
     // --- Demodulator mode buttons (only for listening: the decoders have their own channels) ---
     auto setMode = [&](Mode m, SdrButton* me) {
-        if (inputIsAudio && m != Mode::RAW && m != Mode::OFF) { m = Mode::RAW; me = btnRAW.get(); }
+        if (cur->inputIsAudio && m != Mode::RAW && m != Mode::OFF) { m = Mode::RAW; me = btnRAW.get(); }
 
         rowModes->setEnabled(true);
         btnNFM->setActive(false); btnAM->setActive(false); btnWFM->setActive(false);
         btnUSB->setActive(false); btnLSB->setActive(false); btnCW->setActive(false); btnRAW->setActive(false); btnOFF->setActive(false);
         me->setActive(true);
-        if (inputIsAudio) {   // audio input: the other demodulators make no sense
+        if (cur->inputIsAudio) {   // audio input: the other demodulators make no sense
             btnNFM->setEnabled(false); btnAM->setEnabled(false); btnWFM->setEnabled(false);
             btnUSB->setEnabled(false); btnLSB->setEnabled(false); btnCW->setEnabled(false);
         }
 
-        std::lock_guard<std::mutex> l(sharedData.mtx);
-        sharedData.mode = m;
+        std::lock_guard<std::mutex> l(cur->sd.mtx);
+        cur->sd.mode = m;
 
         if (m == Mode::WFM) {
             slBW->setLimits(50000, 200000); slBW->setValueSilent(180000);
-            sharedData.bandwidth = 180000; slBW->setText("Bandwidth: 180 kHz");
+            cur->sd.bandwidth = 180000; slBW->setText("Bandwidth: 180 kHz");
         } else if (m == Mode::RAW) {
             slBW->setLimits(1000, 200000); slBW->setValueSilent(48000);
-            sharedData.bandwidth = 48000; slBW->setText("Bandwidth: 48.0 kHz");
+            cur->sd.bandwidth = 48000; slBW->setText("Bandwidth: 48.0 kHz");
         } else if (m == Mode::NFM || m == Mode::AM) {
             slBW->setLimits(4000, 40000); slBW->setValueSilent(12500);
-            sharedData.bandwidth = 12500; slBW->setText("Bandwidth: 12.5 kHz");
+            cur->sd.bandwidth = 12500; slBW->setText("Bandwidth: 12.5 kHz");
         } else if (m == Mode::CW) {
             slBW->setLimits(50, 3000); slBW->setValueSilent(500);
-            sharedData.bandwidth = 500; slBW->setText("Bandwidth: 500 Hz");
+            cur->sd.bandwidth = 500; slBW->setText("Bandwidth: 500 Hz");
         } else if (m == Mode::OFF) {
         } else {
             slBW->setLimits(1000, 10000); slBW->setValueSilent(3000);
-            sharedData.bandwidth = 3000; slBW->setText("Bandwidth: 3 kHz");
+            cur->sd.bandwidth = 3000; slBW->setText("Bandwidth: 3 kHz");
         }
     };
 
@@ -991,7 +1096,7 @@ int main() {
     btnBookAdd->onClick = [&]() {
         Bookmark b;
         b.freqHz = freqVFO.getFrequency();
-        { std::lock_guard<std::mutex> l(sharedData.mtx); b.mode = sharedData.mode; }
+        { std::lock_guard<std::mutex> l(cur->sd.mtx); b.mode = cur->sd.mode; }
         b.bandwidthHz = slBW->currentVal;
         b.name = txtBookName->getText();
         b.scan = true;
@@ -1008,7 +1113,7 @@ int main() {
         Bookmark& b = bookmarks.items[i];
         b.name = txtBookName->getText();
         b.freqHz = freqVFO.getFrequency();
-        { std::lock_guard<std::mutex> l(sharedData.mtx); b.mode = sharedData.mode; }
+        { std::lock_guard<std::mutex> l(cur->sd.mtx); b.mode = cur->sd.mode; }
         b.bandwidthHz = slBW->currentVal;
         if (!bookList->bankFilter.empty()) b.bank = bookList->bankFilter;   // moves it to the chosen bank
         const long long f = b.freqHz;
@@ -1032,18 +1137,17 @@ int main() {
     btnScanSkip->onClick = [&]() { scanner.skip(bookmarks.items, scanClock.getElapsedTime().asSeconds()); };
 
     // --- Input signal switch (I/Q / Audio) ---
-    Mode modeBeforeAudio = Mode::NFM;
     applyInputType = [&](bool audioIn) {
         btnInIQ->setActive(!audioIn);
         btnInAudio->setActive(audioIn);
-        if (audioIn == inputIsAudio) return;
-        Mode cur;
-        { std::lock_guard<std::mutex> l(sharedData.mtx); cur = sharedData.mode; }
-        if (audioIn) modeBeforeAudio = cur;
-        inputIsAudio = audioIn;
-        { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.audioInput = audioIn; }
+        if (audioIn == cur->inputIsAudio) return;
+        Mode curMode;
+        { std::lock_guard<std::mutex> l(cur->sd.mtx); curMode = cur->sd.mode; }
+        if (audioIn) cur->modeBeforeAudio = curMode;
+        cur->inputIsAudio = audioIn;
+        { std::lock_guard<std::mutex> l(cur->sd.mtx); cur->sd.audioInput = audioIn; }
         if (audioIn) setMode(Mode::RAW, btnRAW.get());
-        else restoreMode(modeBeforeAudio);
+        else restoreMode(cur->modeBeforeAudio);
     };
 
     // --- Decoders ---
@@ -1064,30 +1168,29 @@ int main() {
     auto chkWSJT  = std::make_shared<Checkbox>(WSJTDecoder::ft8Available() ? "FT8 / FT4 / WSPR (HF digital)"
                                                                            : "WSPR (FT8 / FT4 not in this build)", font);
 
-    struct DecoderEntry { std::shared_ptr<Checkbox> chk; SDRModule* mod; };   // mod == nullptr: APRS
-    std::string selectedTab;   // the decoder whose panel is shown ("APRS" or the module's name)
+    // The checkboxes; the modules are the shown receiver's (cur->decMods[i], nullptr = APRS)
+    struct DecoderEntry { std::shared_ptr<Checkbox> chk; };
     std::vector<DecoderEntry> decoders = {
-        {chkAprs, nullptr}, {chkAIS, ptrAIS}, {chkSSTV, ptrSSTV},
-        {chkWEFAX, ptrWEFAX}, {chkISM, ptrISM}, {chkACARS, ptrACARS}, {chkVDL2, ptrVDL2}, {chkADSB, ptrADSB}, {chkWSJT, ptrWSJT}, {chkCW, ptrCW} };
+        {chkAprs}, {chkAIS}, {chkSSTV}, {chkWEFAX}, {chkISM}, {chkACARS}, {chkVDL2}, {chkADSB}, {chkWSJT}, {chkCW} };
 
     auto activateDecoder = [&](size_t idx, bool on) {
-        DecoderEntry& d = decoders[idx];
-        std::lock_guard<std::mutex> l(sharedData.mtx);
-        if (d.mod) {
-            auto& act = sharedData.activeDecoders;
-            act.erase(std::remove(act.begin(), act.end(), d.mod), act.end());
+        SDRModule* const mod = cur->decMods[idx];
+        std::lock_guard<std::mutex> l(cur->sd.mtx);
+        if (mod) {
+            auto& act = cur->sd.activeDecoders;
+            act.erase(std::remove(act.begin(), act.end(), mod), act.end());
             if (on) {
-                if (d.mod->channelSet()) d.mod->channelSet()->clear();   // placed again for the current band
-                d.mod->enabled = true;
-                act.push_back(d.mod);
+                if (mod->channelSet()) mod->channelSet()->clear();   // placed again for the current band
+                mod->enabled = true;
+                act.push_back(mod);
             } else {
-                d.mod->enabled = false;
+                mod->enabled = false;
             }
         } else {
-            if (on) aprsChannels().clear();
-            sharedData.aprsEnabled = on;
+            if (on) cur->sd.aprsCh.clear();
+            cur->sd.aprsEnabled = on;
         }
-        if (on) selectedTab = d.mod ? d.mod->name : std::string("APRS");   // show the one just switched on
+        if (on) cur->selectedTab = mod ? mod->name : std::string("APRS");   // show the one just switched on
     };
     for (size_t i = 0; i < decoders.size(); i++) {
         decoders[i].chk->onToggle = [&, i](bool b) { activateDecoder(i, b); };
@@ -1096,42 +1199,42 @@ int main() {
     modDecoders->addWidget(std::make_shared<Label>("Several can run at once, each on its own channels", font, 11, sf::Color(150, 150, 160)));
 
     // The map window offers to switch on the decoder a satellite transmitter needs (SSTV, APRS)
-    ptrADSB->onOpenMap = [&]() { mapWindow.openOrFocus(); };
     mapWindow.onEnableDecoder = [&](const std::string& name) {
-        for (auto& d : decoders) {
-            const std::string n = d.mod ? d.mod->name : std::string("APRS");
+        for (size_t i = 0; i < decoders.size(); i++) {
+            DecoderEntry& d = decoders[i];
+            const std::string n = cur->decMods[i] ? cur->decMods[i]->name : std::string("APRS");
             if (n != name) continue;
             if (!d.chk->checked) { d.chk->checked = true; d.chk->onToggle(true); }
-            selectedTab = n;
+            cur->selectedTab = n;
         }
     };
 
     auto modDisp = sidebar.addModule("Display");
     auto slMinDb = std::make_shared<Slider>(SIDEBAR_W - 40, -140.0f, -20.0f, -90.0f, "Min dB", font);
-    slMinDb->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.minDb = v; };
+    slMinDb->onChange = [&](float v) { std::lock_guard<std::mutex> l(cur->sd.mtx); cur->sd.minDb = v; };
     modDisp->addWidget(slMinDb);
 
     auto slMaxDb = std::make_shared<Slider>(SIDEBAR_W - 40, -60.0f, 40.0f, 0.0f, "Max dB", font);
-    slMaxDb->onChange = [&](float v) { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.maxDb = v; };
+    slMaxDb->onChange = [&](float v) { std::lock_guard<std::mutex> l(cur->sd.mtx); cur->sd.maxDb = v; };
     modDisp->addWidget(slMaxDb);
 
     auto slZoom = std::make_shared<Slider>(SIDEBAR_W - 40, 1.0f, 16.0f, 1.0f, "Zoom", font);
     slZoom->onChange = [&](float v) {
-        std::lock_guard<std::mutex> l(sharedData.mtx);
-        double oldZoom = sharedData.zoomLevel;
+        std::lock_guard<std::mutex> l(cur->sd.mtx);
+        double oldZoom = cur->sd.zoomLevel;
         double oldVisibleFraction = 1.0 / oldZoom;
-        double oldViewStart = sharedData.viewCenterPct - oldVisibleFraction / 2.0;
-        double tunerOffsetFromStart = sharedData.tunedFreqPercent - oldViewStart;
+        double oldViewStart = cur->sd.viewCenterPct - oldVisibleFraction / 2.0;
+        double tunerOffsetFromStart = cur->sd.tunedFreqPercent - oldViewStart;
         double tunerPosRatio = tunerOffsetFromStart / oldVisibleFraction;
 
-        sharedData.zoomLevel = v;
+        cur->sd.zoomLevel = v;
 
         double newVisibleFraction = 1.0 / v;
-        double newViewStart = sharedData.tunedFreqPercent - (tunerPosRatio * newVisibleFraction);
-        sharedData.viewCenterPct = newViewStart + newVisibleFraction / 2.0;
+        double newViewStart = cur->sd.tunedFreqPercent - (tunerPosRatio * newVisibleFraction);
+        cur->sd.viewCenterPct = newViewStart + newVisibleFraction / 2.0;
 
-        if (sharedData.viewCenterPct - newVisibleFraction/2.0 < 0.0) sharedData.viewCenterPct = newVisibleFraction/2.0;
-        if (sharedData.viewCenterPct + newVisibleFraction/2.0 > 1.0) sharedData.viewCenterPct = 1.0 - newVisibleFraction/2.0;
+        if (cur->sd.viewCenterPct - newVisibleFraction/2.0 < 0.0) cur->sd.viewCenterPct = newVisibleFraction/2.0;
+        if (cur->sd.viewCenterPct + newVisibleFraction/2.0 > 1.0) cur->sd.viewCenterPct = 1.0 - newVisibleFraction/2.0;
     };
     modDisp->addWidget(slZoom);
 
@@ -1139,8 +1242,8 @@ int main() {
     ddTheme->setOptions(THEME_NAMES);
     ddTheme->setSelection(0);
     ddTheme->onChange = [&](int idx) {
-        std::lock_guard<std::mutex> l(sharedData.mtx);
-        sharedData.waterfallTheme = idx;
+        std::lock_guard<std::mutex> l(cur->sd.mtx);
+        cur->sd.waterfallTheme = idx;
         Theme::setTheme(idx);
         freqVFO.updateStyle();
         btnTuningMode.updateStyle();
@@ -1177,8 +1280,8 @@ int main() {
     btnRecAudio->setActive(true);
     auto btnRecIQ = std::make_shared<SdrButton>(80, 25, "Baseband", font);
 
-    btnRecAudio->onClick = [&](){ btnRecAudio->setActive(true); btnRecIQ->setActive(false); std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.recMode = RecMode::AUDIO; };
-    btnRecIQ->onClick = [&](){ btnRecAudio->setActive(false); btnRecIQ->setActive(true); std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.recMode = RecMode::BASEBAND; };
+    btnRecAudio->onClick = [&](){ btnRecAudio->setActive(true); btnRecIQ->setActive(false); std::lock_guard<std::mutex> l(cur->sd.mtx); cur->sd.recMode = RecMode::AUDIO; };
+    btnRecIQ->onClick = [&](){ btnRecAudio->setActive(false); btnRecIQ->setActive(true); std::lock_guard<std::mutex> l(cur->sd.mtx); cur->sd.recMode = RecMode::BASEBAND; };
     rowRecMode->add(btnRecAudio);
     rowRecMode->add(btnRecIQ);
     modRec->addWidget(rowRecMode);
@@ -1190,7 +1293,7 @@ int main() {
     btnSetFolder->onClick = [&](){
         std::string p = selectFolderDialog();
         if(!p.empty()) {
-            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.recPath = p; }
+            { std::lock_guard<std::mutex> l(cur->sd.mtx); cur->sd.recPath = p; }
             lblRecPath->setText("Path: " + truncatePath(p, 25));
         }
     };
@@ -1199,9 +1302,9 @@ int main() {
     auto btnRecToggle = std::make_shared<SdrButton>(SIDEBAR_W-40, 35, "START RECORDING", font);
     btnRecToggle->setColor(sf::Color(40, 40, 45));
     btnRecToggle->onClick = [&](){
-        std::lock_guard<std::mutex> l(sharedData.mtx);
-        sharedData.isRecording = !sharedData.isRecording;
-        if(sharedData.isRecording) {
+        std::lock_guard<std::mutex> l(cur->sd.mtx);
+        cur->sd.isRecording = !cur->sd.isRecording;
+        if(cur->sd.isRecording) {
             btnRecToggle->setText("STOP RECORDING"); btnRecToggle->setColor(sf::Color(180, 50, 50));
         } else {
             btnRecToggle->setText("START RECORDING"); btnRecToggle->setColor(sf::Color(40, 40, 45));
@@ -1240,7 +1343,7 @@ int main() {
         layout.waterfallH = layout.winH - TOP_BAR_H - layout.specH - layout.tuneBarH;
         if (layout.waterfallH < 100) layout.waterfallH = 100;
 
-        topBar.setSize({layout.winW, (float)TOP_BAR_H});
+        topBar.setSize({layout.winW, (float)TOPBAR_DRAW_H});
         freqVFO.setPosition(20, 4);
         btnTuningMode.setPosition(370, 10);
         btnPlay.setPosition(320, 10);
@@ -1313,9 +1416,9 @@ int main() {
     chkStereo->checked = savedStereo;
     chkStereo->onToggle(savedStereo);
 
-    ptrSSTV->applySettings(settingsMgr.getBool("sstv_auto_slant", true), settingsMgr.getFloat("sstv_slant", 0.0f),
+    cur->sstv->applySettings(settingsMgr.getBool("sstv_auto_slant", true), settingsMgr.getFloat("sstv_slant", 0.0f),
                            settingsMgr.getBool("sstv_auto_save", false));
-    ptrWEFAX->applySettings(settingsMgr.getInt("wefax_lpm", 120), settingsMgr.getInt("wefax_ioc", 576),
+    cur->wefax->applySettings(settingsMgr.getInt("wefax_lpm", 120), settingsMgr.getInt("wefax_ioc", 576),
                             settingsMgr.getBool("wefax_apt", true), settingsMgr.getFloat("wefax_slant", 0.0f),
                             settingsMgr.getBool("wefax_auto_save", false));
 
@@ -1334,17 +1437,17 @@ int main() {
         slGain->onChange(savedGain);
     }
 
-    hwState.fmNotch = settingsMgr.getBool("hw_fm_notch", false);
-    hwState.mwNotch = settingsMgr.getBool("hw_mw_notch", false);
-    hwState.biasT = settingsMgr.getBool("hw_bias_t", false);
-    hwState.directSampling = settingsMgr.getInt("hw_direct_samp", 0);
-    hwState.antennaIndex = settingsMgr.getInt("hw_antenna", 0);
+    cur->sd.hw.fmNotch = settingsMgr.getBool("hw_fm_notch", false);
+    cur->sd.hw.mwNotch = settingsMgr.getBool("hw_mw_notch", false);
+    cur->sd.hw.biasT = settingsMgr.getBool("hw_bias_t", false);
+    cur->sd.hw.directSampling = settingsMgr.getInt("hw_direct_samp", 0);
+    cur->sd.hw.antennaIndex = settingsMgr.getInt("hw_antenna", 0);
 
     int savedSourceIdx = settingsMgr.getInt("source_type", 0);
     if (savedSourceIdx != 0) {
         ddSourceType->setSelection(savedSourceIdx);
         if (savedSourceIdx == 4) {
-            currentSourceType = 4;
+            cur->sourceType = 4;
             updateRadioControls(4);
             ddRate->setOptions(RTL_SAMPLE_RATES_TXT);
             ddRate->setSelection(2);
@@ -1360,10 +1463,9 @@ int main() {
     if (savedRecPath.empty()) {
         savedRecPath = getDefaultRecordingPath();
     }
-    { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.recPath = savedRecPath; }
+    { std::lock_guard<std::mutex> l(cur->sd.mtx); cur->sd.recPath = savedRecPath; }
     lblRecPath->setText("Path: " + truncatePath(savedRecPath, 25));
 
-    sf::Clock debouncer;
     sf::Clock interactionCooldown;
     bool isDraggingScale = false, isSpectrumDragging = false;
     bool isDraggingBW = false;
@@ -1424,12 +1526,12 @@ int main() {
         std::vector<DecTab> t;
         std::vector<SDRModule*> act;
         bool aprs;
-        { std::lock_guard<std::mutex> l(sharedData.mtx); act = sharedData.activeDecoders; aprs = sharedData.aprsEnabled; }
-        if (aprs) t.push_back({"APRS", nullptr, &aprsChannels(), decoderColor(0), 0});
+        { std::lock_guard<std::mutex> l(cur->sd.mtx); act = cur->sd.activeDecoders; aprs = cur->sd.aprsEnabled; }
+        if (aprs) t.push_back({"APRS", nullptr, &cur->sd.aprsCh, decoderColor(0), 0});
         for (SDRModule* m : act) {
             if (!m || !m->enabled) continue;
             size_t entry = 0;
-            for (size_t i = 0; i < decoders.size(); i++) if (decoders[i].mod == m) entry = i;
+            for (size_t i = 0; i < cur->decMods.size(); i++) if (cur->decMods[i] == m) entry = i;
             t.push_back({m->name, m, m->channelSet(), decoderColor(entry), entry});
         }
         return t;
@@ -1441,12 +1543,350 @@ int main() {
     sf::Clock decoderDropClock;               // time since the decoders last skipped a block
     bool decoderDropSeen = false;
 
+    // =====================================================================
+    //  Receiver tabs (below the top bar). The sidebar and the top bar show the
+    //  receiver in `cur`; switching saves what only the widgets know (device
+    //  list, sample rate list, gain ...) and loads the other receiver's state.
+    //  The receivers not shown keep running: no waterfall, no speaker.
+    // =====================================================================
+    bool appMuted = false;
+    Receiver* trackRx = nullptr;            // satellite tracking runs on this receiver
+    struct RxAction { int kind = 0; Receiver* rx = nullptr; };   // 1 add, 2 close, 3 switch
+    RxAction rxAction;
+    struct RxTabHit { sf::FloatRect tab, close, speaker; Receiver* rx; };
+    std::vector<RxTabHit> rxTabHits;
+    sf::FloatRect rxAddHit;
+
+    auto saveUi = [&](Receiver* r) {
+        r->deviceOptions = ddDevice->options;
+        r->deviceSel = ddDevice->selectedIndex;
+        r->rateOptions = ddRate->options;
+        r->rateSel = ddRate->selectedIndex;
+        r->agc = chkAgc->checked;
+        r->gain = slGain->currentVal;
+        r->gainMin = slGain->minVal;
+        r->gainMax = slGain->maxVal;
+        r->hostText = txtHost->getText();
+        r->uiSaved = true;
+    };
+
+    auto applyUi = [&](Receiver* r) {
+        // source
+        ddSourceType->setSelection(r->sourceType);
+        updateRadioControls(r->sourceType);
+        if (r->uiSaved) {
+            ddDevice->setOptions(r->deviceOptions);
+            ddDevice->setSelection(r->deviceSel);
+            ddRate->setOptions(r->rateOptions);
+            ddRate->setSelection(r->rateSel);
+        } else {
+            ddDevice->setOptions({"No Devices Found"});
+            ddRate->setOptions({"None"});
+        }
+        txtHost->setText(r->hostText);
+        btnConnect->setText(r->tcpConnected ? "Disconnect" : "Connect");
+        btnConnect->setActive(r->tcpConnected);
+        refreshSourceUI();
+        btnInIQ->setActive(!r->inputIsAudio);
+        btnInAudio->setActive(r->inputIsAudio);
+        // gain (without sending it to the radio again)
+        slGain->setLimits(r->gainMin, r->gainMax);
+        slGain->setValueSilent(r->gain);
+        chkAgc->checked = r->agc;
+        slGain->setEnabled(!r->agc);
+        if (!r->agc) {
+            char b[48];
+            if (r->sourceType == 1 || r->sourceType == 4) std::snprintf(b, sizeof(b), "RF Gain: %.1f dB", r->gain);
+            else std::snprintf(b, sizeof(b), "RF Gain (dB): %d", (int)r->gain);
+            slGain->setText(b);
+        }
+        // demodulator and display (kept in the receiver's SharedData)
+        Mode m; float bw, sq, minDb, maxDb, zoom; bool st, rds, rec, play; RecMode rm; std::string recPath;
+        double pct;
+        {
+            std::lock_guard<std::mutex> l(r->sd.mtx);
+            m = r->sd.mode; bw = (float)r->sd.bandwidth; sq = r->sd.squelchThreshold;
+            st = r->sd.stereoEnabled; rds = r->sd.rdsEnabled; minDb = r->sd.minDb; maxDb = r->sd.maxDb; zoom = r->sd.zoomLevel;
+            rec = r->sd.isRecording; rm = r->sd.recMode; recPath = r->sd.recPath; play = r->sd.isPlaying;
+            pct = r->sd.tunedFreqPercent;
+        }
+        restoreMode(m);
+        if (m != Mode::OFF) { slBW->setValueSilent(bw); slBW->onChange(slBW->currentVal); }
+        slSq->setValueSilent(sq);
+        chkStereo->checked = st;
+        chkRds->checked = rds;
+        slMinDb->setValueSilent(minDb);
+        slMaxDb->setValueSilent(maxDb);
+        slZoom->setValueSilent(zoom);
+        // decoders
+        for (size_t i = 0; i < decoders.size(); i++) {
+            SDRModule* mod = r->decMods[i];
+            std::lock_guard<std::mutex> l(r->sd.mtx);
+            decoders[i].chk->checked = mod ? mod->enabled : r->sd.aprsEnabled;
+        }
+        // recording
+        btnRecAudio->setActive(rm == RecMode::AUDIO);
+        btnRecIQ->setActive(rm == RecMode::BASEBAND);
+        lblRecPath->setText("Path: " + truncatePath(recPath, 25));
+        btnRecToggle->setText(rec ? "STOP RECORDING" : "START RECORDING");
+        btnRecToggle->setColor(rec ? sf::Color(180, 50, 50) : sf::Color(40, 40, 45));
+        // top bar
+        btnPlay.setText(play ? "||" : ">");
+        btnPlay.setActive(play);
+        btnTuningMode.setText(r->stickyCenter ? "CTR" : "FIX");
+        btnTuningMode.setActive(r->stickyCenter);
+        double rate = 2e6;
+        {
+            std::lock_guard<std::mutex> l(r->sd.sourceMtx);
+            if (r->sd.source) rate = r->sd.source->getSampleRate();
+        }
+        freqVFO.setFrequency(r->centerFreq + (long long)std::llround((pct - 0.5) * rate));
+        sidebar.recalculateLayout();
+        sidebar.updateStyle();
+    };
+
+    // Clears the waterfall pictures (the new receiver's rows start from the top)
+    auto clearWaterfalls = [&]() {
+        std::vector<uint8_t> black((size_t)INTERNAL_WATERFALL_WIDTH * WATERFALL_HEIGHT_PX * 4, 0);
+        for (size_t i = 3; i < black.size(); i += 4) black[i] = 255;
+        wTex.update(black.data());
+        std::fill(miniWaterfall.begin(), miniWaterfall.end(), 0);
+        miniTex.update(miniWaterfall.data());
+    };
+
+    auto switchReceiver = [&](Receiver* to) {
+        if (!to || to == cur) return;
+        if (scanner.running()) { scanner.stop(); setScanUi(); }
+        chDrag = ChannelDrag();
+        chEdge = ChannelEdgeDrag();
+        isDraggingScale = isSpectrumDragging = isDraggingBW = isPanningView = false;
+        if (TextInput::currentFocus) TextInput::currentFocus->blur();
+        if (Dropdown::currentActive) { Dropdown::currentActive->isOpen = false; Dropdown::currentActive = nullptr; }
+        Receiver* from = cur;
+        float vol; int theme;
+        {
+            std::lock_guard<std::mutex> l(from->sd.mtx);
+            vol = from->sd.volume; theme = from->sd.waterfallTheme;
+            from->sd.scanMute = false;
+        }
+        saveUi(from);
+        from->sd.visible = false;   // its sound goes on (the speaker button on its tab decides)
+        cur = to;
+        {
+            std::lock_guard<std::mutex> l(to->sd.mtx);
+            to->sd.volume = vol;   // one speaker, one volume
+            to->sd.waterfallTheme = theme;
+            to->sd.newWaterfallData = false;
+        }
+        to->sd.visible = true;
+        applyUi(to);
+        clearWaterfalls();
+    };
+
+    auto addReceiver = [&]() {
+        if (receivers.size() >= 8) { showPopup("Receivers", "Up to 8 receivers can run at once."); return; }
+        Receiver* r = newReceiver();
+        r->sourceType = 0;
+        r->centerFreq = r->sd.centerFreq = 0;
+        {
+            // the new tab starts with the display settings of the current one
+            std::lock_guard<std::mutex> a(cur->sd.mtx);
+            std::lock_guard<std::mutex> b(r->sd.mtx);
+            r->sd.minDb = cur->sd.minDb;
+            r->sd.maxDb = cur->sd.maxDb;
+            r->sd.recPath = cur->sd.recPath;
+            r->sd.mode = Mode::NFM;
+            r->sd.bandwidth = 12500.0;
+        }
+        switchReceiver(r);
+    };
+
+    auto closeReceiver = [&](Receiver* r) {
+        if (receivers.size() <= 1 || !r) return;
+        if (r == cur) {
+            Receiver* other = nullptr;
+            for (auto& x : receivers) if (x.get() != r) { other = x.get(); break; }
+            switchReceiver(other);
+        }
+        if (trackRx == r) trackRx = nullptr;
+        const int stream = r->sd.audioStream;
+        for (auto it = receivers.begin(); it != receivers.end(); ++it)
+            if (it->get() == r) { receivers.erase(it); break; }   // stops its DSP thread and source
+        audio.removeStream(stream);
+    };
+
+    auto drawRxTabs = [&]() {
+        rxTabHits.clear();
+        sf::RectangleShape bar({layout.winW, (float)RX_TAB_H});
+        bar.setPosition({0.0f, (float)TOPBAR_DRAW_H});
+        bar.setFillColor(sf::Color(26, 27, 32));
+        window.draw(bar);
+        const sf::Vector2f mp = window.mapPixelToCoords(sf::Mouse::getPosition(window));
+        auto txt = [&](const std::string& str, float x, float y, sf::Color c) {
+            sf::Text t(font, sf::String::fromUtf8(str.begin(), str.end()), 22);
+            t.setScale({0.5f, 0.5f});
+            t.setFillColor(c);
+            t.setPosition({std::round(x), std::round(y)});
+            window.draw(t);
+            return t.getGlobalBounds().size.x;
+        };
+        float x = 6.0f;
+        const float y = (float)TOPBAR_DRAW_H + 2.0f, h = (float)RX_TAB_H - 2.0f;
+        for (auto& rxp : receivers) {
+            Receiver* r = rxp.get();
+            const bool sel = r == cur;
+            bool playing, dec = false;
+            {
+                std::lock_guard<std::mutex> l(r->sd.mtx);
+                playing = r->sd.isPlaying;
+                dec = r->sd.aprsEnabled;
+                for (SDRModule* m : r->sd.activeDecoders) dec = dec || (m && m->enabled);
+            }
+            const std::string title = r->title();
+            sf::Text probe(font, sf::String::fromUtf8(title.begin(), title.end()), 22);
+            const bool closable = receivers.size() > 1;
+            const float tw = probe.getGlobalBounds().size.x * 0.5f + 48.0f + (closable ? 18.0f : 0.0f);
+            sf::RectangleShape bg({tw, h});
+            bg.setPosition({x, y});
+            bg.setFillColor(sel ? sf::Color(19, 19, 21) : sf::Color(42, 44, 52));
+            bg.setOutlineThickness(1.0f);
+            bg.setOutlineColor(sel ? Theme::Accent : sf::Color(62, 62, 70));
+            window.draw(bg);
+            // state: green = playing, dot ring = decoders running
+            sf::CircleShape led(4.0f);
+            led.setPosition({x + 6.0f, y + h / 2.0f - 4.0f});
+            led.setFillColor(playing ? sf::Color(80, 230, 110) : sf::Color(80, 80, 88));
+            if (dec) { led.setOutlineThickness(1.5f); led.setOutlineColor(sf::Color(255, 210, 0)); }
+            window.draw(led);
+            // speaker: this receiver's sound on / off (crossed out = muted)
+            const bool spk = r->sd.audioOut;
+            const sf::FloatRect spkR({x + 15.0f, y}, {22.0f, h});
+            {
+                const sf::Color c = spkR.contains(mp) ? sf::Color::White : spk ? sf::Color(200, 200, 210) : sf::Color(110, 110, 118);
+                const float sx = x + 18.0f, sy = y + h / 2.0f;
+                sf::RectangleShape box({3.0f, 5.0f});
+                box.setPosition({sx, sy - 2.5f});
+                box.setFillColor(c);
+                window.draw(box);
+                sf::ConvexShape cone(4);
+                cone.setPoint(0, {sx + 3.0f, sy - 2.5f}); cone.setPoint(1, {sx + 7.0f, sy - 6.0f});
+                cone.setPoint(2, {sx + 7.0f, sy + 6.0f}); cone.setPoint(3, {sx + 3.0f, sy + 2.5f});
+                cone.setFillColor(c);
+                window.draw(cone);
+                if (spk) {
+                    for (float rr : {3.0f, 6.0f}) {   // sound waves
+                        sf::VertexArray arc(sf::PrimitiveType::LineStrip, 5);
+                        for (int k = 0; k < 5; k++) {
+                            const float a = (-0.8f + 0.4f * k);
+                            arc[k].position = {sx + 8.0f + rr * std::cos(a), sy + rr * std::sin(a)};
+                            arc[k].color = c;
+                        }
+                        window.draw(arc);
+                    }
+                } else {
+                    sf::VertexArray xx(sf::PrimitiveType::Lines, 4);
+                    xx[0].position = {sx + 9.0f, sy - 3.0f}; xx[1].position = {sx + 14.0f, sy + 3.0f};
+                    xx[2].position = {sx + 14.0f, sy - 3.0f}; xx[3].position = {sx + 9.0f, sy + 3.0f};
+                    for (int k = 0; k < 4; k++) xx[k].color = sf::Color(240, 90, 90);
+                    window.draw(xx);
+                }
+            }
+            txt(title, x + 40.0f, y + 3.0f, sel ? sf::Color::White : sf::Color(180, 180, 190));
+            sf::FloatRect closeR;
+            if (closable) {
+                closeR = sf::FloatRect({x + tw - 18.0f, y}, {18.0f, h});
+                txt("x", x + tw - 13.0f, y + 2.0f, closeR.contains(mp) ? sf::Color(255, 120, 120) : sf::Color(130, 130, 140));
+            }
+            rxTabHits.push_back({sf::FloatRect({x, y}, {tw, h}), closeR, spkR, r});
+            x += tw + 4.0f;
+        }
+        // "+": another receiver
+        const float aw = 128.0f;
+        rxAddHit = sf::FloatRect({x, y}, {aw, h});
+        sf::RectangleShape add({aw, h});
+        add.setPosition({x, y});
+        add.setFillColor(rxAddHit.contains(mp) ? sf::Color(50, 55, 66) : sf::Color(32, 34, 40));
+        add.setOutlineThickness(1.0f);
+        add.setOutlineColor(sf::Color(62, 62, 70));
+        window.draw(add);
+        txt("+  Add receiver", x + 14.0f, y + 3.0f, Theme::Accent);
+    };
+
     // Smoothed values of the signal meter in the status bar
     float meterSnr = -1.0f;
     double meterSignal = -127.0;
     sf::Clock meterClock;
 
+    // --- The other receivers of the last session (RX1 uses the settings above) ---
+    {
+        const int rxCount = std::clamp(settingsMgr.getInt("rx_count", 1), 1, 8);
+        Receiver* first = cur;
+        for (int i = 1; i < rxCount; i++) {
+            const std::string k = "rx" + std::to_string(i + 1) + "_";
+            Receiver* r = newReceiver();
+            switchReceiver(r);
+            long long f = 0;
+            try { f = std::stoll(settingsMgr.getString(k + "frequency", "0")); } catch (...) {}
+            r->centerFreq = f;
+            { std::lock_guard<std::mutex> l(r->sd.mtx); r->sd.centerFreq = f; }
+            r->hostText = settingsMgr.getString(k + "host", txtHost->getText());
+            txtHost->setText(r->hostText);
+            const int type = std::clamp(settingsMgr.getInt(k + "source_type", 0), 0, 4);
+            std::string devHex = settingsMgr.getString(k + "device", "");
+            if (!devHex.empty() && devHex[0] == 'x') devHex.erase(0, 1);   // "x": keeps it a string in the file
+            const std::string devId = fromHex(devHex);
+            const int rateIdx = std::max(0, settingsMgr.getInt(k + "rate", 0));
+            if (type == 4) {
+                r->sourceType = 4;
+                ddSourceType->setSelection(4);
+                updateRadioControls(4);
+                ddRate->setOptions(RTL_SAMPLE_RATES_TXT);
+                ddRate->setSelection(std::min(rateIdx, (int)RTL_SAMPLE_RATES_TXT.size() - 1));
+                refreshSourceUI();
+            } else if (type >= 1 && type <= 3) {
+                ddSourceType->setSelection(type);
+                r->cachedDevices = type == 1 ? RtlSdrSource::getDeviceList()
+                                 : type == 2 ? SdrPlaySource::getDeviceList() : AudioCaptureSource::getDeviceList();
+                std::vector<std::string> names;
+                int found = -1;
+                for (size_t d = 0; d < r->cachedDevices.size(); d++) {
+                    names.push_back(r->cachedDevices[d].name);
+                    if (r->cachedDevices[d].id == devId) found = (int)d;
+                }
+                if (names.empty()) names.push_back("No Devices Found");
+                ddDevice->setOptions(names);
+                if (found >= 0) ddDevice->setSelection(found);
+                r->sourceType = type;
+                updateRadioControls(type);
+                refreshSourceUI();
+                // only the same device as last time (never another receiver's radio)
+                if (found >= 0) {
+                    quietSourceErrors = true;
+                    doOpenSource(type, r->cachedDevices[found].id, rateIdx, "");
+                    quietSourceErrors = false;
+                }
+            }
+            const int m = settingsMgr.getInt(k + "mode", (int)Mode::NFM);
+            restoreMode((Mode)std::clamp(m, 0, (int)Mode::CW));
+            const float bw = settingsMgr.getFloat(k + "bandwidth", 12500.0f);
+            slBW->setValueSilent(bw);
+            slBW->onChange(slBW->currentVal);
+        }
+        switchReceiver(first);
+        for (size_t i = 0; i < receivers.size(); i++)
+            receivers[i]->sd.audioOut = settingsMgr.getBool("rx" + std::to_string(i + 1) + "_speaker", true);
+    }
+
     while (window.isOpen()) {
+        // receiver tab actions from the last frame's clicks (done here, before anything of
+        // this frame looks at `cur`)
+        if (rxAction.kind != 0) {
+            const RxAction a = rxAction;
+            rxAction = {};
+            if (a.kind == 1) addReceiver();
+            else if (a.kind == 2) closeReceiver(a.rx);
+            else if (a.kind == 3) switchReceiver(a.rx);
+        }
         syncMacWindowSize(window);   // macOS window tiling resizes without telling SFML
         sf::Vector2u currSize = window.getSize();
         if (currSize != lastSize && currSize.x > 0 && currSize.y > 0) {
@@ -1462,15 +1902,15 @@ int main() {
         bool agcLimitedByRds = false;
         bool sourceReconnecting = false;
         {
-            std::lock_guard<std::mutex> l(sourceMtx);
-            if (currentSource) {
-                sourceReconnecting = currentSource->isReconnecting();
-                isHw = currentSource->isHardware();
-                hwSampleRate = currentSource->getSampleRate();
-                prog = currentSource->getProgress();
-                autoGainDb = currentSource->getAutoGainDb();
-                adcOverload = currentSource->getOverloadFraction();
-                agcLimitedByRds = currentSource->isAgcLimited();
+            std::lock_guard<std::mutex> l(cur->sd.sourceMtx);
+            if (cur->sd.source) {
+                sourceReconnecting = cur->sd.source->isReconnecting();
+                isHw = cur->sd.source->isHardware();
+                hwSampleRate = cur->sd.source->getSampleRate();
+                prog = cur->sd.source->getProgress();
+                autoGainDb = cur->sd.source->getAutoGainDb();
+                adcOverload = cur->sd.source->getOverloadFraction();
+                agcLimitedByRds = cur->sd.source->isAgcLimited();
             }
         }
 
@@ -1486,11 +1926,11 @@ int main() {
         }
 
         // RTL-TCP: detect that the server dropped the connection and reset the UI
-        if (tcpConnected) {
+        if (cur->tcpConnected) {
             bool lost = false;
             {
-                std::lock_guard<std::mutex> l(sourceMtx);
-                RtlTcpSource* t = dynamic_cast<RtlTcpSource*>(currentSource.get());
+                std::lock_guard<std::mutex> l(cur->sd.sourceMtx);
+                RtlTcpSource* t = dynamic_cast<RtlTcpSource*>(cur->sd.source.get());
                 if (t && t->isConnectionLost()) lost = true;
             }
             if (lost) {
@@ -1506,15 +1946,17 @@ int main() {
         if (std::abs(volSlider.currentVal - lastVolPos) > 0.0005f) {
             lastVolPos = volSlider.currentVal;
             volSlider.setText(volumeText(lastVolPos));
-            std::lock_guard<std::mutex> l(sharedData.mtx);
-            sharedData.volume = volumeGain(lastVolPos);
+            for (auto& rxp : receivers) {   // one speaker, one volume for every receiver
+                std::lock_guard<std::mutex> l(rxp->sd.mtx);
+                rxp->sd.volume = volumeGain(lastVolPos);
+            }
         }
 
-        if (currentSourceType == 0) {
+        if (cur->sourceType == 0) {
             timeSlider.update(window);
             if (timeSlider.isDragging) {
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                sharedData.pendingSeekRequest = timeSlider.currentVal;
+                std::lock_guard<std::mutex> l(cur->sd.mtx);
+                cur->sd.pendingSeekRequest = timeSlider.currentVal;
             } else {
                 timeSlider.currentVal = prog;
                 timeSlider.updateHandlePos();
@@ -1531,15 +1973,15 @@ int main() {
         double viewCenter = 0.5;
 
         {
-            std::lock_guard<std::mutex> l(sharedData.mtx);
-            aprsOn = sharedData.aprsEnabled;
-            rdsOn = sharedData.rdsEnabled;
-            rdsInfo = sharedData.rds;
-            tunePct = sharedData.tunedFreqPercent;
-            mode = sharedData.mode;
-            currentZoom = sharedData.zoomLevel;
-            currentTheme = sharedData.waterfallTheme;
-            viewCenter = sharedData.viewCenterPct;
+            std::lock_guard<std::mutex> l(cur->sd.mtx);
+            aprsOn = cur->sd.aprsEnabled;
+            rdsOn = cur->sd.rdsEnabled;
+            rdsInfo = cur->sd.rds;
+            tunePct = cur->sd.tunedFreqPercent;
+            mode = cur->sd.mode;
+            currentZoom = cur->sd.zoomLevel;
+            currentTheme = cur->sd.waterfallTheme;
+            viewCenter = cur->sd.viewCenterPct;
         }
 
         slZoom->update(window);
@@ -1560,20 +2002,20 @@ int main() {
         const std::vector<DecTab> tabs = collectTabs();
         {
             bool found = false;
-            for (const DecTab& t : tabs) if (t.name == selectedTab) found = true;
-            if (!found) selectedTab = tabs.empty() ? std::string() : tabs.back().name;
+            for (const DecTab& t : tabs) if (t.name == cur->selectedTab) found = true;
+            if (!found) cur->selectedTab = tabs.empty() ? std::string() : tabs.back().name;
         }
         const DecTab* selTab = nullptr;
-        for (const DecTab& t : tabs) if (t.name == selectedTab) selTab = &t;
+        for (const DecTab& t : tabs) if (t.name == cur->selectedTab) selTab = &t;
         SDRModule* panelMod = selTab ? selTab->mod : nullptr;   // nullptr + selTab: the APRS tab
         const bool aprsShown = selTab && !selTab->mod;
         aprsOn = aprsOn && aprsShown;   // the APRS list is the APRS tab's panel
-        const float timelineStripH = (currentSourceType == 0) ? 40.0f : 0.0f;
+        const float timelineStripH = (cur->sourceType == 0) ? 40.0f : 0.0f;
         const float aprsTopY = layout.winH - timelineStripH - 200.0f;
 
         // --- Decoder channels: coloured bands + handles on the tuning bar (all running decoders) ---
         auto setRunning = [&](ChannelSet* cs) {
-            if (inputIsAudio) return false;
+            if (cur->inputIsAudio) return false;
             for (const DecTab& t : tabs) if (t.set == cs) return true;
             return false;
         };
@@ -1582,16 +2024,16 @@ int main() {
         struct ChHandle { DecoderChannel ch; float x; float rawX; int edge; ChannelSet* set; sf::Color col; std::string dec; };
         std::vector<ChHandle> chHandles;
         const double vfoOffsetHz = (tunePct - 0.5) * hwSampleRate;
-        const long long vfoFreqHz = currentCenterFreq + (long long)std::llround(vfoOffsetHz);
+        const long long vfoFreqHz = cur->centerFreq + (long long)std::llround(vfoOffsetHz);
         auto offsetToX = [&](double off) {
             return (float)(((0.5 + off / hwSampleRate) - viewStartPct) / viewWidthPct * layout.specW);
         };
         auto xToFreq = [&](float x) {
             const double pct = viewStartPct + (x / layout.specW) * viewWidthPct;
-            return currentCenterFreq + (long long)std::llround((pct - 0.5) * hwSampleRate);
+            return cur->centerFreq + (long long)std::llround((pct - 0.5) * hwSampleRate);
         };
         const float tbTop = (float)TOP_BAR_H + layout.specH, tbBot = tbTop + layout.tuneBarH;
-        if (!inputIsAudio) {
+        if (!cur->inputIsAudio) {
             // the selected decoder's channels last: drawn on top, picked first when they overlap
             std::vector<const DecTab*> order;
             for (const DecTab& t : tabs) if (&t != selTab) order.push_back(&t);
@@ -1599,7 +2041,7 @@ int main() {
             for (const DecTab* t : order) {
                 if (!t->set) continue;
                 for (const DecoderChannel& c : t->set->snapshot()) {
-                    const double off = c.followVfo ? vfoOffsetHz : (double)(c.freqHz - currentCenterFreq);
+                    const double off = c.followVfo ? vfoOffsetHz : (double)(c.freqHz - cur->centerFreq);
                     const float x = offsetToX(off);
                     const int edge = x < 0.0f ? -1 : (x > layout.specW ? 1 : 0);
                     chHandles.push_back({c, std::clamp(x, 10.0f, layout.specW - 10.0f), x, edge, t->set, t->color, t->name});
@@ -1621,7 +2063,7 @@ int main() {
         if (mode == Mode::USB) { tunerEdgeL = visualCenterX; tunerEdgeR = visualCenterX + bwPixels; }
         if (mode == Mode::LSB) { tunerEdgeL = visualCenterX - bwPixels; tunerEdgeR = visualCenterX; }
         auto chCentreOffset = [&](const DecoderChannel& c) {
-            return c.followVfo ? vfoOffsetHz : (double)(c.freqHz - currentCenterFreq);
+            return c.followVfo ? vfoOffsetHz : (double)(c.freqHz - cur->centerFreq);
         };
         // A draggable edge of a yellow band on the spectrum: index into chHandles, or -1.
         // Bands whose width is the tuner's have no own edges (the grey band's edges change both).
@@ -1668,19 +2110,19 @@ int main() {
         // Puts the tuner on a frequency (retunes the radio when it is outside the band)
         auto tuneVfoTo = [&](long long f) {
             const double halfBW = hwSampleRate / 2.0;
-            if (isHw && (f < currentCenterFreq - halfBW || f > currentCenterFreq + halfBW)) {
-                currentCenterFreq = f;
+            if (isHw && (f < cur->centerFreq - halfBW || f > cur->centerFreq + halfBW)) {
+                cur->centerFreq = f;
                 {
-                    std::lock_guard<std::mutex> l(sharedData.mtx);
-                    sharedData.centerFreq = f;
-                    sharedData.tunedFreqPercent = 0.5;
-                    sharedData.viewCenterPct = 0.5;
+                    std::lock_guard<std::mutex> l(cur->sd.mtx);
+                    cur->sd.centerFreq = f;
+                    cur->sd.tunedFreqPercent = 0.5;
+                    cur->sd.viewCenterPct = 0.5;
                 }
-                pendingCenterFreq = f;
-                debouncer.restart();
+                cur->pendingCenterFreq = f;
+                cur->debouncer.restart();
             } else {
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                sharedData.tunedFreqPercent = std::clamp(0.5 + (double)(f - currentCenterFreq) / hwSampleRate, 0.0, 1.0);
+                std::lock_guard<std::mutex> l(cur->sd.mtx);
+                cur->sd.tunedFreqPercent = std::clamp(0.5 + (double)(f - cur->centerFreq) / hwSampleRate, 0.0, 1.0);
             }
             freqVFO.setFrequency(f);
         };
@@ -1694,9 +2136,9 @@ int main() {
             chDrag.freqHz = xToFreq(x);
             float bestD = 10.0f;
             if (std::abs(visualCenterX - x) < bestD) { bestD = std::abs(visualCenterX - x); chDrag.snap = 2; chDrag.freqHz = vfoFreqHz; }
-            if (chDrag.snap == 0 && currentCenterFreq > 0) {
+            if (chDrag.snap == 0 && cur->centerFreq > 0) {
                 for (long long pf : chDrag.set->presets) {
-                    const float px = offsetToX((double)(pf - currentCenterFreq));
+                    const float px = offsetToX((double)(pf - cur->centerFreq));
                     if (std::abs(px - x) < bestD) { bestD = std::abs(px - x); chDrag.snap = 1; chDrag.freqHz = pf; }
                 }
             }
@@ -1713,7 +2155,7 @@ int main() {
                 for (const ChHandle& h : chHandles) {
                     if (h.ch.id != chDrag.id || h.set != chDrag.set) continue;
                     if (!h.ch.followVfo) tuneVfoTo(h.ch.freqHz);
-                    if (!inputIsAudio) restoreMode(h.ch.listenMode);
+                    if (!cur->inputIsAudio) restoreMode(h.ch.listenMode);
                 }
             } else if (chDrag.snap == 2) {
                 chDrag.set->followTuner(chDrag.id);
@@ -1725,10 +2167,10 @@ int main() {
             bool isHwLocal = false;
             double sr = 2e6;
             {
-                std::lock_guard<std::mutex> l(sourceMtx);
-                if (currentSource) {
-                    isHwLocal = currentSource->isHardware();
-                    sr = currentSource->getSampleRate();
+                std::lock_guard<std::mutex> l(cur->sd.sourceMtx);
+                if (cur->sd.source) {
+                    isHwLocal = cur->sd.source->isHardware();
+                    sr = cur->sd.source->getSampleRate();
                 }
             }
 
@@ -1736,42 +2178,43 @@ int main() {
             double clickedAbsolutePct = viewStartPct + clickViewPct * viewWidthPct;
 
             double offsetHz = (clickedAbsolutePct - 0.5) * sr;
-            long long clickedFreq = currentCenterFreq + (long long)offsetHz;
+            long long clickedFreq = cur->centerFreq + (long long)offsetHz;
 
             long long step = STEP_VALUES[ddSnap->selectedIndex];
             if (step > 0) {
                 clickedFreq = (long long)std::round((double)clickedFreq / step) * step;
-                double newOffset = (double)(clickedFreq - currentCenterFreq);
+                double newOffset = (double)(clickedFreq - cur->centerFreq);
                 clickedAbsolutePct = 0.5 + (newOffset / sr);
             }
 
-            if (stickyCenterMode && isHwLocal) {
-                pendingCenterFreq = clickedFreq;
-                debouncer.restart();
+            if (cur->stickyCenter && isHwLocal) {
+                cur->pendingCenterFreq = clickedFreq;
+                cur->debouncer.restart();
                 {
-                    std::lock_guard<std::mutex> l(sharedData.mtx);
-                    sharedData.tunedFreqPercent = 0.5;
-                    sharedData.viewCenterPct = 0.5;
+                    std::lock_guard<std::mutex> l(cur->sd.mtx);
+                    cur->sd.tunedFreqPercent = 0.5;
+                    cur->sd.viewCenterPct = 0.5;
                 }
                 freqVFO.setFrequency(clickedFreq);
             } else {
                 {
-                    std::lock_guard<std::mutex> l(sharedData.mtx);
-                    sharedData.tunedFreqPercent = clickedAbsolutePct;
+                    std::lock_guard<std::mutex> l(cur->sd.mtx);
+                    cur->sd.tunedFreqPercent = clickedAbsolutePct;
                 }
                 freqVFO.setFrequency(clickedFreq);
             }
         };
 
-        if (pendingRfGain > -900.0f && gainDebouncer.getElapsedTime().asMilliseconds() > GAIN_LATENCY_MS) {
-            {
-                std::lock_guard<std::mutex> l(sourceMtx);
-                if (currentSource && currentSource->isHardware()) {
-                    currentSource->setGain((int)pendingRfGain);
+        for (auto& rxp : receivers) {   // every receiver: a tab may be left right after a change
+            Receiver& r = *rxp;
+            if (r.pendingRfGain > -900.0f && r.gainDebouncer.getElapsedTime().asMilliseconds() > GAIN_LATENCY_MS) {
+                {
+                    std::lock_guard<std::mutex> l(r.sd.sourceMtx);
+                    if (r.sd.source && r.sd.source->isHardware()) r.sd.source->setGain((int)r.pendingRfGain);
                 }
+                r.pendingRfGain = -999.0f;
+                r.gainDebouncer.restart();
             }
-            pendingRfGain = -999.0f;
-            gainDebouncer.restart();
         }
 
         // Decoder panel at the bottom of the waterfall. With a file source the timeline
@@ -1831,6 +2274,27 @@ int main() {
                 }
             }
 
+            // Receiver tabs (below the top bar): switch / add / close
+            if (const auto* mbr = ev->getIf<sf::Event::MouseButtonPressed>()) {
+                const sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window));
+                if (m.y >= TOPBAR_DRAW_H && m.y < TOP_BAR_H) {
+                    if (mbr->button == sf::Mouse::Button::Left) {
+                        if (rxAddHit.contains(m)) rxAction = {1, nullptr};
+                        else for (const RxTabHit& h : rxTabHits) {
+                            if (h.speaker.contains(m)) {   // this receiver's sound on / off (works in the background)
+                                const bool on = !h.rx->sd.audioOut;
+                                h.rx->sd.audioOut = on;
+                                if (!on) audio.clear(h.rx->sd.audioStream);
+                                break;
+                            }
+                            if (h.close.size.x > 0 && h.close.contains(m)) { rxAction = {2, h.rx}; break; }
+                            if (h.tab.contains(m)) { if (h.rx != cur) rxAction = {3, h.rx}; break; }
+                        }
+                    }
+                    continue;
+                }
+            }
+
             if (sidebar.handleEvent(*ev, window)) continue;
 
             // Decoder tabs: click = show its panel, x = switch the decoder off
@@ -1845,7 +2309,7 @@ int main() {
                                 d.chk->onToggle(false);
                                 break;
                             }
-                            if (th.tab.contains(m)) { selectedTab = th.name; break; }
+                            if (th.tab.contains(m)) { cur->selectedTab = th.name; break; }
                         }
                     }
                     continue;
@@ -1894,32 +2358,30 @@ int main() {
             bool topBarHandled = false;
             if (volSlider.handleEvent(*ev, window)) topBarHandled = true;
             if (slZoom->handleEvent(*ev, window)) topBarHandled = true;
-            if (currentSourceType == 0 && timeSlider.handleEvent(*ev, window)) topBarHandled = true;
+            if (cur->sourceType == 0 && timeSlider.handleEvent(*ev, window)) topBarHandled = true;
 
             if (btnMute.isClicked(*ev, window)) {
-                static bool m = false;
-                m = !m;
-                if(m) btnMute.setActive(true); else btnMute.setActive(false);
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                sharedData.isMuted = m;
+                appMuted = !appMuted;
+                btnMute.setActive(appMuted);
+                audio.masterMute = appMuted;   // the whole speaker (every receiver)
                 topBarHandled = true;
             }
 
             if (btnPlay.isClicked(*ev, window)) {
                 bool s;
                 {
-                    std::lock_guard<std::mutex> l(sharedData.mtx);
-                    sharedData.isPlaying = !sharedData.isPlaying;
-                    s = sharedData.isPlaying;
+                    std::lock_guard<std::mutex> l(cur->sd.mtx);
+                    cur->sd.isPlaying = !cur->sd.isPlaying;
+                    s = cur->sd.isPlaying;
                 }
                 if (s) {
                     btnPlay.setText("||"); btnPlay.setActive(true);
                     audio.start();
-                    { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->start(); }
+                    { std::lock_guard<std::mutex> l(cur->sd.sourceMtx); if (cur->sd.source) cur->sd.source->start(); }
                 } else {
                     btnPlay.setText(">"); btnPlay.setActive(false);
-                    audio.stop();
-                    { std::lock_guard<std::mutex> l(sourceMtx); if (currentSource) currentSource->stop(); }
+                    audio.clear(cur->sd.audioStream);
+                    { std::lock_guard<std::mutex> l(cur->sd.sourceMtx); if (cur->sd.source) cur->sd.source->stop(); }
                 }
                 topBarHandled = true;
             }
@@ -1930,12 +2392,12 @@ int main() {
             }
 
             if (isHw && btnTuningMode.isClicked(*ev, window)) {
-                stickyCenterMode = !stickyCenterMode;
-                if(stickyCenterMode) {
+                cur->stickyCenter = !cur->stickyCenter;
+                if(cur->stickyCenter) {
                     btnTuningMode.setText("CTR"); btnTuningMode.setActive(true);
-                    { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.tunedFreqPercent = 0.5; }
-                    pendingCenterFreq = freqVFO.getFrequency();
-                    debouncer.restart();
+                    { std::lock_guard<std::mutex> l(cur->sd.mtx); cur->sd.tunedFreqPercent = 0.5; }
+                    cur->pendingCenterFreq = freqVFO.getFrequency();
+                    cur->debouncer.restart();
                 } else {
                     btnTuningMode.setText("FIX"); btnTuningMode.setActive(false);
                 }
@@ -1946,28 +2408,28 @@ int main() {
                 topBarHandled = true;
                 long long targetVFO = freqVFO.getFrequency();
                 double halfBW = hwSampleRate / 2.0;
-                double minF = (double)currentCenterFreq - halfBW;
-                double maxF = (double)currentCenterFreq + halfBW;
+                double minF = (double)cur->centerFreq - halfBW;
+                double maxF = (double)cur->centerFreq + halfBW;
 
-                if (isHw && (stickyCenterMode || targetVFO < minF || targetVFO > maxF)) {
-                    currentCenterFreq = targetVFO;
+                if (isHw && (cur->stickyCenter || targetVFO < minF || targetVFO > maxF)) {
+                    cur->centerFreq = targetVFO;
                     {
-                        std::lock_guard<std::mutex> l(sharedData.mtx);
-                        sharedData.centerFreq = targetVFO;
-                        sharedData.tunedFreqPercent = 0.5;
-                        sharedData.viewCenterPct = 0.5;
+                        std::lock_guard<std::mutex> l(cur->sd.mtx);
+                        cur->sd.centerFreq = targetVFO;
+                        cur->sd.tunedFreqPercent = 0.5;
+                        cur->sd.viewCenterPct = 0.5;
                     }
-                    pendingCenterFreq = targetVFO;
-                    debouncer.restart();
+                    cur->pendingCenterFreq = targetVFO;
+                    cur->debouncer.restart();
                 } else {
                     if (!isHw) {
                         if (targetVFO > maxF) targetVFO = (long long)maxF;
                         if (targetVFO < minF) targetVFO = (long long)minF;
                     }
-                    double newOffset = (double)(targetVFO - currentCenterFreq);
+                    double newOffset = (double)(targetVFO - cur->centerFreq);
                     {
-                        std::lock_guard<std::mutex> l(sharedData.mtx);
-                        sharedData.tunedFreqPercent = 0.5 + (newOffset / hwSampleRate);
+                        std::lock_guard<std::mutex> l(cur->sd.mtx);
+                        cur->sd.tunedFreqPercent = 0.5 + (newOffset / hwSampleRate);
                     }
                 }
                 if (targetVFO != freqVFO.getFrequency()) freqVFO.setFrequency(targetVFO);
@@ -2000,23 +2462,23 @@ int main() {
 
                         freqVFO.setFrequency(rawNext);
 
-                        if (stickyCenterMode && isHw) {
-                            currentCenterFreq = rawNext;
-                            pendingCenterFreq = rawNext;
-                            debouncer.restart();
+                        if (cur->stickyCenter && isHw) {
+                            cur->centerFreq = rawNext;
+                            cur->pendingCenterFreq = rawNext;
+                            cur->debouncer.restart();
                             {
-                                std::lock_guard<std::mutex> l(sharedData.mtx);
-                                sharedData.centerFreq = rawNext;
-                                sharedData.tunedFreqPercent = 0.5;
-                                sharedData.viewCenterPct = 0.5;
+                                std::lock_guard<std::mutex> l(cur->sd.mtx);
+                                cur->sd.centerFreq = rawNext;
+                                cur->sd.tunedFreqPercent = 0.5;
+                                cur->sd.viewCenterPct = 0.5;
                             }
                         } else {
-                            double newOffset = (double)(rawNext - currentCenterFreq);
+                            double newOffset = (double)(rawNext - cur->centerFreq);
                             double clickPct = 0.5 + (newOffset / hwSampleRate);
                             clickPct = std::clamp(clickPct, 0.0, 1.0);
                             {
-                                std::lock_guard<std::mutex> l(sharedData.mtx);
-                                sharedData.tunedFreqPercent = clickPct;
+                                std::lock_guard<std::mutex> l(cur->sd.mtx);
+                                cur->sd.tunedFreqPercent = clickPct;
                             }
                         }
                     }
@@ -2041,15 +2503,15 @@ int main() {
                         if (m.x > logX) {
                             float relY = m.y - listTopY - aprsLogScrollOffset;
                             int index = (int)(relY / 16.0f);
-                            std::lock_guard<std::mutex> l(sharedData.mtx);
-                            if (index >= 0 && index < sharedData.aprsHistory.size()) {
-                                selectedAprsPacket = sharedData.aprsHistory[index];
+                            std::lock_guard<std::mutex> l(cur->sd.mtx);
+                            if (index >= 0 && index < cur->sd.aprsHistory.size()) {
+                                selectedAprsPacket = cur->sd.aprsHistory[index];
                                 showAprsModal = true;
                             }
                         }
                     }
 
-                    bool overTimeline = (currentSourceType == 0) && (timeSlider.isDragging || (m.y > layout.winH - 40));
+                    bool overTimeline = (cur->sourceType == 0) && (timeSlider.isDragging || (m.y > layout.winH - 40));
                     bool inFreqScaleZone = (m.y >= TOP_BAR_H + layout.specH && m.y <= TOP_BAR_H + layout.specH + layout.tuneBarH && m.x < layout.specW);
 
                     float leftEdge = visualCenterX - bwPixels / 2.0f;
@@ -2088,10 +2550,10 @@ int main() {
                     float dx = lastDragX - m.x;
                     lastDragX = m.x;
                     double pctShift = (dx / layout.specW) * viewWidthPct;
-                    std::lock_guard<std::mutex> l(sharedData.mtx);
-                    sharedData.viewCenterPct += pctShift;
-                    if (sharedData.viewCenterPct - visibleFraction/2.0 < 0.0) sharedData.viewCenterPct = visibleFraction/2.0;
-                    if (sharedData.viewCenterPct + visibleFraction/2.0 > 1.0) sharedData.viewCenterPct = 1.0 - visibleFraction/2.0;
+                    std::lock_guard<std::mutex> l(cur->sd.mtx);
+                    cur->sd.viewCenterPct += pctShift;
+                    if (cur->sd.viewCenterPct - visibleFraction/2.0 < 0.0) cur->sd.viewCenterPct = visibleFraction/2.0;
+                    if (cur->sd.viewCenterPct + visibleFraction/2.0 > 1.0) cur->sd.viewCenterPct = 1.0 - visibleFraction/2.0;
                 }
                 else if (isDraggingBW) {
                     float hzPerPx = (hwSampleRate * viewWidthPct) / layout.specW;
@@ -2115,29 +2577,29 @@ int main() {
                     dragAccumulator = exactShift - shift;
 
                     if (isHw) {
-                        long long nextCenter = currentCenterFreq + shift;
+                        long long nextCenter = cur->centerFreq + shift;
                         if (nextCenter < 0) nextCenter = 0;
-                        currentCenterFreq = nextCenter;
+                        cur->centerFreq = nextCenter;
                         {
-                            std::lock_guard<std::mutex> l(sharedData.mtx);
-                            sharedData.centerFreq = nextCenter;
+                            std::lock_guard<std::mutex> l(cur->sd.mtx);
+                            cur->sd.centerFreq = nextCenter;
                         }
-                        pendingCenterFreq = nextCenter;
+                        cur->pendingCenterFreq = nextCenter;
                     } else {
                         double pctShift = (dx / layout.specW) * viewWidthPct;
-                        std::lock_guard<std::mutex> l(sharedData.mtx);
-                        sharedData.viewCenterPct = std::clamp(sharedData.viewCenterPct + pctShift, visibleFraction/2.0, 1.0 - visibleFraction/2.0);
+                        std::lock_guard<std::mutex> l(cur->sd.mtx);
+                        cur->sd.viewCenterPct = std::clamp(cur->sd.viewCenterPct + pctShift, visibleFraction/2.0, 1.0 - visibleFraction/2.0);
                     }
                 }
 
                 const bool overDecoderPanel = (m.y >= decoderPanelTop && m.y < layout.winH - timelineStripH);
                 if (!overAprs && !overDecoderPanel && m.x >= 0 && m.x < layout.specW && m.y >= TOP_BAR_H && m.y < (TOP_BAR_H + layout.specH + layout.waterfallH)) {
-                    std::lock_guard<std::mutex> l(sharedData.mtx);
-                    sharedData.mouseX_spectrum = m.x;
-                    sharedData.mouseY_spectrum = m.y - TOP_BAR_H;
+                    std::lock_guard<std::mutex> l(cur->sd.mtx);
+                    cur->sd.mouseX_spectrum = m.x;
+                    cur->sd.mouseY_spectrum = m.y - TOP_BAR_H;
                 } else {
-                    std::lock_guard<std::mutex> l(sharedData.mtx);
-                    sharedData.mouseX_spectrum = -1.0f;
+                    std::lock_guard<std::mutex> l(cur->sd.mtx);
+                    cur->sd.mouseX_spectrum = -1.0f;
                 }
             }
         } // end of pollEvent loop
@@ -2146,7 +2608,7 @@ int main() {
         {
             float snr = 0.0f;
             unsigned long long seq = 0;
-            { std::lock_guard<std::mutex> l(sharedData.mtx); snr = sharedData.tunerSnrDb; seq = sharedData.tunerLevelSeq; }
+            { std::lock_guard<std::mutex> l(cur->sd.mtx); snr = cur->sd.tunerSnrDb; seq = cur->sd.tunerLevelSeq; }
             const bool fresh = seq != lastLevelSeq;
             lastLevelSeq = seq;
             // tuning by hand stops the scanner
@@ -2157,14 +2619,14 @@ int main() {
             if (pendingBookmarkTune >= 0 && pendingBookmarkTune < (int)bookmarks.items.size()) {
                 const Bookmark b = bookmarks.items[pendingBookmarkTune];
                 tuneVfoTo(b.freqHz);
-                if (!inputIsAudio) {
+                if (!cur->inputIsAudio) {
                     restoreMode(b.mode);
                     if (b.mode != Mode::OFF) { slBW->setValueSilent(b.bandwidthHz); slBW->onChange(slBW->currentVal); }
                 }
             }
             pendingBookmarkTune = -1;
             const bool mute = scanner.running() && scanner.muteWanted();
-            { std::lock_guard<std::mutex> l(sharedData.mtx); sharedData.scanMute = mute; }
+            { std::lock_guard<std::mutex> l(cur->sd.mtx); cur->sd.scanMute = mute; }
             bookList->active = scanner.running() ? scanner.current : -1;
             if (scanner.running()) bookList->ensureVisible(scanner.current);
             const std::string st = scanner.status(bookmarks.items);
@@ -2178,18 +2640,18 @@ int main() {
         // decoder positions are stamped with the map's time (the recording's time for old files)
         positionBus().setClock(orbit::jdToUnix(mapWindow.trackerJd()));
         // ADS-B: the receiver for distances / surface positions, and the "Tune to 1090 MHz" button
-        ptrADSB->setReceiver(satTracker.obs.latDeg, satTracker.obs.lonDeg);
-        if (const long long want = ptrADSB->tuneRequest.exchange(0); want > 0) {
+        for (auto& rxp : receivers) rxp->adsb->setReceiver(satTracker.obs.latDeg, satTracker.obs.lonDeg);
+        if (const long long want = cur->adsb->tuneRequest.exchange(0); want > 0) {
             if (isHw) {   // only the frequency; the sample rate stays the user's choice
-                currentCenterFreq = want;
+                cur->centerFreq = want;
                 {
-                    std::lock_guard<std::mutex> l(sharedData.mtx);
-                    sharedData.centerFreq = want;
-                    sharedData.tunedFreqPercent = 0.5;
-                    sharedData.viewCenterPct = 0.5;
+                    std::lock_guard<std::mutex> l(cur->sd.mtx);
+                    cur->sd.centerFreq = want;
+                    cur->sd.tunedFreqPercent = 0.5;
+                    cur->sd.viewCenterPct = 0.5;
                 }
-                pendingCenterFreq = want;
-                debouncer.restart();
+                cur->pendingCenterFreq = want;
+                cur->debouncer.restart();
                 freqVFO.setFrequency(want);
             }
         }
@@ -2205,35 +2667,42 @@ int main() {
                 if (!t) t = selTab;
                 if (t) { decName = t->name; trackSet = t->set; }
             }
-            if (inputIsAudio) trackSet = nullptr;
+            if (cur->inputIsAudio) trackSet = nullptr;
             satTracker.activeDecoderName = decName;
 
+            // Tracking belongs to the receiver it was started on; in another tab it pauses
+            if (!satTracker.active()) trackRx = nullptr;
+            else if (!trackRx) trackRx = cur;
+            const bool trackHere = !trackRx || trackRx == cur;
             // real time, or the recording's / manual time set in the map's Time module
-            if (satTracker.update(satCatalog, mapWindow.trackerJd())) {
+            const bool trackWants = satTracker.update(satCatalog, mapWindow.trackerJd());
+            if (trackWants && !trackHere)
+                satTracker.applyStatus = "Tracking runs on RX" + std::to_string(trackRx->id) + ": open its tab";
+            if (trackWants && trackHere) {
                 satTracker.applyStatus.clear();
                 const double rate = hwSampleRate > 0 ? hwSampleRate : 2e6;
                 // Retunes the radio so `hz` lies in the received band, away from the DC spike;
                 // the tuner (VFO) goes onto `hz` as well
                 auto recentreOn = [&](long long hz) {
                     const long long c = hz + (long long)std::llround(rate * 0.25);
-                    currentCenterFreq = c;
+                    cur->centerFreq = c;
                     {
-                        std::lock_guard<std::mutex> l(sharedData.mtx);
-                        sharedData.centerFreq = c;
-                        sharedData.tunedFreqPercent = 0.5 + (double)(hz - c) / rate;
-                        sharedData.viewCenterPct = 0.5;
+                        std::lock_guard<std::mutex> l(cur->sd.mtx);
+                        cur->sd.centerFreq = c;
+                        cur->sd.tunedFreqPercent = 0.5 + (double)(hz - c) / rate;
+                        cur->sd.viewCenterPct = 0.5;
                     }
-                    pendingCenterFreq = c;
-                    debouncer.restart();
+                    cur->pendingCenterFreq = c;
+                    cur->debouncer.restart();
                     freqVFO.setFrequency(hz);
                 };
                 auto inBand = [&](long long hz, double width) {
-                    return std::abs((double)(hz - currentCenterFreq)) + width / 2.0 < rate * 0.45;
+                    return std::abs((double)(hz - cur->centerFreq)) + width / 2.0 < rate * 0.45;
                 };
 
                 if (satTracker.target == orbit::TrackTarget::Tuner) {
                     // demodulator mode of the transmitter, once per tracking start
-                    if (satTracker.setDemodMode && !satTracker.demodApplied && !inputIsAudio) {
+                    if (satTracker.setDemodMode && !satTracker.demodApplied && !cur->inputIsAudio) {
                         const orbit::DemodHint h = orbit::demodHintFor(satTracker.tx);
                         restoreMode(h.mode);
                         slBW->setValueSilent((float)h.bandwidthHz);
@@ -2241,23 +2710,23 @@ int main() {
                     }
                     satTracker.demodApplied = true;
                     double pct;
-                    { std::lock_guard<std::mutex> l(sharedData.mtx); pct = sharedData.tunedFreqPercent; }
-                    const long long cur = currentCenterFreq + (long long)std::llround((pct - 0.5) * rate);
-                    satTracker.noteRadioFrequency(cur);
+                    { std::lock_guard<std::mutex> l(cur->sd.mtx); pct = cur->sd.tunedFreqPercent; }
+                    const long long curHz = cur->centerFreq + (long long)std::llround((pct - 0.5) * rate);
+                    satTracker.noteRadioFrequency(curHz);
                     const long long want = satTracker.wantHz;
-                    if (std::llabs(want - cur) >= 5 && trackClock.getElapsedTime().asMilliseconds() >= 100) {
+                    if (std::llabs(want - curHz) >= 5 && trackClock.getElapsedTime().asMilliseconds() >= 100) {
                         if (isHw && !inBand(want, slBW->currentVal)) recentreOn(want);
                         else if (!isHw && !inBand(want, 0.0)) satTracker.applyStatus = "Outside the file's band";
                         else {
-                            std::lock_guard<std::mutex> l(sharedData.mtx);
-                            sharedData.tunedFreqPercent = 0.5 + (double)(want - currentCenterFreq) / rate;
+                            std::lock_guard<std::mutex> l(cur->sd.mtx);
+                            cur->sd.tunedFreqPercent = 0.5 + (double)(want - cur->centerFreq) / rate;
                             freqVFO.setFrequency(want);
                         }
                         satTracker.lastCommandHz = want;
                         trackClock.restart();
-                    } else if (satTracker.lastCommandHz == 0) satTracker.lastCommandHz = cur;
+                    } else if (satTracker.lastCommandHz == 0) satTracker.lastCommandHz = curHz;
                 } else {
-                    if (!trackSet) satTracker.applyStatus = inputIsAudio ? "Audio input: decoder channels are not used"
+                    if (!trackSet) satTracker.applyStatus = cur->inputIsAudio ? "Audio input: decoder channels are not used"
                                                                          : "Switch on a decoder (e.g. SSTV) to track its channel";
                     else {
                         const auto chans = trackSet->snapshot();
@@ -2278,18 +2747,23 @@ int main() {
             }
         }
 
-        if (pendingCenterFreq != 0 && debouncer.getElapsedTime().asMilliseconds() > TUNING_LATENCY_MS) {
-            std::lock_guard<std::mutex> l(sourceMtx);
-            if (currentSource && currentSource->isHardware()) {
-                currentSource->setCenterFrequency(pendingCenterFreq);
-                currentCenterFreq = pendingCenterFreq;
+        for (auto& rxp : receivers) {
+            Receiver& r = *rxp;
+            if (r.pendingCenterFreq != 0 && r.debouncer.getElapsedTime().asMilliseconds() > TUNING_LATENCY_MS) {
+                {
+                    std::lock_guard<std::mutex> l(r.sd.sourceMtx);
+                    if (r.sd.source && r.sd.source->isHardware()) {
+                        r.sd.source->setCenterFrequency(r.pendingCenterFreq);
+                        r.centerFreq = r.pendingCenterFreq;
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> l(r.sd.mtx);
+                    r.sd.centerFreq = r.pendingCenterFreq;
+                }
+                r.pendingCenterFreq = 0;
+                r.debouncer.restart();
             }
-            {
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                sharedData.centerFreq = pendingCenterFreq;
-            }
-            pendingCenterFreq = 0;
-            debouncer.restart();
         }
 
         sidebar.update(window);
@@ -2302,7 +2776,7 @@ int main() {
         } else {
             if (freqVFO.isHovered) showHand = true;
             if (mousePos.y >= TOP_BAR_H + layout.specH - 10 && mousePos.y <= TOP_BAR_H + layout.specH + 20 && mousePos.x < layout.specW) showHand = true;
-            if (volSlider.isMouseOver(window) || (currentSourceType == 0 && timeSlider.isMouseOver(window))) showHand = true;
+            if (volSlider.isMouseOver(window) || (cur->sourceType == 0 && timeSlider.isMouseOver(window))) showHand = true;
             if (btnPlay.isMouseOver(window) || btnMute.isMouseOver(window) || btnTuningMode.isMouseOver(window) || btnMap.isMouseOver(window)) showHand = true;
             if (aprsOn && mousePos.y > aprsTopY && mousePos.y < aprsTopY + 200.0f && mousePos.x < layout.specW) showHand = true;
             if (!tabs.empty() && mousePos.y >= tabTop && mousePos.y < tabTop + TAB_H && mousePos.x < layout.specW) showHand = true;
@@ -2318,10 +2792,10 @@ int main() {
         std::vector<uint8_t> newRow;
         bool hasData = false;
         {
-            std::lock_guard<std::mutex> l(sharedData.mtx);
-            if (sharedData.newInspectorData) {
-                newRow = sharedData.inspectorWaterfallRow;
-                sharedData.newInspectorData = false;
+            std::lock_guard<std::mutex> l(cur->sd.mtx);
+            if (cur->sd.newInspectorData) {
+                newRow = cur->sd.inspectorWaterfallRow;
+                cur->sd.newInspectorData = false;
                 hasData = true;
             }
         }
@@ -2341,11 +2815,11 @@ int main() {
         std::vector<uint8_t> row;
         bool newRow2 = false;
         {
-            std::lock_guard<std::mutex> lock(sharedData.mtx);
-            spectrum = sharedData.fftSpectrum;
-            if (sharedData.newWaterfallData) {
-                row = sharedData.waterfallRow;
-                sharedData.newWaterfallData = false;
+            std::lock_guard<std::mutex> lock(cur->sd.mtx);
+            spectrum = cur->sd.fftSpectrum;
+            if (cur->sd.newWaterfallData) {
+                row = cur->sd.waterfallRow;
+                cur->sd.newWaterfallData = false;
                 newRow2 = true;
             }
         }
@@ -2358,7 +2832,7 @@ int main() {
         window.clear(sf::Color::Black);
 
         long long cf = 0;
-        if (currentSource) cf = currentCenterFreq;
+        if (cur->sd.source) cf = cur->centerFreq;
 
         // --- DEDICATED TUNING BAR ---
         sf::RectangleShape tuneBarBg({layout.specW, layout.tuneBarH});
@@ -2468,9 +2942,9 @@ int main() {
         float mx = -1.0f;
         float my = -1.0f;
         {
-            std::lock_guard<std::mutex> l(sharedData.mtx);
-            mx = sharedData.mouseX_spectrum;
-            my = sharedData.mouseY_spectrum;
+            std::lock_guard<std::mutex> l(cur->sd.mtx);
+            mx = cur->sd.mouseX_spectrum;
+            my = cur->sd.mouseY_spectrum;
         }
 
         if (mx != -1.0f) {
@@ -2577,17 +3051,48 @@ int main() {
             const int hovered = (chDrag.set || chEdge.set) ? -1 : handleAt(mousePos);
             const int hoveredEdge = (chDrag.set || chEdge.set || hovered >= 0) ? -1 : edgeAt(mousePos);
 
+            // channel labels: below the band plan's name, in as many rows as they need not to overlap
+            auto chTitle = [&](const ChHandle& h) {
+                const DecoderChannel& c = h.ch;
+                const bool numericName = !c.name.empty() && c.name[0] >= '0' && c.name[0] <= '9';
+                const std::string cname = numericName ? h.dec + " " + c.name : c.name;
+                const bool saysTuner = cname.size() >= 5 && cname.compare(cname.size() - 5, 5, "tuner") == 0;
+                return cname + (c.followVfo ? (saysTuner ? std::string() : "  (tuner)") : numericName ? std::string() : "  " + mhzText(c.freqHz));
+            };
+            std::vector<int> labelRow(chHandles.size(), 0);
+            {
+                std::vector<std::pair<float, size_t>> order;
+                for (size_t i = 0; i < chHandles.size(); i++) {
+                    if (chHandles[i].edge != 0) continue;
+                    const double off = chHandles[i].ch.followVfo ? vfoOffsetHz : (double)(chHandles[i].ch.freqHz - cur->centerFreq);
+                    order.push_back({std::max(2.0f, offsetToX(chHandles[i].ch.lowOffset(off)) + 3.0f), i});
+                }
+                std::sort(order.begin(), order.end());
+                std::vector<float> rowEnd;
+                for (const auto& [lx, i] : order) {
+                    const std::string t = chTitle(chHandles[i]);
+                    sf::Text probe(font, sf::String::fromUtf8(t.begin(), t.end()), 20);
+                    const float w = probe.getGlobalBounds().size.x * 0.5f + 6.0f;
+                    int row = -1;
+                    for (size_t r = 0; r < rowEnd.size(); r++) if (rowEnd[r] <= lx) { row = (int)r; break; }
+                    if (row < 0) {
+                        if (rowEnd.size() < 5) { row = (int)rowEnd.size(); rowEnd.push_back(0.0f); }
+                        else row = (int)(std::min_element(rowEnd.begin(), rowEnd.end()) - rowEnd.begin());
+                    }
+                    rowEnd[row] = lx + w;
+                    labelRow[i] = row;
+                }
+            }
+
             for (size_t i = 0; i < chHandles.size(); i++) {
                 const ChHandle& h = chHandles[i];
                 const DecoderChannel& c = h.ch;
                 const bool dragging = (chDrag.set == h.set && chDrag.id == c.id) || (chEdge.set == h.set && chEdge.id == c.id);
-                const double off = c.followVfo ? vfoOffsetHz : (double)(c.freqHz - currentCenterFreq);
+                const double off = c.followVfo ? vfoOffsetHz : (double)(c.freqHz - cur->centerFreq);
                 const sf::Color yellow = h.col;
                 const sf::Color edgeCol = withAlpha(h.col, 210), fillCol = withAlpha(h.col, 38), wfEdgeCol = withAlpha(h.col, 110);
                 // channels named by their frequency (ACARS, VDL2) get the decoder's name in front
-                const bool numericName = !c.name.empty() && c.name[0] >= '0' && c.name[0] <= '9';
-                const std::string cname = numericName ? h.dec + " " + c.name : c.name;
-                const std::string title = cname + (c.followVfo ? "  (tuner)" : numericName ? std::string() : "  " + mhzText(c.freqHz));
+                const std::string title = chTitle(h);
 
                 if (h.edge == 0) {
                     // band on the spectrum, edges on the waterfall
@@ -2605,7 +3110,7 @@ int main() {
                         vline(x, specTop, specBot, edgeCol);
                         vline(x, wfTop, wfBot, wfEdgeCol);
                     }
-                    label(title, std::max(2.0f, x0 + 3.0f), specTop + 3.0f + 12.0f * (float)(i % 2), edgeCol);
+                    label(title, std::max(2.0f, x0 + 3.0f), specTop + 24.0f + 12.0f * (float)labelRow[i], edgeCol);
 
                     // handle: a yellow grip on the tuning bar at the channel frequency
                     const float hw = 12.0f, hh = layout.tuneBarH - 6.0f;
@@ -2658,7 +3163,7 @@ int main() {
         }
 
         // --- RDS PANEL (top right corner of the spectrum) ---
-        if (rdsOn && mode == Mode::WFM && currentSource) {
+        if (rdsOn && mode == Mode::WFM && cur->sd.source) {
             const float pad = 10.0f;
             const float panelW = std::min(440.0f, layout.specW - 20.0f);
             const float panelX = layout.specW - panelW - 10.0f;
@@ -2766,9 +3271,9 @@ int main() {
             AprsLastPacket pkt;
             std::deque<AprsLastPacket> logs;
             {
-                std::lock_guard<std::mutex> l(sharedData.mtx);
-                pkt = sharedData.lastAprs;
-                logs = sharedData.aprsHistory;
+                std::lock_guard<std::mutex> l(cur->sd.mtx);
+                pkt = cur->sd.lastAprs;
+                logs = cur->sd.aprsHistory;
             }
 
             float compassX = 60.0f;
@@ -2814,7 +3319,7 @@ int main() {
 
             // which channel APRS decodes (same yellow line as in the other decoder panels)
             {
-                const std::string chText = inputIsAudio ? std::string("Input: audio") : aprsChannels().describe();
+                const std::string chText = cur->inputIsAudio ? std::string("Input: audio") : cur->sd.aprsCh.describe();
                 sf::Text chT(font, chText, 20);
                 chT.setScale({0.5f, 0.5f});
                 chT.setFillColor(sf::Color(255, 210, 0));
@@ -2916,7 +3421,7 @@ int main() {
         else {
             // --- STATUS BAR WITH S-METER (hidden while decoders are running) ---
             float statusH = 40.0f;
-            float statusY = layout.winH - statusH;
+            float statusY = layout.winH - statusH - timelineStripH;   // a file: above its timeline
 
             sf::RectangleShape statusBarBg({layout.specW, statusH});
             statusBarBg.setPosition({0, statusY});
@@ -2940,8 +3445,8 @@ int main() {
                 ledX += 80.0f;
             };
 
-            drawLED("PLAY", sharedData.isPlaying, Theme::Accent);
-            drawLED("REC", sharedData.isRecording, sf::Color(255, 50, 50));
+            drawLED("PLAY", cur->sd.isPlaying, Theme::Accent);
+            drawLED("REC", cur->sd.isRecording, sf::Color(255, 50, 50));
             drawLED("HW", isHw, sf::Color(50, 255, 100));
 
             // --- SIGNAL METER ---
@@ -3024,10 +3529,11 @@ int main() {
             }
         }
 
-        if (currentSourceType == 0) timeSlider.draw(window);
+        if (cur->sourceType == 0) timeSlider.draw(window);
         sidebar.draw(window);
 
         window.draw(topBar);
+        drawRxTabs();
         freqVFO.draw(window);
         btnPlay.draw(window);
         if (isHw) btnTuningMode.draw(window);
@@ -3153,7 +3659,7 @@ int main() {
         // --- Decoder tabs (above the panel) ---
         tabHits.clear();
         {
-            const unsigned long long drops = sharedData.decoderDrops.load();
+            const unsigned long long drops = cur->sd.decoderDrops.load();
             if (drops != lastDecoderDrops) { lastDecoderDrops = drops; decoderDropClock.restart(); decoderDropSeen = true; }
         }
         if (!tabs.empty()) {
@@ -3202,7 +3708,25 @@ int main() {
         window.display();
     }
 
+    // RX1 is saved with the usual keys (the widgets must show it), the others as rxN_...
+    if (!receivers.empty() && cur != receivers[0].get()) switchReceiver(receivers[0].get());
     SettingsManager saveMgr;
+    saveMgr.set("rx_count", (int)receivers.size());
+    for (size_t i = 0; i < receivers.size(); i++)
+        saveMgr.set("rx" + std::to_string(i + 1) + "_speaker", receivers[i]->sd.audioOut.load());
+    for (size_t i = 1; i < receivers.size(); i++) {
+        Receiver* r = receivers[i].get();
+        const std::string k = "rx" + std::to_string(i + 1) + "_";
+        saveMgr.set(k + "source_type", r->sourceType);
+        saveMgr.set(k + "frequency", std::to_string(r->centerFreq));
+        const bool haveDev = r->deviceSel >= 0 && r->deviceSel < (int)r->cachedDevices.size();
+        saveMgr.set(k + "device", haveDev ? "x" + toHex(r->cachedDevices[r->deviceSel].id) : std::string());
+        saveMgr.set(k + "rate", r->rateSel);
+        saveMgr.set(k + "host", r->hostText);
+        std::lock_guard<std::mutex> l(r->sd.mtx);
+        saveMgr.set(k + "mode", (int)r->sd.mode);
+        saveMgr.set(k + "bandwidth", (float)r->sd.bandwidth);
+    }
     for (auto& mod : sidebar.modules) saveMgr.set("sidebar_" + mod->title, mod->isOpen);
 
     saveMgr.set("theme", ddTheme->selectedIndex);
@@ -3211,7 +3735,7 @@ int main() {
     saveMgr.set("min_db", slMinDb->currentVal);
     saveMgr.set("max_db", slMaxDb->currentVal);
     saveMgr.set("step_index", ddSnap->selectedIndex);
-    saveMgr.set("mode_index", (int)sharedData.mode);
+    saveMgr.set("mode_index", (int)cur->sd.mode);
     saveMgr.set("bandwidth", slBW->currentVal);
     saveMgr.set("squelch", slSq->currentVal);
     saveMgr.set("scan_threshold", slScanThr->currentVal);
@@ -3221,49 +3745,40 @@ int main() {
     saveMgr.set("rds", chkRds->checked);
     saveMgr.set("picture_path", pictureDirCustom);
     saveMgr.set("volume_pos", volSlider.currentVal);
-    saveMgr.set("sstv_auto_slant", ptrSSTV->getAutoSlant());
-    saveMgr.set("sstv_slant", ptrSSTV->getSlantPpm());
-    saveMgr.set("sstv_auto_save", ptrSSTV->getAutoSave());
-    saveMgr.set("wefax_lpm", ptrWEFAX->getLpm());
-    saveMgr.set("wefax_ioc", ptrWEFAX->getIoc());
-    saveMgr.set("wefax_apt", ptrWEFAX->getAutoApt());
-    saveMgr.set("wefax_slant", ptrWEFAX->getSlantPpm());
-    saveMgr.set("wefax_auto_save", ptrWEFAX->getAutoSave());
-    saveMgr.set("rf_gain", sharedData.rfGain);
+    saveMgr.set("sstv_auto_slant", cur->sstv->getAutoSlant());
+    saveMgr.set("sstv_slant", cur->sstv->getSlantPpm());
+    saveMgr.set("sstv_auto_save", cur->sstv->getAutoSave());
+    saveMgr.set("wefax_lpm", cur->wefax->getLpm());
+    saveMgr.set("wefax_ioc", cur->wefax->getIoc());
+    saveMgr.set("wefax_apt", cur->wefax->getAutoApt());
+    saveMgr.set("wefax_slant", cur->wefax->getSlantPpm());
+    saveMgr.set("wefax_auto_save", cur->wefax->getAutoSave());
+    saveMgr.set("rf_gain", cur->sd.rfGain);
     saveMgr.set("source_type", ddSourceType->selectedIndex);
-    saveMgr.set("hw_fm_notch", hwState.fmNotch);
-    saveMgr.set("hw_mw_notch", hwState.mwNotch);
-    saveMgr.set("hw_bias_t", hwState.biasT);
-    saveMgr.set("hw_direct_samp", hwState.directSampling);
-    saveMgr.set("hw_antenna", hwState.antennaIndex);
+    saveMgr.set("hw_fm_notch", cur->sd.hw.fmNotch);
+    saveMgr.set("hw_mw_notch", cur->sd.hw.mwNotch);
+    saveMgr.set("hw_bias_t", cur->sd.hw.biasT);
+    saveMgr.set("hw_direct_samp", cur->sd.hw.directSampling);
+    saveMgr.set("hw_antenna", cur->sd.hw.antennaIndex);
     saveMgr.set("rtltcp_host", txtHost->getText());
     satTracker.saveSettings(saveMgr);
     mapWindow.saveSettings(saveMgr);
 
     {
-        std::lock_guard<std::mutex> l(sharedData.mtx);
-        saveMgr.set("rec_path", sharedData.recPath);
+        std::lock_guard<std::mutex> l(cur->sd.mtx);
+        saveMgr.set("rec_path", cur->sd.recPath);
     }
 
-    saveMgr.set("frequency", (double)currentCenterFreq);
+    saveMgr.set("frequency", (double)cur->centerFreq);
 
     saveMgr.save(settingsPath);
 
-    dspRunning = false;
-    if (dspThread.joinable()) dspThread.join();
-
-    // Release the radio while everything is still alive. Leaving it to the destructor of
-    // the global source would run after main() returns, when the driver libraries may
-    // already be shutting down; the SDRplay API service doesn't cope well with a client
+    // Stop every receiver (its DSP thread, then the radio) while everything is still alive.
+    // Leaving it to the destructors after main() returns would run when the driver libraries
+    // may already be shutting down; the SDRplay API service doesn't cope well with a client
     // that disappears in the middle of a stream.
-    {
-        std::lock_guard<std::mutex> l(sourceMtx);
-        if (currentSource) {
-            currentSource->stop();
-            currentSource->close();
-            currentSource = nullptr;
-        }
-    }
+    cur = nullptr;
+    receivers.clear();
 
     return 0;
 }

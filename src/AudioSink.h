@@ -5,7 +5,15 @@
 #include <deque>
 #include <string>
 #include <algorithm>
+#include <map>
+#include <atomic>
 #include "miniaudio.h"
+
+// =====================================================================
+//  The speaker. Every receiver (tab) pushes its audio into its own
+//  stream; the callback mixes the streams, so several tabs can be heard
+//  at once. Master volume / mute apply to the mix.
+// =====================================================================
 
 class AudioSink {
 public:
@@ -15,7 +23,8 @@ public:
     };
 
     std::mutex mutex;
-    std::deque<float> sampleQueue;
+    std::map<int, std::deque<float>> streams;   // by stream id (the receiver's id)
+    std::atomic<bool> masterMute {false};
     
     // INCREASED BUFFER: 1 second (48000 Hz * 2 channels * 1.0s)
     // Prevents playback stuttering by providing a safe buffer margin.
@@ -88,8 +97,9 @@ public:
     void start() { if (isInitialized) ma_device_start(&device); }
     void stop() { if (isInitialized) ma_device_stop(&device); }
 
-    void pushSamples(const std::vector<float>& audioData) {
+    void pushSamples(const std::vector<float>& audioData, int stream = 0) {
         std::lock_guard<std::mutex> lock(mutex);
+        std::deque<float>& sampleQueue = streams[stream];
         sampleQueue.insert(sampleQueue.end(), audioData.begin(), audioData.end());
 
         // If the buffer overflows (e.g., CPU generates data too fast), drop the OLDEST samples.
@@ -101,14 +111,24 @@ public:
         }
     }
 
-    size_t getBufferedCount() {
+    size_t getBufferedCount(int stream = 0) {
         std::lock_guard<std::mutex> lock(mutex);
-        return sampleQueue.size();
+        auto it = streams.find(stream);
+        return it == streams.end() ? 0 : it->second.size();
     }
-    
-    void clear() {
+
+    void clear(int stream) {
         std::lock_guard<std::mutex> lock(mutex);
-        sampleQueue.clear();
+        auto it = streams.find(stream);
+        if (it != streams.end()) it->second.clear();
+    }
+    void clear() {   // every stream
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto& kv : streams) kv.second.clear();
+    }
+    void removeStream(int stream) {
+        std::lock_guard<std::mutex> lock(mutex);
+        streams.erase(stream);
     }
 
 private:
@@ -116,18 +136,15 @@ private:
         AudioSink* sink = (AudioSink*)pDevice->pUserData;
         float* out = (float*)pOutput;
         std::lock_guard<std::mutex> lock(sink->mutex);
-        
-        size_t samplesNeeded = frameCount * 2;
-        size_t available = sink->sampleQueue.size();
-        size_t toRead = (available < samplesNeeded) ? available : samplesNeeded;
 
-        for (size_t i = 0; i < toRead; ++i) {
-            out[i] = sink->sampleQueue.front();
-            sink->sampleQueue.pop_front();
+        const size_t samplesNeeded = (size_t)frameCount * 2;
+        std::fill(out, out + samplesNeeded, 0.0f);   // silence where a stream has no data (underrun)
+        for (auto& kv : sink->streams) {
+            std::deque<float>& q = kv.second;
+            const size_t toRead = std::min(q.size(), samplesNeeded);
+            for (size_t i = 0; i < toRead; ++i) { out[i] += q.front(); q.pop_front(); }
         }
-        // Fill with silence if there is not enough data (underrun)
-        for (size_t i = toRead; i < samplesNeeded; ++i) {
-            out[i] = 0.0f;
-        }
+        const bool mute = sink->masterMute.load();
+        for (size_t i = 0; i < samplesNeeded; ++i) out[i] = mute ? 0.0f : std::clamp(out[i], -1.0f, 1.0f);
     }
 };

@@ -918,10 +918,16 @@ public:
             openedLocally = true;
         }
         sdrplay_api_DeviceT devs[6]; unsigned int nDevs = 0;
-        // The device list must be locked while it is read (other SDRplay programs may use it too)
-        sdrplay_api_LockDeviceApi();
-        sdrplay_api_GetDevices(devs, &nDevs, 6);
-        sdrplay_api_UnlockDeviceApi();
+        // The device list must be locked while it is read (other SDRplay programs may use it too).
+        // Right after the API was opened the service sometimes reports no device yet: ask again.
+        for (int attempt = 0; attempt < 4; attempt++) {
+            sdrplay_api_LockDeviceApi();
+            sdrplay_api_GetDevices(devs, &nDevs, 6);
+            sdrplay_api_UnlockDeviceApi();
+            if (nDevs > 0) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+        std::cerr << "[SDRplay] " << nDevs << " free device(s) found" << std::endl;
         for(unsigned int i=0; i<nDevs; i++) {
             SDRDeviceItem item;
             if (devs[i].hwVer == SDRPLAY_RSP1_ID) item.name = "RSP1";

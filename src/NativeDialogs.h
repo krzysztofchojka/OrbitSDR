@@ -22,10 +22,26 @@ inline void showPopup(std::string title, std::string message) {
     #ifdef _WIN32
         MessageBoxA(NULL, message.c_str(), title.c_str(), MB_OK | MB_ICONINFORMATION);
     #elif __APPLE__
-        std::string cmd = "osascript -e 'display dialog \"" + message + "\" with title \"" + title + "\" buttons {\"OK\"} default button \"OK\" with icon note'";
+        // AppleScript string (\ and " escaped) inside a single-quoted shell argument (' -> '\'')
+        auto as = [](const std::string& t) {
+            std::string o;
+            for (char c : t) {
+                if (c == '\\' || c == '"') o += '\\';
+                if (c == '\'') { o += "'\\''"; continue; }
+                o += c;
+            }
+            return o;
+        };
+        std::string cmd = "osascript -e 'display dialog \"" + as(message) + "\" with title \"" + as(title) + "\" buttons {\"OK\"} default button \"OK\" with icon note'";
         int ret = system(cmd.c_str()); (void)ret;
     #elif __linux__
-        std::string cmd = "zenity --info --title=\"" + title + "\" --text=\"" + message + "\"";
+        // double-quoted shell argument: \ " $ ` escaped
+        auto sh = [](const std::string& t) {
+            std::string o;
+            for (char c : t) { if (c == '\\' || c == '"' || c == '$' || c == '`') o += '\\'; o += c; }
+            return o;
+        };
+        std::string cmd = "zenity --info --title=\"" + sh(title) + "\" --text=\"" + sh(message) + "\"";
         int ret = system(cmd.c_str()); (void)ret;
     #endif
 }

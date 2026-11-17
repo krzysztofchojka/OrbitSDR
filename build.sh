@@ -8,7 +8,9 @@ APP_BUNDLE="$APP_NAME.app"
 CXX="g++"
 
 # --- ARGUMENT PARSING ---
-SDRPLAY_MODE="ask"
+# SDRplay support is built in by default: the API is loaded at run time (src/SdrplayLoader.h),
+# so the program also starts without it. --disable-sdrplay leaves it out.
+SDRPLAY_MODE="yes"
 
 for arg in "$@"; do
   case $arg in
@@ -42,10 +44,14 @@ SDR_FLAGS=""
 FINAL_INCLUDES="$BASE_INCLUDES"
 FINAL_LIBS="$BASE_LIBS"
 
+if [[ "$SDRPLAY_MODE" != "yes" ]]; then
+    echo ">> SDRPlay support left out (--disable-sdrplay)"
+fi
 if [[ "$SDRPLAY_MODE" == "yes" ]]; then
     echo ">> Enabling SDRPlay..."
     SDR_FLAGS="-DENABLE_SDRPLAY"
-    FINAL_INCLUDES="$FINAL_INCLUDES $SDRPLAY_INC"
+    # the API headers are in the repository (deps/sdrplay/include); an installed API's too
+    FINAL_INCLUDES="$FINAL_INCLUDES -I$(pwd)/deps/sdrplay/include $SDRPLAY_INC"
     FINAL_LIBS="$FINAL_LIBS $SDRPLAY_LIB"
 fi
 

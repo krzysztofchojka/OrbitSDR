@@ -139,7 +139,10 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
     WavWriter recorder;
     sf::Clock waterfallTimer;
 
-    int squelchHold = 0;
+    float squelchEnv = 1.0f;   // per receiver (several DSP threads run at once)
+    double paceSamples = -1.0; // background file playback: samples played since paceStart
+    auto paceStart = std::chrono::steady_clock::now();
+    std::vector<float> fftMags(FFT_SIZE), fftSorted(FFT_SIZE);
     DecoderRunner decoders(shared);   // the decoders' thread (stops when dspWorker returns)
     bool decodersReset = false;
 
@@ -169,8 +172,8 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
     while (running) {
         std::shared_ptr<IQSource> src = nullptr;
         {
-            std::lock_guard<std::mutex> lock(sourceMtx);
-            src = currentSource;
+            std::lock_guard<std::mutex> lock(shared.sourceMtx);
+            src = shared.source;
         }
 
         if (!src) {
@@ -233,11 +236,13 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
         if (seekReq >= 0.0 && src->isSeekable()) {
             src->seek(seekReq);
             demod.clear();
-            audio.clear();
+            audio.clear(shared.audioStream);
             justSeeked = true;
+            paceSamples = -1.0;
         }
 
         if (!play && !justSeeked) {
+            paceSamples = -1.0;
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
         }
@@ -277,9 +282,18 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
             }
         }
 
-        if (play && !src->isHardware() && !justSeeked) {
+        const bool toSpeaker = shared.audioOut;
+        if (play && !src->isHardware() && !justSeeked && !toSpeaker && !src->getFilePath().empty()) {
+            // a file in a background tab: nothing drains the speaker buffer, play it by the clock
+            const auto nowT = std::chrono::steady_clock::now();
+            if (paceSamples < 0.0) { paceSamples = 0.0; paceStart = nowT; }
+            const double ahead = paceSamples / std::max(1.0, src->getSampleRate()) -
+                                 std::chrono::duration<double>(nowT - paceStart).count();
+            if (ahead > 0.15) std::this_thread::sleep_for(std::chrono::milliseconds((int)((ahead - 0.1) * 1000)));
+        } else paceSamples = -1.0;
+        if (play && !src->isHardware() && !justSeeked && toSpeaker) {
             size_t safeLevel = 24000;
-            while (audio.getBufferedCount() > safeLevel && running && shared.isPlaying) {
+            while (audio.getBufferedCount(shared.audioStream) > safeLevel && running && shared.isPlaying) {
                 {
                     std::lock_guard<std::mutex> l(shared.mtx);
                     if (!shared.isPlaying) break;
@@ -337,7 +351,9 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                 recorder.write(rawFloat.data(), rawFloat.size());
             }
 
-            for(int i = 0; i < readCount; i++) {
+            if (paceSamples >= 0.0) paceSamples += readCount;
+            const bool shown = shared.visible;   // background tabs: no waterfall, spectrum, inspector
+            if (shown) for(int i = 0; i < readCount; i++) {
                 fftBuffer[fftBufferIdx] = iqBuffer[i];
                 fftBufferIdx = (fftBufferIdx + 1) % FFT_SIZE;
             }
@@ -345,7 +361,7 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
             double freqOffset = (targetFreqPct - 0.5) * sr;
             if (audioSource) freqOffset = 0.0;   // audio: nothing to tune, keep it unshifted
             std::vector<Complex> chunkToProcess(iqBuffer.begin(), iqBuffer.begin() + readCount);
-            inspector.process(chunkToProcess, sr, freqOffset, bw, shared);
+            if (shown) inspector.process(chunkToProcess, sr, freqOffset, bw, shared);
 
             if (play) {
                 // the decoders' block (their thread takes it after the demodulated audio is added below)
@@ -384,7 +400,7 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                     const std::vector<float>* src = &audioData;
                     std::vector<float> chAudio;
                     if (!audioSource) {
-                        const auto rc = aprsChannels().update(centerHz, sr, freqOffset);
+                        const auto rc = shared.aprsCh.update(centerHz, sr, freqOffset);
                         if (!rc.empty() && rc[0].inBand) {
                             if (!aprsDemod || aprsDemodRate != sr) {
                                 aprsDemod = std::make_unique<Demodulator>(sr, AUDIO_RATE);
@@ -406,7 +422,6 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                     decoders.push(std::move(decJob));
                 }
 
-                static float squelchEnv = 1.0f;
                 if (sqThr > -99.0f) {
                     if (smoothedRssi < sqThr) {
                         squelchEnv *= 0.9f; // Soft close (fade-out)
@@ -431,11 +446,11 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                     if (std::isnan(s) || std::isinf(s)) s = 0.0f;
                     else s = std::clamp(s * finalVol, -1.0f, 1.0f);
                 }
-                audio.pushSamples(audioData);
+                if (toSpeaker) audio.pushSamples(audioData, shared.audioStream);
                 if (recorder.active && rMode == RecMode::AUDIO) recorder.write(audioData.data(), audioData.size());
             }
 
-            if (waterfallTimer.getElapsedTime().asMilliseconds() > 33) {
+            if (shown && waterfallTimer.getElapsedTime().asMilliseconds() > 33) {
                 std::vector<Complex> fftData(FFT_SIZE);
                 for(int i=0; i<FFT_SIZE; i++) fftData[i] = fftBuffer[(fftBufferIdx + i) % FFT_SIZE] * winFunc[i];
                 fft(fftData);
@@ -481,7 +496,7 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                 // Tuner band level for the scanner (full FFT, so it works at any zoom)
                 float tunerSnr = 0.0f, tunerPeak = -150.0f;
                 {
-                    static std::vector<float> mags(FFT_SIZE);
+                    std::vector<float>& mags = fftMags;
                     for (int i = 0; i < FFT_SIZE; i++) {
                         const int sh = (i + FFT_SIZE / 2) % FFT_SIZE;   // index 0 = lowest frequency
                         mags[i] = 20.0f * std::log10(std::abs(fftData[sh]) / FFT_SIZE + 1e-12f);
@@ -494,7 +509,7 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                     const int b0 = std::clamp(c + (int)std::floor(lo / binHz), 0, FFT_SIZE - 1);
                     const int b1 = std::clamp(c + (int)std::ceil(hi / binHz), b0, FFT_SIZE - 1);
                     for (int b = b0; b <= b1; b++) tunerPeak = std::max(tunerPeak, mags[b]);
-                    static std::vector<float> sorted(FFT_SIZE);
+                    std::vector<float>& sorted = fftSorted;
                     sorted = mags;
                     std::nth_element(sorted.begin(), sorted.begin() + FFT_SIZE / 5, sorted.end());
                     tunerSnr = std::max(0.0f, tunerPeak - sorted[FFT_SIZE / 5]);

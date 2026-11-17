@@ -11,6 +11,7 @@ OrbitSDR is a C++17 / SFML receiver that stays small and responsive while decodi
 
 - **Built for Apple Silicon (M1 and newer) and SDRplay.** That is the main development and test platform. No Homebrew or drivers needed for RTL-SDR, everything is bundled in the `.app`. For SDRPlay you have to install official [SDRPlay Api](https://sdrplay.com/hardware-api/).
 - **Eleven decoders built in:** APRS, AIS, ACARS, VDL2, ADS-B, ISM sensors (rtl_433), RDS, SSTV, WEFAX, FT8 / FT4 / WSPR and CW (Morse).
+- **Several receivers at once, in tabs.** "+ Add receiver" below the top bar opens another tab with its own source (a second RTL-SDR, an SDRplay, rtl_tcp, a file ...), waterfall, settings and decoders, e.g. APRS on 2 m in one tab and ADS-B on 1090 MHz in another. The tabs not shown keep receiving and decoding (no waterfall is drawn for them). The speaker icon on each tab switches that receiver's sound on or off, so e.g. FM broadcast from one radio can play in the background while you watch another; the sounds of several tabs are mixed. The tabs and their sources are restored at the next start.
 - **Several decoders at once, each on its own channel.** Decode AIS and APRS, watch the 433 MHz sensors and listen to FM radio at the same time, all within one bandwidth. Every running decoder has a tab above the decoder panel; the decoders run in their own thread, so the audio never waits for them.
 - **Tested on real signals:** ships in harbours, weather stations and car tyre sensors in the city, APRS, SSTV, HF radiofax and RDS.
 
@@ -134,7 +135,7 @@ The key `ORBITSDR_APP` is public on purpose (OrbitSDR is open source). It only m
 ```sh
 brew install sfml librtlsdr
 chmod +x build.sh
-./build.sh            # asks whether to enable SDRplay support
+./build.sh            # SDRplay support included (add --disable-sdrplay to leave it out)
 ```
 
 ### Linux (Ubuntu / Debian)

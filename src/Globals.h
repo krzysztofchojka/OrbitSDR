@@ -16,7 +16,9 @@ inline const int FFT_SIZE = 8192;
 inline const int INTERNAL_WATERFALL_WIDTH = 2048;
 inline const int WATERFALL_HEIGHT_PX = 1024;
 inline const double AUDIO_RATE = 48000.0;
-inline const int TOP_BAR_H = 60;
+inline const int TOPBAR_DRAW_H = 60;                  // the dark bar with the frequency, play, MAP ...
+inline const int RX_TAB_H = 24;                       // the receiver tabs below it
+inline const int TOP_BAR_H = TOPBAR_DRAW_H + RX_TAB_H; // where the spectrum and the sidebar start
 inline const int SIDEBAR_W = 320;
 inline const int TUNING_LATENCY_MS = 50;
 inline const int GAIN_LATENCY_MS = 50;
@@ -28,9 +30,6 @@ inline const std::vector<long long> STEP_VALUES = {0, 1000, 5000, 6250, 10000, 1
 inline const std::vector<std::string> THEME_NAMES = {"Orbit Original", "Neon (Pink/Blue)", "Matrix (Green)", "Grayscale", "Orbit Plus (Aurora)"};
 
 // --- GLOBALS ---
-inline std::mutex sourceMtx; 
-inline std::shared_ptr<IQSource> currentSource;
-
 struct GlobalHwState {
     bool fmNotch = false;
     bool mwNotch = false;
@@ -38,23 +37,15 @@ struct GlobalHwState {
     int directSampling = 0;
     int antennaIndex = 0;
 };
-inline GlobalHwState hwState;
-
 // APRS channel (APRS is built into the DSP worker, not a module): 144.800 (EU),
 // 144.390 (US), 145.825 (ISS) ... or the tuner. See modules/Core/DecoderChannels.h
-inline ChannelSet& aprsChannels() {
-    static ChannelSet c;   // (holds a mutex: configured in place, not copied)
-    static const bool configured = [] {
-        c.name = "APRS";
-        c.presets = { 144800000, 144390000, 144640000, 144575000, 145175000, 145825000, 144930000 };
-        c.maxChannels = 1;
-        c.defaultWidth = 12500.0;
-        c.resizable = true;   // the APRS demodulator uses the channel width
-        c.listenMode = Mode::NFM;
-        return true;
-    }();
-    (void)configured;
-    return c;
+inline void configureAprsChannels(ChannelSet& c) {
+    c.name = "APRS";
+    c.presets = { 144800000, 144390000, 144640000, 144575000, 145175000, 145825000, 144930000 };
+    c.maxChannels = 1;
+    c.defaultWidth = 12500.0;
+    c.resizable = true;   // the APRS demodulator uses the channel width
+    c.listenMode = Mode::NFM;
 }
 
 enum class RecMode { AUDIO, BASEBAND };
@@ -65,8 +56,23 @@ struct AprsLastPacket {
     float course = -1.0f, speed = -1.0f;
 };
 
+// Everything one receiver (one tab: a source, its DSP thread, its decoders) shares between
+// its DSP thread and the UI. OrbitSDR can run several receivers at once.
 struct SharedData {
     std::mutex mtx;
+
+    // --- the source (radio, file, sound card) of this receiver ---
+    std::mutex sourceMtx;                   // guards `source`
+    std::shared_ptr<IQSource> source;
+    GlobalHwState hw;                       // antenna, notches, bias-T, direct sampling
+    ChannelSet aprsCh;                      // the APRS decoder's channel
+    // shown receiver: the DSP thread computes the waterfall / spectrum only for it
+    std::atomic<bool> visible {true};
+    // this receiver plays to the speaker (its speaker button on the tab); several can play at
+    // once, the speaker mixes their streams (stream id = audioStream)
+    std::atomic<bool> audioOut {true};
+    int audioStream = 0;
+
     double tunedFreqPercent = 0.5; double pendingSeekRequest = -1.0; double bandwidth = 12500.0; long long centerFreq = 0;
     double viewCenterPct = 0.5; 
     float volume = 0.5f; bool isMuted = false;
@@ -106,7 +112,7 @@ struct SharedData {
     SharedData() : fftSpectrum(INTERNAL_WATERFALL_WIDTH, -100.0), 
                    waterfallRow(INTERNAL_WATERFALL_WIDTH * 4, 0),
                    inspectorSpectrum(FFT_SIZE/2, -100.0),
-                   inspectorWaterfallRow(280 * 4, 0) {} 
+                   inspectorWaterfallRow(280 * 4, 0) { configureAprsChannels(aprsCh); }
 };
 
 struct LayoutState {
