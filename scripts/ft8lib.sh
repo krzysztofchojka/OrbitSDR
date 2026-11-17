@@ -45,11 +45,11 @@ _ft8lib_main() {
                  "$src/ft8/message.c" "$src/ft8/text.c" "$src/common/monitor.c" "$src/fft/kiss_fft.c" "$src/fft/kiss_fftr.c"
                  "$src/compat.c")
     # quiet: the library prints its settings to stderr otherwise
-    local cflags=(-O2 -pipe -std=gnu11 -w "-I$src" -Dstpcpy=ftx_stpcpy "-DLOG_PRINTF(...)=((void)0)" -D_USE_MATH_DEFINES)
+    local cflags=(-O2 -pipe -std=gnu11 -w "-I$src" -include "$src/compat.h" -Dstpcpy=ftx_stpcpy "-DLOG_PRINTF(...)=((void)0)" -D_USE_MATH_DEFINES)
 
     # rebuild when a source file or the compiler / flags change
     local stamp
-    stamp="$cc|${cflags[*]}|$(cat "${files[@]}" "$src"/ft8/*.h "$src"/common/*.h "$src"/fft/*.h | cksum)"
+    stamp="$cc|${cflags[*]}|$(cat "${files[@]}" "$src/compat.h" "$src"/ft8/*.h "$src"/common/*.h "$src"/fft/*.h | cksum)"
     if [ -f "$bdir/libft8.a" ] && [ "$(cat "$bdir/stamp" 2>/dev/null)" = "$stamp" ]; then
         FT8LIB_LIB="$bdir/libft8.a"
         return 0
