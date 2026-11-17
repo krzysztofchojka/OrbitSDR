@@ -638,6 +638,8 @@ public:
         if (!dev) return;
         if (name == "direct_sampling") { rtlsdr_set_direct_sampling(dev, value); }
         else if (name == "bias_t") { rtlsdr_set_bias_tee(dev, value); }
+        else if (name == "ppm" && value != 0) { rtlsdr_set_freq_correction(dev, value); }
+        else if (name == "ppm") { rtlsdr_set_freq_correction(dev, 0); }
     }
     
     std::vector<std::string> getAvailableSampleRatesText() override { return RTL_SAMPLE_RATES_TXT; }
@@ -1011,6 +1013,11 @@ private:
     // Guard against editing an uninitialised structure
     if (!deviceParams) return;
 
+    if (name == "ppm") {   // frequency correction of the reference oscillator
+        deviceParams->devParams->ppm = (double)value;
+        if (running) sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Dev_Ppm, sdrplay_api_Update_Ext1_None);
+        return;
+    }
     if (name == "antenna") {
         if (currentDevice.hwVer == SDRPLAY_RSPdx_ID || currentDevice.hwVer == SDRPLAY_RSPdxR2_ID) {
             if (value == 0) deviceParams->devParams->rspDxParams.antennaSel = sdrplay_api_RspDx_ANTENNA_A;

@@ -4,6 +4,7 @@
 #include "../Core/DetailsPopup.h"
 #include "../Core/ModuleLog.h"
 #include "../Core/PositionBus.h"
+#include "../Core/NarrowChannel.h"
 #include <regex>
 #include <cmath>
 #include "../../Decimator.h"
@@ -133,6 +134,7 @@ class ACARSDecoder : public SDRModule {
     std::mutex mtx;
     std::map<int, std::unique_ptr<Rx>> rxs;         // by channel id
     ChannelSet channels;                            // see DecoderChannels.h
+    GroupDecimator group;                           // shared first stage of the channels
     std::deque<Entry> entries;                      // newest first
     long long centerHz = 0;
     double lastRate = 0.0;
@@ -343,6 +345,18 @@ public:
             for (const auto& c : rc) if (c.id == it->first) keep = true;
             if (!keep) it = rxs.erase(it); else ++it;
         }
+        // one shared first stage for all channels in band
+        double lo = 1e18, hi = -1e18;
+        for (const auto& c : rc) if (c.inBand) { lo = std::min(lo, c.offsetHz - 10000.0); hi = std::max(hi, c.offsetHz + 10000.0); }
+        const std::complex<double>* gin = iq.data();
+        size_t gn = iq.size();
+        double grate = sampleRate, gcentre = 0.0;
+        if (hi > lo) {
+            group.configure(sampleRate, (lo + hi) / 2.0, hi - lo);
+            gin = group.process(iq.data(), iq.size(), gn);
+            grate = group.outputRate();
+            gcentre = group.centreHz();
+        }
         for (const auto& c : rc) {
             auto& slot = rxs[c.id];
             if (!slot) {
@@ -356,8 +370,8 @@ public:
             Rx& r = *slot;
             r.freqHz = c.freqHz;
             if (!c.inBand) continue;
-            r.rx.configure(sampleRate, c.offsetHz);
-            r.rx.process(iq.data(), iq.size());
+            r.rx.configure(grate, c.offsetHz - gcentre);
+            r.rx.process(gin, gn);
         }
         channelInfo = tunedOnly ? "No ACARS channel in band: decoding at the tuner"
                                 : std::to_string(rxs.size()) + " channel(s)";

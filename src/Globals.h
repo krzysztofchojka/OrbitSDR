@@ -36,6 +36,7 @@ struct GlobalHwState {
     bool biasT = false;
     int directSampling = 0;
     int antennaIndex = 0;
+    int ppm = 0;   // frequency correction of the radio's oscillator (RTL-SDR, rtl_tcp, SDRplay)
 };
 // APRS channel (APRS is built into the DSP worker, not a module): 144.800 (EU),
 // 144.390 (US), 145.825 (ISS) ... or the tuner. See modules/Core/DecoderChannels.h
@@ -43,7 +44,9 @@ inline void configureAprsChannels(ChannelSet& c) {
     c.name = "APRS";
     c.presets = { 144800000, 144390000, 144640000, 144575000, 145175000, 145825000, 144930000 };
     c.maxChannels = 1;
-    c.defaultWidth = 12500.0;
+    // 20 kHz: still decodes when the radio is a few kHz off (an RTL-SDR without TCXO is often
+    // 3-8 kHz off on 2 m); the 12.5 kHz channel lost packets from 2.5 kHz offset, same sensitivity
+    c.defaultWidth = 20000.0;
     c.resizable = true;   // the APRS demodulator uses the channel width
     c.listenMode = Mode::NFM;
 }

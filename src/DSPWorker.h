@@ -3,6 +3,8 @@
 #include <thread>
 #include <condition_variable>
 #include <deque>
+#include <map>
+#include <memory>
 #include <mutex>
 #include "Globals.h"
 #include "AudioSink.h"
@@ -20,10 +22,11 @@
 #include "orbit/RecordingTime.h"
 
 // =====================================================================
-//  The decoders run in their own thread: the DSP thread hands every
-//  block of I/Q (and the demodulated audio) over and goes on with the
-//  waterfall and the speaker. On a slow computer the decoders then skip
-//  blocks instead of making the audio stutter (counted in decoderDrops).
+//  The decoders run in their own threads, one per decoder: the DSP thread
+//  hands every block of I/Q (and the demodulated audio) over and goes on
+//  with the waterfall and the speaker; the decoders work in parallel on
+//  the other CPU cores. A decoder that can't keep up skips blocks
+//  (counted in decoderDrops) instead of making the audio stutter.
 // =====================================================================
 class DecoderRunner {
 public:
@@ -35,60 +38,91 @@ public:
         bool reliable = true, audioIn = false, reset = false;
     };
 
-    explicit DecoderRunner(SharedData& s) : shared(s), th([this] { run(); }) {}
+    explicit DecoderRunner(SharedData& s) : shared(s) {}
     ~DecoderRunner() {
-        { std::lock_guard<std::mutex> l(m); stop = true; }
-        cv.notify_all();
-        if (th.joinable()) th.join();
+        for (auto& kv : workers) kv.second->shutdown();
     }
 
+    // DSP thread: every running decoder gets the block (shared, not copied)
     void push(Job&& j) {
-        {
-            std::lock_guard<std::mutex> l(m);
-            if (q.size() >= MAX_QUEUE) {   // the decoders are behind: drop the oldest block
-                const bool reset = q.front().reset;
-                q.pop_front();
-                if (reset && !q.empty()) q.front().reset = true;
-                shared.decoderDrops++;
-            }
-            q.push_back(std::move(j));
+        std::vector<SDRModule*> mods;
+        { std::lock_guard<std::mutex> l(shared.mtx); mods = shared.activeDecoders; }
+        auto job = std::make_shared<const Job>(std::move(j));
+        for (SDRModule* m : mods) {
+            if (!m || !m->enabled) continue;
+            auto& w = workers[m];
+            if (!w) w = std::make_unique<Worker>(m, shared);
+            w->push(job);
         }
-        cv.notify_one();
     }
 
 private:
-    static constexpr size_t MAX_QUEUE = 10;   // ~0.5 s of blocks
-    SharedData& shared;
-    std::mutex m;
-    std::condition_variable cv;
-    std::deque<Job> q;
-    bool stop = false;
-    std::thread th;   // last: starts after the members above exist
+    class Worker {
+        SDRModule* mod;
+        SharedData& shared;
+        std::mutex m;
+        std::condition_variable cv;
+        std::deque<std::shared_ptr<const Job>> q;
+        size_t queued = 0;            // samples waiting
+        bool stop = false;
+        bool pendingReset = false;    // a dropped block asked for a reset
+        std::thread th;               // last: starts after the members above exist
 
-    void run() {
-        for (;;) {
-            Job j;
-            {
-                std::unique_lock<std::mutex> l(m);
-                cv.wait(l, [this] { return stop || !q.empty(); });
-                if (stop) return;
-                j = std::move(q.front());
-                q.pop_front();
-            }
-            std::vector<SDRModule*> mods;
-            { std::lock_guard<std::mutex> l(shared.mtx); mods = shared.activeDecoders; }
-            for (SDRModule* mod : mods) {
-                if (!mod || !mod->enabled) continue;
-                if (j.reset) mod->reset();
-                mod->setAudioInput(j.audioIn);
-                mod->setStreamTime(j.t, j.reliable);
-                mod->setRadioFrequency(j.centerHz);
-                mod->setTunerBandwidth(j.bw);
-                mod->processIQ(j.iq, j.sr, j.offset);
-                if (!j.mono.empty()) mod->processAudio(j.mono);
+        // The queue may hold this much I/Q. (A limit in blocks was wrong: radios often deliver
+        // small blocks, and a short stall then "overflowed" with the CPU almost idle.)
+        static constexpr double MAX_QUEUE_SEC = 1.5;
+
+        void run() {
+            for (;;) {
+                std::shared_ptr<const Job> j;
+                bool reset;
+                {
+                    std::unique_lock<std::mutex> l(m);
+                    cv.wait(l, [this] { return stop || !q.empty(); });
+                    if (stop) return;
+                    j = std::move(q.front());
+                    q.pop_front();
+                    queued -= j->iq.size();
+                    reset = j->reset || pendingReset;
+                    pendingReset = false;
+                }
+                if (!mod->enabled) continue;
+                if (reset) mod->reset();
+                mod->setAudioInput(j->audioIn);
+                mod->setStreamTime(j->t, j->reliable);
+                mod->setRadioFrequency(j->centerHz);
+                mod->setTunerBandwidth(j->bw);
+                mod->processIQ(j->iq, j->sr, j->offset);
+                if (!j->mono.empty()) mod->processAudio(j->mono);
             }
         }
-    }
+
+    public:
+        Worker(SDRModule* md, SharedData& s) : mod(md), shared(s), th([this] { run(); }) {}
+        void push(const std::shared_ptr<const Job>& j) {
+            {
+                std::lock_guard<std::mutex> l(m);
+                queued += j->iq.size();
+                q.push_back(j);
+                const double limit = std::max(j->sr, 1.0) * MAX_QUEUE_SEC;
+                while (q.size() > 1 && (double)queued > limit) {   // really behind: drop the oldest
+                    if (q.front()->reset) pendingReset = true;
+                    queued -= q.front()->iq.size();
+                    q.pop_front();
+                    shared.decoderDrops++;
+                }
+            }
+            cv.notify_one();
+        }
+        void shutdown() {
+            { std::lock_guard<std::mutex> l(m); stop = true; }
+            cv.notify_all();
+            if (th.joinable()) th.join();
+        }
+    };
+
+    SharedData& shared;
+    std::map<SDRModule*, std::unique_ptr<Worker>> workers;   // DSP thread only
 };
 
 inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink& audio) {

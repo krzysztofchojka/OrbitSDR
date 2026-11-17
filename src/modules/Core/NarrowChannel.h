@@ -178,3 +178,45 @@ public:
         }
     }
 };
+
+// =====================================================================
+//  Shared first stage for a group of channels close together (VDL2,
+//  ACARS): moves the group's centre to 0 Hz and decimates by a power of
+//  two once, so the channels don't each have to mix and filter the full
+//  sample rate (10 VDL2 channels at 2.4 MS/s: ~3x less work).
+// =====================================================================
+class GroupDecimator {
+    using C = std::complex<double>;
+    static constexpr double PI_D = 3.14159265358979323846;
+    double fs = 0.0, centre = 1e18;
+    int factor = 1;
+    IQDecimator decim;
+    C nco = C(1.0, 0.0), step = C(1.0, 0.0);
+    std::vector<C> mixed;
+
+public:
+    // centreHz: offset of the group's centre from the radio's centre; spanHz: from the lowest
+    // channel edge to the highest. Returns true when the output changed (channels must restart).
+    bool configure(double sampleRate, double centreHz, double spanHz) {
+        int f = 1;
+        // keep ~25 % margin around the group (the halfband filters' slopes)
+        while (sampleRate / (f * 2) >= spanHz * 1.25) f *= 2;
+        if (sampleRate == fs && f == factor && std::fabs(centreHz - centre) < 1.0) return false;
+        fs = sampleRate;
+        factor = f;
+        centre = centreHz;
+        decim.setFactor(f);
+        factor = decim.getFactor();
+        step = std::polar(1.0, -2.0 * PI_D * centre / fs);
+        return true;
+    }
+    double outputRate() const { return fs / factor; }
+    double centreHz() const { return centre; }
+
+    const C* process(const C* in, size_t n, size_t& outN) {
+        mixed.resize(n);
+        for (size_t i = 0; i < n; i++) { mixed[i] = in[i] * nco; nco *= step; }
+        nco /= std::abs(nco);
+        return decim.process(mixed.data(), n, outN);
+    }
+};

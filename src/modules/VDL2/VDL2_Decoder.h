@@ -59,6 +59,7 @@ class VDL2Decoder : public SDRModule {
     std::mutex mtx;
     std::map<int, std::unique_ptr<Rx>> rxs;
     ChannelSet channels;
+    GroupDecimator group;        // shared first stage of the channels
     std::deque<Entry> entries;   // newest first
     std::map<uint32_t, std::string> regOf;   // ICAO address -> registration (learned from ACARS)
     long long centerHz = 0;
@@ -278,6 +279,18 @@ public:
             for (const auto& c : rc) if (c.id == it->first) keep = true;
             if (!keep) it = rxs.erase(it); else ++it;
         }
+        // one shared first stage for all channels (they lie within a few hundred kHz)
+        double lo = 1e18, hi = -1e18;
+        for (const auto& c : rc) if (c.inBand) { lo = std::min(lo, c.offsetHz - 12500.0); hi = std::max(hi, c.offsetHz + 12500.0); }
+        const std::complex<double>* gin = iq.data();
+        size_t gn = iq.size();
+        double grate = sampleRate, gcentre = 0.0;
+        if (hi > lo) {
+            group.configure(sampleRate, (lo + hi) / 2.0, hi - lo);
+            gin = group.process(iq.data(), iq.size(), gn);
+            grate = group.outputRate();
+            gcentre = group.centreHz();
+        }
         for (const auto& c : rc) {
             auto& slot = rxs[c.id];
             if (!slot) {
@@ -291,9 +304,9 @@ public:
             Rx& r = *slot;
             r.freqHz = c.freqHz;
             if (!c.inBand) continue;
-            r.ch.configure(sampleRate, c.offsetHz, vdl2::SAMPLE_RATE, 9000.0, 6000.0, 1.0);
+            r.ch.configure(grate, c.offsetHz - gcentre, vdl2::SAMPLE_RATE, 9000.0, 6000.0, 1.0);
             r.tmp.clear();
-            r.ch.process(iq.data(), iq.size(), r.tmp);
+            r.ch.process(gin, gn, r.tmp);
             if (r.tmp.empty()) continue;
             double lv = 0.0;
             for (const auto& v : r.tmp) lv += std::norm(v);

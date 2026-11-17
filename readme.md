@@ -49,7 +49,7 @@ xattr -dr com.apple.quarantine /Applications/OrbitSDR.app
 | Source | Details |
 |---|---|
 | **SDRplay** (RSP1A, RSP2, RSPdx, RSPduo...) | Antenna port selection, notch filters, Bias-T. Requires the [SDRplay API service](https://www.sdrplay.com/downloads/). |
-| **RTL-SDR** | Standard and Direct Sampling (HF) modes, Bias-T. |
+| **RTL-SDR** | Standard and Direct Sampling (HF) modes, Bias-T, frequency correction (ppm). |
 | **rtl_tcp** | Network RTL-SDR, e.g. a Raspberry Pi next to the antenna. |
 | **Sound card** | Line-in / microphone as a baseband (I/Q) or audio source, e.g. the audio output of a scanner or transceiver. |
 | **WAV files** | I/Q recordings (stereo) or demodulated audio (mono), 8/16/24-bit integer or 32-bit float, with a seekable timeline. |
@@ -62,7 +62,7 @@ xattr -dr com.apple.quarantine /Applications/OrbitSDR.app
 | **ISM** (rtl_433) | 433.92 / 868 / 315 / 915 MHz | About 300 device types: weather stations, thermometers, tyre pressure sensors (TPMS), door sensors, remotes, utility meters. |
 | **ACARS** | 129–137 MHz | Aircraft datalink: registration, flight, label, message text. All ACARS channels in the bandwidth are decoded at once. |
 | **ADS-B** | 1090 MHz | Aircraft: callsign, altitude, speed, track, vertical rate, squawk and position (Mode S / extended squitter, like dump1090). Needs 2.4 or 2.0 MS/s; **Tune to 1090 MHz** in the panel sets the radio. Aircraft appear on the satellite map. |
-| **APRS** | 144.800 MHz (EU) / 144.390 MHz (US) | AX.25 packets, messages and GPS positions. |
+| **APRS** | 144.800 MHz (EU) / 144.390 MHz (US) | AX.25 packets, messages and GPS positions. The 20 kHz channel still decodes when the radio is a few kHz off; for a bigger error set the frequency correction (ppm) in Radio Control. |
 | **RDS** | FM broadcast | Station name, RadioText, PI, programme type, TP/TA, clock time. Also used to tune the WFM gain automatically. |
 | **SSTV** | 145.800 MHz (ISS), HF | Robot 36/72, Martin M1/M2, Scottie S1/S2/DX, PD50–PD290. VIS auto-detection, slant correction, PNG export. |
 | **WEFAX** | HF radiofax stations | Automatic start/stop, phasing, LPM/IOC selection, slant correction, PNG export. |

@@ -89,6 +89,7 @@ struct Receiver {
     bool stickyCenter = false;
     Mode modeBeforeAudio = Mode::NFM;
     std::string selectedTab;              // decoder tab shown in the decoder panel
+    unsigned long long seenDrops = 0;     // decoder blocks skipped that the UI already warned about
     int openType = -1;                    // the device this receiver has open (type + id), so
     std::string openDevice;               // another receiver doesn't try to open it too
     float pendingRfGain = -999.0f;
@@ -451,6 +452,19 @@ int main() {
     rowFilters->add(chkFmNotch);
     rowFilters->add(chkMwNotch);
 
+    // Frequency correction (ppm): an RTL-SDR without TCXO is often 20-60 ppm off, a few kHz
+    // on 2 m - enough to lose APRS / narrow FM and to misplace FT8 / CW
+    auto slPpm = std::make_shared<Slider>(SIDEBAR_W - 40, -100.0f, 100.0f, 0.0f, "Frequency correction: 0 ppm", font);
+    auto ppmText = [](int v) { return "Frequency correction: " + std::string(v > 0 ? "+" : "") + std::to_string(v) + " ppm"; };
+    slPpm->onChange = [&, ppmText](float v) {
+        const int ppm = (int)std::lround(v);
+        slPpm->setText(ppmText(ppm));
+        if (ppm == cur->sd.hw.ppm) return;
+        cur->sd.hw.ppm = ppm;
+        std::lock_guard<std::mutex> l(cur->sd.sourceMtx);
+        if (cur->sd.source) cur->sd.source->setHardwareOption("ppm", ppm);
+    };
+
     auto chkBiasT = std::make_shared<Checkbox>("Bias-T Power", font);
     chkBiasT->onToggle = [&](bool b) {
         cur->sd.hw.biasT = b;
@@ -463,6 +477,11 @@ int main() {
         if (sourceIdx != 0) {
             modRadio->addWidget(slGain);
             modRadio->addWidget(chkAgc);
+        }
+        if (sourceIdx == 1 || sourceIdx == 2 || sourceIdx == 4) {
+            modRadio->addWidget(slPpm);
+            slPpm->setValueSilent((float)cur->sd.hw.ppm);
+            slPpm->setText(ppmText(cur->sd.hw.ppm));
         }
         if (sourceIdx == 1 || sourceIdx == 4) {
             modRadio->addWidget(lblDirectSamp);
@@ -553,6 +572,7 @@ int main() {
             slGain->setText("RF Gain: AGC");
             newSource->setHardwareOption("direct_sampling", cur->sd.hw.directSampling);
             newSource->setHardwareOption("bias_t", cur->sd.hw.biasT ? 1 : 0);
+            newSource->setHardwareOption("ppm", cur->sd.hw.ppm);
         }
         else if (sourceIdx == 2) {
             targetRate = (rateIdx < SDRPLAY_RATES_VAL.size()) ? SDRPLAY_RATES_VAL[rateIdx] : 2000000;
@@ -580,6 +600,7 @@ int main() {
             newSource->setHardwareOption("fm_notch", cur->sd.hw.fmNotch ? 1 : 0);
             newSource->setHardwareOption("mw_notch", cur->sd.hw.mwNotch ? 1 : 0);
             newSource->setHardwareOption("bias_t", cur->sd.hw.biasT ? 1 : 0);
+            newSource->setHardwareOption("ppm", cur->sd.hw.ppm);
         }
         else if (sourceIdx == 3) {
             // Sound card / line-in used as a baseband source
@@ -623,6 +644,7 @@ int main() {
             slGain->setText("RF Gain: AGC");
             newSource->setHardwareOption("direct_sampling", cur->sd.hw.directSampling);
             newSource->setHardwareOption("bias_t", cur->sd.hw.biasT ? 1 : 0);
+            newSource->setHardwareOption("ppm", cur->sd.hw.ppm);
         }
 
         if (!success && sourceIdx != 0) {
@@ -1442,6 +1464,7 @@ int main() {
     cur->sd.hw.biasT = settingsMgr.getBool("hw_bias_t", false);
     cur->sd.hw.directSampling = settingsMgr.getInt("hw_direct_samp", 0);
     cur->sd.hw.antennaIndex = settingsMgr.getInt("hw_antenna", 0);
+    cur->sd.hw.ppm = std::clamp(settingsMgr.getInt("hw_ppm", 0), -200, 200);
 
     int savedSourceIdx = settingsMgr.getInt("source_type", 0);
     if (savedSourceIdx != 0) {
@@ -1539,7 +1562,6 @@ int main() {
     const float TAB_H = 22.0f;
     struct TabHit { sf::FloatRect tab, close; size_t entry; std::string name; };
     std::vector<TabHit> tabHits;              // where the tabs were drawn (for the clicks)
-    unsigned long long lastDecoderDrops = 0;
     sf::Clock decoderDropClock;               // time since the decoders last skipped a block
     bool decoderDropSeen = false;
 
@@ -1836,6 +1858,7 @@ int main() {
             if (!devHex.empty() && devHex[0] == 'x') devHex.erase(0, 1);   // "x": keeps it a string in the file
             const std::string devId = fromHex(devHex);
             const int rateIdx = std::max(0, settingsMgr.getInt(k + "rate", 0));
+            r->sd.hw.ppm = std::clamp(settingsMgr.getInt(k + "ppm", 0), -200, 200);
             if (type == 4) {
                 r->sourceType = 4;
                 ddSourceType->setSelection(4);
@@ -3659,8 +3682,10 @@ int main() {
         // --- Decoder tabs (above the panel) ---
         tabHits.clear();
         {
+            // per receiver: switching to a tab that skipped blocks long ago is no new warning
             const unsigned long long drops = cur->sd.decoderDrops.load();
-            if (drops != lastDecoderDrops) { lastDecoderDrops = drops; decoderDropClock.restart(); decoderDropSeen = true; }
+            if (drops > cur->seenDrops) { decoderDropClock.restart(); decoderDropSeen = true; }
+            cur->seenDrops = drops;
         }
         if (!tabs.empty()) {
             sf::RectangleShape strip({layout.specW, TAB_H});
@@ -3723,6 +3748,7 @@ int main() {
         saveMgr.set(k + "device", haveDev ? "x" + toHex(r->cachedDevices[r->deviceSel].id) : std::string());
         saveMgr.set(k + "rate", r->rateSel);
         saveMgr.set(k + "host", r->hostText);
+        saveMgr.set(k + "ppm", r->sd.hw.ppm);
         std::lock_guard<std::mutex> l(r->sd.mtx);
         saveMgr.set(k + "mode", (int)r->sd.mode);
         saveMgr.set(k + "bandwidth", (float)r->sd.bandwidth);
@@ -3760,6 +3786,7 @@ int main() {
     saveMgr.set("hw_bias_t", cur->sd.hw.biasT);
     saveMgr.set("hw_direct_samp", cur->sd.hw.directSampling);
     saveMgr.set("hw_antenna", cur->sd.hw.antennaIndex);
+    saveMgr.set("hw_ppm", cur->sd.hw.ppm);
     saveMgr.set("rtltcp_host", txtHost->getText());
     satTracker.saveSettings(saveMgr);
     mapWindow.saveSettings(saveMgr);

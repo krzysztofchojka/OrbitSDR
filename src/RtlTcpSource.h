@@ -46,7 +46,7 @@
 //  - server->client data: 8-bit unsigned IQ, interleaved I,Q,I,Q...
 class RtlTcpSource : public IQSource {
     enum Cmd : uint8_t {
-        CMD_FREQ = 0x01, CMD_SAMPLERATE = 0x02, CMD_GAIN_MODE = 0x03,
+        CMD_FREQ = 0x01, CMD_SAMPLERATE = 0x02, CMD_GAIN_MODE = 0x03, CMD_FREQ_CORRECTION = 0x05,
         CMD_GAIN = 0x04, CMD_AGC_MODE = 0x08, CMD_DIRECT_SAMPLING = 0x09,
         CMD_BIAS_TEE = 0x0E   // only newer rtl_tcp versions, older ones ignore it
     };
@@ -310,6 +310,7 @@ public:
     void setHardwareOption(std::string name, int value) override {
         if (name == "direct_sampling") sendCmd(CMD_DIRECT_SAMPLING, (uint32_t)value);
         else if (name == "bias_t")     sendCmd(CMD_BIAS_TEE, value ? 1 : 0);
+        else if (name == "ppm")        sendCmd(CMD_FREQ_CORRECTION, (uint32_t)value);   // signed ppm, sent as two's complement
     }
 
     std::vector<std::string> getAvailableSampleRatesText() override {
