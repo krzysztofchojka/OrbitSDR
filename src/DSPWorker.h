@@ -324,17 +324,22 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
         }
 
         const bool toSpeaker = shared.audioOut;
-        if (play && !src->isHardware() && !justSeeked && !toSpeaker && !src->getFilePath().empty()) {
-            // a file in a background tab: nothing drains the speaker buffer, play it by the clock
+        // The speaker paces a file only while its device really takes samples. Without a
+        // working output (no sound system, device failed to open or stalled) nothing drains
+        // the buffer: waiting for it would hang, ignoring it would race through the file.
+        const bool speakerPaces = toSpeaker && audio.isLive(shared.audioStream);
+        if (play && !src->isHardware() && !justSeeked && !speakerPaces && !src->getFilePath().empty()) {
+            // a file in a background tab, or no working speaker: play it by the clock
             const auto nowT = std::chrono::steady_clock::now();
             if (paceSamples < 0.0) { paceSamples = 0.0; paceStart = nowT; }
             const double ahead = paceSamples / std::max(1.0, src->getSampleRate()) -
                                  std::chrono::duration<double>(nowT - paceStart).count();
             if (ahead > 0.15) std::this_thread::sleep_for(std::chrono::milliseconds((int)((ahead - 0.1) * 1000)));
         } else paceSamples = -1.0;
-        if (play && !src->isHardware() && !justSeeked && toSpeaker) {
+        if (play && !src->isHardware() && !justSeeked && speakerPaces) {
             size_t safeLevel = 24000;
-            while (audio.getBufferedCount(shared.audioStream) > safeLevel && running && shared.isPlaying) {
+            while (audio.getBufferedCount(shared.audioStream) > safeLevel && running && shared.isPlaying &&
+                   audio.isLive(shared.audioStream)) {   // a device that stops taking samples must not block us
                 {
                     std::lock_guard<std::mutex> l(shared.mtx);
                     if (!shared.isPlaying) break;

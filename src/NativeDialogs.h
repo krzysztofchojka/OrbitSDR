@@ -6,6 +6,8 @@
 #include <iostream>
 #include <cstdio>
 #include <cctype>
+#include <functional>
+#include <thread>
 
 #ifdef _WIN32
     // --- FIX: check whether NOMINMAX is already defined ---
@@ -15,6 +17,49 @@
     #include <windows.h>
     #include <commdlg.h>
     #include <shlobj.h> // Required for directory browsing
+#else
+    #include <future>
+    #include <chrono>
+    #include <sys/wait.h>
+#endif
+
+// Called repeatedly while an external dialog program (zenity, osascript) is open. main.cpp
+// sets it to drain the window's events: a window that stops answering the window manager
+// gets GNOME's "OrbitSDR is not responding - Force quit / Wait" after ~5 s, which looks
+// like a crash. (On Windows the dialogs run in-process and keep the window answering.)
+inline std::function<void()>& dialogPump() {
+    static std::function<void()> pump;
+    return pump;
+}
+// The thread that owns the window (set with the pump): only it may drain the window's events.
+inline std::thread::id& dialogPumpThread() {
+    static std::thread::id id;
+    return id;
+}
+
+#ifndef _WIN32
+// Runs a dialog command and returns what it printed. The command runs on its own thread;
+// meanwhile this (UI) thread keeps the window responsive through dialogPump().
+inline std::string runDialog(const std::string& cmd) {
+    auto task = std::async(std::launch::async, [cmd]() {
+        std::string out;
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) return out;
+        std::array<char, 256> buffer;
+        while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) out += buffer.data();
+        const int status = pclose(pipe);
+        if (status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 127) {
+            const std::string prog = cmd.substr(0, cmd.find(' '));
+            std::fprintf(stderr, "[dialog] '%s' was not found%s\n", prog.c_str(),
+                         prog == "zenity" ? ": install it (sudo apt install zenity) to pick files" : "");
+        }
+        return out;
+    });
+    const bool pump = dialogPump() && std::this_thread::get_id() == dialogPumpThread();
+    while (task.wait_for(std::chrono::milliseconds(30)) != std::future_status::ready)
+        if (pump) dialogPump()();
+    return task.get();
+}
 #endif
 
 // Displays a native message box/alert
@@ -33,7 +78,7 @@ inline void showPopup(std::string title, std::string message) {
             return o;
         };
         std::string cmd = "osascript -e 'display dialog \"" + as(message) + "\" with title \"" + as(title) + "\" buttons {\"OK\"} default button \"OK\" with icon note'";
-        int ret = system(cmd.c_str()); (void)ret;
+        runDialog(cmd);
     #elif __linux__
         // double-quoted shell argument: \ " $ ` escaped
         auto sh = [](const std::string& t) {
@@ -42,7 +87,7 @@ inline void showPopup(std::string title, std::string message) {
             return o;
         };
         std::string cmd = "zenity --info --title=\"" + sh(title) + "\" --text=\"" + sh(message) + "\"";
-        int ret = system(cmd.c_str()); (void)ret;
+        runDialog(cmd);
     #endif
 }
 
@@ -60,30 +105,16 @@ inline std::string openFileDialog() {
         ofn.lpstrFilter = "WAV Files\0*.wav\0All Files\0*.*\0";
         ofn.nFilterIndex = 1;
         ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-        
+
         if (GetOpenFileNameA(&ofn)) {
             result = filename;
         }
     #elif __APPLE__
-        const char* cmd = "osascript -e 'try' -e 'POSIX path of (choose file of type {\"wav\"} with prompt \"Select Baseband WAV\")' -e 'on error' -e 'return \"\"' -e 'end try'";
-        std::array<char, 128> buffer;
-        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
-        if (pipe) {
-            while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-                result += buffer.data();
-            }
-        }
+        result = runDialog("osascript -e 'try' -e 'POSIX path of (choose file of type {\"wav\"} with prompt \"Select Baseband WAV\")' -e 'on error' -e 'return \"\"' -e 'end try'");
     #elif __linux__
-        const char* cmd = "zenity --file-selection --file-filter='*.wav' --title='Select Baseband WAV'";
-        std::array<char, 128> buffer;
-        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
-        if (pipe) {
-            while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-                result += buffer.data();
-            }
-        }
+        result = runDialog("zenity --file-selection --file-filter='*.wav' --title='Select Baseband WAV'");
     #endif
-    
+
     // Trim trailing newline characters
     if (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
         result.pop_back();
@@ -111,11 +142,7 @@ inline std::string openTleFileDialog() {
         #else
         const char* cmd = "zenity --file-selection --title='Select a TLE file' 2>/dev/null";
         #endif
-        std::array<char, 256> buffer;
-        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
-        if (pipe) {
-            while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) result += buffer.data();
-        }
+        result = runDialog(cmd);
     #endif
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) result.pop_back();
     return result;
@@ -128,7 +155,7 @@ inline std::string selectFolderDialog(const std::string& title = "Select Folder 
         BROWSEINFOA bi = { 0 };
         bi.lpszTitle = title.c_str();
         LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
-        
+
         if (pidl != 0) {
             char path[MAX_PATH];
             if (SHGetPathFromIDListA(pidl, path)) {
@@ -137,25 +164,11 @@ inline std::string selectFolderDialog(const std::string& title = "Select Folder 
             CoTaskMemFree(pidl);
         }
     #elif __APPLE__
-        std::string cmd = "osascript -e 'try' -e 'POSIX path of (choose folder with prompt \"" + title + "\")' -e 'on error' -e 'return \"\"' -e 'end try'";
-        std::array<char, 128> buffer;
-        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
-        if (pipe) {
-            while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-                result += buffer.data();
-            }
-        }
+        result = runDialog("osascript -e 'try' -e 'POSIX path of (choose folder with prompt \"" + title + "\")' -e 'on error' -e 'return \"\"' -e 'end try'");
     #elif __linux__
-        std::string cmd = "zenity --file-selection --directory --title='" + title + "'";
-        std::array<char, 128> buffer;
-        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
-        if (pipe) {
-            while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-                result += buffer.data();
-            }
-        }
+        result = runDialog("zenity --file-selection --directory --title='" + title + "'");
     #endif
-    
+
     // Trim trailing newline characters
     if (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
         result.pop_back();
@@ -186,16 +199,10 @@ inline std::string savePictureDialog(const std::string& folder, const std::strin
         ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
         if (GetSaveFileNameA(&ofn)) result = filename;
     #elif __APPLE__
-        std::string cmd = "osascript -e 'try' -e 'POSIX path of (choose file name with prompt \"Save picture\" default name \"" + fileName +
-                          "\" default location (POSIX file \"" + folder + "\"))' -e 'on error' -e 'return \"\"' -e 'end try'";
-        std::array<char, 256> buffer;
-        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
-        if (pipe) while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) result += buffer.data();
+        result = runDialog("osascript -e 'try' -e 'POSIX path of (choose file name with prompt \"Save picture\" default name \"" + fileName +
+                           "\" default location (POSIX file \"" + folder + "\"))' -e 'on error' -e 'return \"\"' -e 'end try'");
     #elif __linux__
-        std::string cmd = "zenity --file-selection --save --confirm-overwrite --title='Save picture' --filename='" + folder + "/" + fileName + "'";
-        std::array<char, 256> buffer;
-        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
-        if (pipe) while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) result += buffer.data();
+        result = runDialog("zenity --file-selection --save --confirm-overwrite --title='Save picture' --filename='" + folder + "/" + fileName + "'");
     #endif
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) result.pop_back();
     // Make sure the file gets the .png extension
@@ -231,16 +238,10 @@ inline std::string saveTextFileDialog(const std::string& folder, const std::stri
         ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
         if (GetSaveFileNameA(&ofn)) result = filename;
     #elif __APPLE__
-        std::string cmd = "osascript -e 'try' -e 'POSIX path of (choose file name with prompt \"" + title + "\" default name \"" + fileName +
-                          "\" default location (POSIX file \"" + folder + "\"))' -e 'on error' -e 'return \"\"' -e 'end try'";
-        std::array<char, 256> buffer;
-        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
-        if (pipe) while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) result += buffer.data();
+        result = runDialog("osascript -e 'try' -e 'POSIX path of (choose file name with prompt \"" + title + "\" default name \"" + fileName +
+                           "\" default location (POSIX file \"" + folder + "\"))' -e 'on error' -e 'return \"\"' -e 'end try'");
     #elif __linux__
-        std::string cmd = "zenity --file-selection --save --confirm-overwrite --title='" + title + "' --filename='" + folder + "/" + fileName + "'";
-        std::array<char, 256> buffer;
-        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
-        if (pipe) while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) result += buffer.data();
+        result = runDialog("zenity --file-selection --save --confirm-overwrite --title='" + title + "' --filename='" + folder + "/" + fileName + "'");
     #endif
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) result.pop_back();
     return result;

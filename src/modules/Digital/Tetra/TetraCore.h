@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <functional>
 
 #include "TetraVoice.h"
 #include "../../Core/PositionBus.h"
@@ -99,6 +100,26 @@ class Core {
 public:
     static constexpr size_t MAX_SDS = 200;
     static constexpr size_t MAX_LIP = 200;
+
+    // For the calls table: a transmission starts / ends, an SDS arrives. Called on the
+    // thread that feeds rxBit(), while that call runs. Call control is repeated many times
+    // on the air (late entry): the receiver of these events drops the repeats.
+    struct Event {
+        enum class Type { TxStart, TxEnd, Sds };
+        Type        type = Type::TxStart;
+        std::string callId;
+        std::string from, to;       // TxStart: talker > group
+        bool        encrypted = false;
+        bool        setup = false;    // TxStart from D-SETUP: it names the CALLER, and is
+                                      // repeated during the whole call, also while others talk
+        bool        release = false;  // TxEnd from D-RELEASE: the whole call is over
+        SdsMsg      sds;            // Sds
+    };
+    std::function<void(const Event&)> onEvent;
+
+    // When a traffic (TCH/S) slot was last seen on the channel, clear or not, decoded or
+    // not (steady clock, ms; 0 = never). Tells an over that is still going on.
+    long long lastTrafficMs() const { return m_lastTrafficMs.load(); }
 
     Core() {
 #ifdef ENABLE_TETRA
@@ -265,8 +286,14 @@ private:
     }
 
     // Called from rxBit's thread when a PDU is decoded.
+    void emit(const Event& e) { if (onEvent) onEvent(e); }
+
     void onReport(const Tetra::ReportData& r) {
-        if (r.service == "UPLANE") { onSpeech(r); return; }
+        if (r.service == "UPLANE") {
+            m_lastTrafficMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count());
+            onSpeech(r);
+            return;
+        }
 
         std::lock_guard<std::mutex> l(m_mtx);
         m_st.reports++;
@@ -276,13 +303,30 @@ private:
         if (r.pdu == "D-SETUP" || r.pdu == "D-CONNECT") {
             m_st.group  = r.has("actual ssi") ? r.get("actual ssi") : r.get("ssi");
             m_st.callId = r.get("call identifier");
-            if (r.has("calling party ssi")) m_st.talker = r.get("calling party ssi");
+            if (r.has("calling party ssi")) {
+                m_st.talker = r.get("calling party ssi");
+                Event e;
+                e.type = Event::Type::TxStart;
+                e.callId = m_st.callId; e.from = m_st.talker; e.to = m_st.group;
+                e.setup = true;
+                emit(e);
+            }
         } else if (r.pdu == "D-TX GRANTED") {
             m_st.group  = r.has("actual ssi") ? r.get("actual ssi") : r.get("ssi");
             m_st.callId = r.get("call identifier");
             m_st.talker = r.get("transmitting party ssi");
+            Event e;
+            e.type = Event::Type::TxStart;
+            e.callId = m_st.callId; e.from = m_st.talker; e.to = m_st.group;
+            e.encrypted = r.get("encryption control") == "1";
+            emit(e);
         } else if (r.pdu == "D-TX CEASED" || r.pdu == "D-RELEASE") {
             m_st.talker.clear();
+            Event e;
+            e.type = Event::Type::TxEnd;
+            e.callId = r.get("call identifier");
+            e.release = r.pdu == "D-RELEASE";
+            emit(e);
         }
 
         // SDS. tetra-kit overloads "infos": decoded text only when a text coding
@@ -313,6 +357,10 @@ private:
             }
             m_st.sds.push_front(m);
             if (m_st.sds.size() > MAX_SDS) m_st.sds.pop_back();
+            Event e;
+            e.type = Event::Type::Sds;
+            e.sds = m;
+            emit(e);
         }
 
         // LIP position report
@@ -353,6 +401,7 @@ private:
     std::mutex m_mtx;
     Status     m_st;
     std::atomic<bool> m_contentOn {false};
+    std::atomic<long long> m_lastTrafficMs {0};
 
     mutable std::mutex m_vmtx;      // speech buffer (pull() runs on the DSP thread)
     std::deque<float>  m_vq;

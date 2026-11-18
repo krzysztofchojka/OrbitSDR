@@ -12,6 +12,8 @@
 #include <mutex>
 #include <deque>
 #include <map>
+#include <set>
+#include <chrono>
 #include <vector>
 #include <string>
 #include <memory>
@@ -84,6 +86,15 @@ class DigitalVoiceDecoder : public SDRModule {
         double tetEvmDeg = 180.0;
         int    tetVariant = -1;
         double tetSrcRate = 0.0;           // group rate feeding the TETRA channel (diagnostics)
+
+        // the TETRA transmission (over) shown as a "live" row of the calls table
+        struct TetraTx {
+            bool open = false;
+            std::string callId, from;
+            std::chrono::steady_clock::time_point start, last;   // last: last call control for it
+            dv::Call call;
+        } tetTx;
+        std::set<std::string> tetCalls;    // call ids already in the table (until D-RELEASE)
     };
 
     // TETRA occupies only ~+-12 kHz (Rs*(1+roll-off)/2 = 12.15 kHz), so a 54 kHz baseband
@@ -238,10 +249,108 @@ class DigitalVoiceDecoder : public SDRModule {
         if (calls.size() > MAX_CALLS) calls.pop_back();
     }
 
-    void logCall(const dv::Call& c) {
+    // ---- TETRA in the calls table -------------------------------------------
+    // A TETRA row is proto "TETRA"; an SDS row has seconds < 0 (a message, no length).
+    static bool isTetraSds(const dv::Call& c) { return c.proto == "TETRA" && c.seconds < 0; }
+
+    // What may be shown of a row: with "TETRA content: hidden" the subscriber numbers and
+    // the SDS content of TETRA rows are masked (in the table, its popup and the log).
+    dv::Call shown(const dv::Call& c) const {
+        if (c.proto != "TETRA" || showTetraContent) return c;
+        dv::Call m = c;
+        m.from = m.to = "hidden";
+        if (isTetraSds(c)) m.extra = "SDS (content hidden)";
+        return m;
+    }
+
+    // mtx is held (called from process, through tetra::Core::onEvent)
+    void onTetraEvent(Rx* r, const tetra::Core::Event& e) {
+        using Clock = std::chrono::steady_clock;
+        const auto now = Clock::now();
+        if (e.type == tetra::Core::Event::Type::TxStart) {
+            Rx::TetraTx& t = r->tetTx;
+            // D-SETUP is repeated through the whole call and always names the caller, also
+            // while somebody else has the floor: it opens a row only for a call not seen yet.
+            // Later overs of the call come with D-TX GRANTED.
+            if (e.setup && !e.callId.empty() && r->tetCalls.count(e.callId)) {
+                if (t.open && t.callId == e.callId) t.last = now;
+                return;
+            }
+            if (!e.callId.empty()) {
+                if (r->tetCalls.size() > 64) r->tetCalls.clear();
+                r->tetCalls.insert(e.callId);
+            }
+            // the same over announced again (D-TX GRANTED repeats): keep the row
+            if (t.open && t.callId == e.callId && t.from == e.from) { t.last = now; return; }
+            if (t.open) endTetraTx(r);   // another talker took over
+            dv::Call c;
+            c.time = dv::wallClock();
+            c.proto = "TETRA";
+            c.from = e.from;
+            c.to = e.to;
+            c.encrypted = e.encrypted;
+            if (e.encrypted) c.encText = "TEA, not decoded";
+            c.extra = "voice" + (e.callId.empty() ? std::string() : "  call " + e.callId);
+            c.open = true;
+            onCall(r, c);
+            t.open = true; t.callId = e.callId; t.from = e.from; t.start = t.last = now; t.call = c;
+        } else if (e.type == tetra::Core::Event::Type::TxEnd) {
+            if (r->tetTx.open && (e.callId.empty() || e.callId == r->tetTx.callId)) endTetraTx(r);
+            if (e.release) { if (e.callId.empty()) r->tetCalls.clear(); else r->tetCalls.erase(e.callId); }
+        } else {
+            const tetra::SdsMsg& m = e.sds;
+            dv::Call c;
+            c.time = dv::wallClock();
+            c.proto = "TETRA";
+            c.from = m.from;
+            c.to = m.to;
+            switch (m.kind) {
+            case tetra::SdsMsg::Kind::Text:   c.extra = "SDS \"" + m.text + "\""; break;
+            case tetra::SdsMsg::Kind::Status: c.extra = "SDS status " + m.text; break;
+            default:                          c.extra = "SDS [" + m.proto + "] " + m.text; break;
+            }
+            c.seconds = -1.0;   // a message
+            c.open = false;
+            c.freqHz = r->id == AUDIO_ID ? 0 : r->freqHz;
+            c.channelId = r->id;
+            calls.push_front(c);
+            r->calls++;
+            totalCalls++;
+            if (calls.size() > MAX_CALLS) calls.pop_back();
+            logCall(c);
+        }
+    }
+
+    // Closes the open TETRA over of a channel (its row gets the length). mtx is held.
+    void endTetraTx(Rx* r) {
+        Rx::TetraTx& t = r->tetTx;
+        if (!t.open) return;
+        dv::Call c = t.call;
+        c.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t.start).count();
+        c.open = false;
+        onCall(r, c);
+        t = Rx::TetraTx();
+    }
+
+    // Every block of a TETRA channel: the live row's length, and the end of an over whose
+    // D-TX CEASED / D-RELEASE was lost (no call control and no traffic slot for 5 s).
+    void tetraTick(Rx& r) {
+        Rx::TetraTx& t = r.tetTx;
+        if (!t.open) return;
+        const auto now = std::chrono::steady_clock::now();
+        const long long trafficMs = r.tcore->lastTrafficMs();
+        const auto traffic = std::chrono::steady_clock::time_point(std::chrono::milliseconds(trafficMs));
+        const auto lastSeen = std::max(t.last, trafficMs ? traffic : t.last);
+        if (now - lastSeen > std::chrono::seconds(5)) { endTetraTx(&r); return; }
+        for (auto& e : calls)
+            if (e.channelId == r.id && e.open && e.proto == "TETRA") { e.seconds = std::chrono::duration<double>(now - t.start).count(); break; }
+    }
+
+    void logCall(const dv::Call& raw) {
+        const dv::Call c = shown(raw);
         std::string line = (c.freqHz ? mhz(c.freqHz) + " MHz  " : std::string("audio  ")) + c.proto +
                            (c.slot ? "  TS" + std::to_string(c.slot) : "") + "  " + (c.from.empty() ? "?" : c.from) +
-                           " > " + (c.to.empty() ? "?" : c.to) + "  " + durText(c.seconds);
+                           " > " + (c.to.empty() ? "?" : c.to) + "  " + (isTetraSds(c) ? std::string("SDS") : durText(c.seconds));
         if (!c.alias.empty()) line += "  alias: " + c.alias;
         if (c.encrypted) line += "  ENCRYPTED" + (c.encText.empty() ? std::string() : " (" + c.encText + ")");
         if (!c.extra.empty()) line += "  " + c.extra;
@@ -267,6 +376,8 @@ class DigitalVoiceDecoder : public SDRModule {
             };
             // resolved downlink bits -> ported tetra-kit decoder (network info, SDS, LIP)
             slot->tsync.onBit = [raw](uint8_t b) { raw->tcore->rxBit(b); };
+            // TETRA overs and SDS -> the calls table (mtx is held: called from process)
+            slot->tcore->onEvent = [this, raw](const tetra::Core::Event& e) { onTetraEvent(raw, e); };
         }
         return *slot;
     }
@@ -377,7 +488,18 @@ class DigitalVoiceDecoder : public SDRModule {
         popup.show("Digital voice  " + (cv.isAudio ? std::string("audio input") : mhz(cv.freqHz) + " MHz"), rows, note);
     }
 
-    void openCall(const dv::Call& c) {
+    void openCall(const dv::Call& raw) {
+        const dv::Call c = shown(raw);
+        if (isTetraSds(c)) {
+            std::vector<std::pair<std::string, std::string>> rows;
+            rows.push_back({"Time", c.time});
+            rows.push_back({"Channel", c.freqHz ? mhz(c.freqHz) + " MHz" : "audio input"});
+            rows.push_back({"From", c.from.empty() ? "-" : c.from});
+            rows.push_back({"To", c.to.empty() ? "-" : c.to});
+            rows.push_back({"Message", c.extra.size() > 4 ? c.extra.substr(4) : c.extra});   // without the "SDS " prefix
+            popup.show("TETRA SDS  " + (c.from.empty() ? "" : c.from) + (c.to.empty() ? "" : " > " + c.to), rows, "");
+            return;
+        }
         std::vector<std::pair<std::string, std::string>> rows;
         rows.push_back({"Time", c.time});
         rows.push_back({"Channel", c.freqHz ? mhz(c.freqHz) + " MHz" : "audio input"});
@@ -574,7 +696,10 @@ public:
                 r.tetCarrierHz = r.tdemod.carrierHz;
                 r.tetEvmDeg = r.tdemod.evmAcc * 180.0 / 3.14159265358979323846;
                 r.tetSrcRate = grate;
+                tetraTick(r);
             } else if (r.tetReady) {
+                endTetraTx(&r);
+                r.tetCalls.clear();
                 r.tetReady = false; r.tsync.reset(); r.tet.reset(); r.tcore->reset();
                 r.tetBursts = 0; r.tetVariant = -1; r.tetSrcRate = 0.0;
             }
@@ -988,7 +1113,7 @@ private:
         }
         const float charW = 5.6f;
         for (int r = 0; r < visibleRows && r < (int)list.size(); r++) {
-            const dv::Call& c = list[r];
+            const dv::Call c = shown(list[r]);
             const float ry = tableBodyY + r * rowH;
             if (r % 2 == 0) {
                 sf::RectangleShape stripe({tableRect.size.x, rowH});
@@ -1002,7 +1127,8 @@ private:
             if (!c.extra.empty()) infoTxt = (infoTxt.empty() ? "" : infoTxt + "  ") + c.extra;
             const std::string cells[8] = {
                 c.time, c.freqHz ? mhz(c.freqHz) : "audio", c.slot ? std::to_string(c.slot) : "-", c.proto,
-                c.from.empty() ? "?" : c.from, c.to.empty() ? "?" : c.to, c.open ? "live" : durText(c.seconds), infoTxt };
+                c.from.empty() ? "?" : c.from, c.to.empty() ? "?" : c.to,
+                c.open ? "live" : isTetraSds(c) ? std::string("SDS") : durText(c.seconds), infoTxt };
             float px = tableRect.position.x;
             for (int k = 0; k < 8; k++) {
                 const size_t maxChars = (size_t)std::max(3.0f, (cols[k].w - 6.0f) / charW);

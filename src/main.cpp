@@ -184,6 +184,15 @@ int main() {
 #endif
     window.setFramerateLimit(60);
 
+    // While a zenity / osascript dialog is open the window must keep answering the window
+    // manager (GNOME offers "Force quit" for a window silent for ~5 s). The events that come
+    // in meanwhile are kept and handled after the dialog, in order, as before.
+    std::deque<sf::Event> heldEvents;
+    dialogPumpThread() = std::this_thread::get_id();
+    dialogPump() = [&window, &heldEvents]() {
+        while (const std::optional<sf::Event> e = window.pollEvent()) heldEvents.push_back(*e);
+    };
+
     // Icon: looked up next to the executable and in ../Resources (macOS bundle)
     sf::Image icon;
     {
@@ -1004,6 +1013,15 @@ int main() {
     };
     modAudio->addWidget(lblAudioDev);
     modAudio->addWidget(ddAudio);
+    {
+        // which sound system plays (Linux: PulseAudio / PipeWire or ALSA). "Null" = none was found
+        const bool none = audio.backendName == "Null" || audio.backendName == "none";
+        auto lblAudioSys = std::make_shared<Label>(
+            none ? "No sound system found (PulseAudio/ALSA)"
+                 : "Sound system: " + audio.backendName,
+            font, 11, none ? sf::Color(255, 150, 90) : sf::Color(120, 120, 130));
+        modAudio->addWidget(lblAudioSys);
+    }
 
     auto modDemod = sidebar.addModule("Demodulator");
     modDemod->addWidget(rowModes);
@@ -2403,7 +2421,12 @@ int main() {
         std::vector<SDRModule*> runningMods;
         for (const DecTab& t : tabs) if (t.mod) runningMods.push_back(t.mod);
 
-        while (const std::optional<sf::Event> ev = window.pollEvent()) {
+        // events held while a dialog was open come first
+        auto nextEvent = [&]() -> std::optional<sf::Event> {
+            if (!heldEvents.empty()) { const sf::Event e = heldEvents.front(); heldEvents.pop_front(); return e; }
+            return window.pollEvent();
+        };
+        while (const std::optional<sf::Event> ev = nextEvent()) {
             if (ev->is<sf::Event::Closed>()) window.close();
 
             // Global mouse-release catcher - prevents UI from getting stuck

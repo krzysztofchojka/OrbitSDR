@@ -8,6 +8,8 @@
 #include <map>
 #include <memory>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include "miniaudio.h"
 
 // =====================================================================
@@ -33,10 +35,26 @@ public:
     // 1 second per stream (48000 Hz * 2 channels): a safe margin against stutter
     const size_t MAX_BUFFER_SIZE = (size_t)(48000 * 2 * 1.0);
 
+    // What the sound system is (for the UI and the log): "PulseAudio", "ALSA", "WASAPI" ...
+    // "Null" means no real sound system could be opened: nothing will be heard.
+    std::string backendName = "none";
+    // the last device that could not be opened, and why ("" = none failed)
+    std::string lastErrorText() { std::lock_guard<std::mutex> l(routeMtx); return lastError; }
+
     AudioSink() {
-        if (ma_context_init(NULL, 0, NULL, &context) != MA_SUCCESS) return;
+        const ma_result r = ma_context_init(NULL, 0, NULL, &context);
+        if (r != MA_SUCCESS) {
+            lastError = std::string("no sound system: ") + ma_result_description(r);
+            fprintf(stderr, "[audio] %s\n", lastError.c_str());
+            return;
+        }
         contextOk = true;
+        backendName = ma_get_backend_name(context.backend);
         refreshDeviceList();
+        fprintf(stderr, "[audio] backend: %s, %zu output device(s)\n", backendName.c_str(), availableDevices.size() - 1);
+        for (size_t i = 1; i < availableDevices.size(); i++) fprintf(stderr, "[audio]   %s\n", availableDevices[i].name.c_str());
+        if (context.backend == ma_backend_null)
+            fprintf(stderr, "[audio] WARNING: no PulseAudio / PipeWire / ALSA found (libpulse.so.0, libasound.so.2): no sound\n");
     }
 
     ~AudioSink() {
@@ -55,7 +73,9 @@ public:
         if (!contextOk) return;
         ma_device_info* infos;
         ma_uint32 count;
-        if (ma_context_get_devices(&context, &infos, &count, NULL, NULL) == MA_SUCCESS) {
+        const ma_result r = ma_context_get_devices(&context, &infos, &count, NULL, NULL);
+        if (r != MA_SUCCESS) fprintf(stderr, "[audio] cannot list devices: %s\n", ma_result_description(r));
+        if (r == MA_SUCCESS) {
             for (ma_uint32 i = 0; i < count; ++i) {
                 DeviceInfo info;
                 info.name = infos[i].name;
@@ -117,6 +137,19 @@ public:
         }
     }
 
+    // True while the stream's device is open AND its callback keeps taking samples (it ran in
+    // the last 400 ms). A file played to the speaker is paced by this buffer draining; when
+    // the device is missing or stalled, the DSP thread must pace by the clock instead,
+    // otherwise it would either race through the file or wait forever.
+    bool isLive(int stream = 0) {
+        std::lock_guard<std::mutex> l(routeMtx);
+        const auto r = route.find(stream);
+        const auto it = outs.find(r == route.end() ? 0 : r->second);
+        if (it == outs.end() || !it->second->ok) return false;
+        const long long last = it->second->lastCallbackMs.load();
+        return last > 0 && nowMs() - last < 400;
+    }
+
     size_t getBufferedCount(int stream = 0) {
         std::lock_guard<std::mutex> l(routeMtx);
         Out* o = outFor(stream);
@@ -155,11 +188,17 @@ private:
         std::mutex mtx;
         std::map<int, std::deque<float>> streams;   // by stream id (the receiver's id)
         std::atomic<bool>* mute = nullptr;
+        std::atomic<long long> lastCallbackMs {0};   // steady clock, when the device last asked for samples
         ~Out() { if (ok) ma_device_uninit(&device); }
     };
 
+    static long long nowMs() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
     ma_context context;
     bool contextOk = false;
+    std::string lastError;                        // routeMtx (openOut runs with it held)
     std::mutex routeMtx;                          // route, outs (the callbacks only lock Out::mtx)
     std::map<int, std::unique_ptr<Out>> outs;     // by device index
     std::map<int, int> route;                     // stream -> device index
@@ -175,9 +214,20 @@ private:
         config.performanceProfile = ma_performance_profile_low_latency;
         config.playback.pDeviceID = index > 0 ? &availableDevices[index].id : NULL;
         o.mute = &masterMute;
-        if (ma_device_init(&context, &config, &o.device) != MA_SUCCESS) return false;
+        const std::string name = index > 0 ? availableDevices[index].name : std::string("system default");
+        ma_result r = ma_device_init(&context, &config, &o.device);
+        if (r != MA_SUCCESS) {
+            lastError = "cannot open " + name + ": " + ma_result_description(r);
+            fprintf(stderr, "[audio] %s\n", lastError.c_str());
+            return false;
+        }
         o.ok = true;
-        if (ma_device_start(&o.device) != MA_SUCCESS) { ma_device_uninit(&o.device); o.ok = false; return false; }
+        r = ma_device_start(&o.device);
+        if (r != MA_SUCCESS) {
+            lastError = "cannot start " + name + ": " + ma_result_description(r);
+            fprintf(stderr, "[audio] %s\n", lastError.c_str());
+            ma_device_uninit(&o.device); o.ok = false; return false;
+        }
         return true;
     }
     // routeMtx held. Streams not routed yet play on the system default.
@@ -209,6 +259,7 @@ private:
 
     static void data_callback(ma_device* pDevice, void* pOutput, const void*, ma_uint32 frameCount) {
         Out* o = (Out*)pDevice->pUserData;
+        o->lastCallbackMs.store(nowMs());
         float* out = (float*)pOutput;
         const size_t samplesNeeded = (size_t)frameCount * 2;
         std::fill(out, out + samplesNeeded, 0.0f);   // silence where a stream has no data (underrun)
