@@ -1038,6 +1038,24 @@ int DSDDecoder::getFrameSync()
                 m_mbeRate = DSDMBERate3600x2450;
                 return (int) DSDSyncDPMR;
             }
+            // OrbitSDR: dPMR classic with an inverted discriminator. Inverted FS1 is the
+            // FS4 pattern (packet data header), which is not decoded here anyway.
+            if (syncEngine.isMatching(DSDSync::SyncDPMRFS4))
+            {
+                m_state.carrier = 1;
+                m_dsdSymbol.setFSK(4, true);
+
+                sprintf(m_state.ftype, "-dPMR        ");
+
+                if (m_opts.errorbars == 1)
+                {
+                    printFrameSync("-dPMR      ", m_synctest_pos + 1);
+                }
+
+                m_lastSyncType = DSDSyncDPMR;
+                m_mbeRate = DSDMBERate3600x2450;
+                return (int) DSDSyncDPMR;
+            }
         }
         if (m_opts.frame_dstar == 1)
         {

@@ -72,6 +72,8 @@ echo "Compiling with modules: $MODULE_SOURCES"
 . scripts/rtl433.sh
 # ft8_lib (FT8 / FT4 decoder): vendored in deps/ft8_lib, compiled once into .cache/
 . scripts/ft8lib.sh
+# DSDcc + mbelib (digital voice: DMR, dPMR, D-STAR, YSF, NXDN): vendored, compiled once into .cache/
+. scripts/dsdcc.sh
 
 $CXX -std=c++17 -O3 $SDR_FLAGS $RTL433_FLAGS $FT8LIB_FLAGS $DSDCC_FLAGS $FINAL_INCLUDES \
     $SRC_DIR/main.cpp $MODULE_SOURCES $RTL433_LIB $FT8LIB_LIB $DSDCC_LIB \

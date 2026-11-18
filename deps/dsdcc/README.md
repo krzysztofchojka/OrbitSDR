@@ -25,6 +25,9 @@ hands the voice frames to mbelib (`deps/mbelib`).
     header (algorithm id, key id), CSBK (opcode, feature set id), data header.
 - `nxdn.h`, `nxdn.cpp`, `nxdnmessage.h`, `nxdnmessage.cpp`: cipher type and key id
   of a call.
+- `dsd_decoder.cpp`: dPMR with an inverted discriminator (inverted FS1, which is the
+  FS4 pattern) is decoded too; upstream finds only the positive polarity, so receivers
+  and recordings with the opposite FM sign gave no speech.
 
 Built by `scripts/dsdcc.sh` (sourced by the build scripts) into a static
 library in `.cache/`. Used by `src/modules/Digital/`.
