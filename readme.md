@@ -181,14 +181,14 @@ The rtl_433 sources are not stored in this repository. The build scripts call `s
 
 [ft8_lib](https://github.com/kgoba/ft8_lib) (MIT) is kept in `deps/ft8_lib`. The build scripts call `scripts/ft8lib.sh`, which compiles it once with the C compiler into `.cache/`. If that fails, OrbitSDR is built without FT8 / FT4 (WSPR still works).
 
-### DSDcc and mbelib (digital voice)
+### DSDcc and mbevocoder (digital voice)
 
-[DSDcc](https://github.com/f4exb/dsdcc) (GPL v3, with OrbitSDR's additions, see `deps/dsdcc/README.md`) and [mbelib](https://github.com/szechyjs/mbelib) (ISC) are kept in `deps/`. The build scripts call `scripts/dsdcc.sh`, which compiles them once into `.cache/`. The voice codecs (AMBE / IMBE) may be covered by patents in some countries: `./build.sh --no-vocoder` (or `ORBITSDR_NO_VOCODER=1` for any build script) leaves mbelib out, the calls are then shown without speech. `--disable-digital` (`ORBITSDR_NO_DIGITAL=1`) leaves out digital voice entirely.
+[DSDcc](https://github.com/f4exb/dsdcc) (GPL v3, with OrbitSDR's additions, see `deps/dsdcc/README.md`) and the decoder part of [mbevocoder](https://github.com/srcejon/mbevocoder) (GPL v3, the AMBE / IMBE codecs that SDRangel 8.2 uses, see `deps/mbevocoder/README.md`) are kept in `deps/`. The build scripts call `scripts/dsdcc.sh`, which compiles them once into `.cache/`. The voice codecs (AMBE / IMBE) may be covered by patents in some countries: `./build.sh --no-vocoder` (or `ORBITSDR_NO_VOCODER=1` for any build script) leaves the codec out, the calls are then shown without speech. `--disable-digital` (`ORBITSDR_NO_DIGITAL=1`) leaves out digital voice entirely.
 
 ## License and credits
 
 OrbitSDR is licensed under the [GNU GPL v3](LICENSE).
 
-It uses [SFML](https://www.sfml-dev.org/), [miniaudio](https://miniaud.io/), [librtlsdr](https://osmocom.org/projects/rtl-sdr), [rtl_433](https://github.com/merbanan/rtl_433) (GPL-2.0-or-later), [ft8_lib](https://github.com/kgoba/ft8_lib) (MIT), [DSDcc](https://github.com/f4exb/dsdcc) (Edouard Griffiths F4EXB; GPL v3), [mbelib](https://github.com/szechyjs/mbelib) (ISC) and the [SDRplay API](https://www.sdrplay.com/).
+It uses [SFML](https://www.sfml-dev.org/), [miniaudio](https://miniaud.io/), [librtlsdr](https://osmocom.org/projects/rtl-sdr), [rtl_433](https://github.com/merbanan/rtl_433) (GPL-2.0-or-later), [ft8_lib](https://github.com/kgoba/ft8_lib) (MIT), [DSDcc](https://github.com/f4exb/dsdcc) (Edouard Griffiths F4EXB; GPL v3), [mbevocoder](https://github.com/srcejon/mbevocoder) (Jon Beniston M7RCE; GPL v3, from mbelib and mbelib-neo) and the [SDRplay API](https://www.sdrplay.com/).
 
 The WSPR decoder is a C++ port of wsprd from [WSJT-X](https://wsjt.sourceforge.io/) (K1JT, K9AN; GPL v3), the VDL2 decoder follows [dumpvdl2](https://github.com/szpajder/dumpvdl2) (Tomasz Lemiech; GPL v3) with the Reed-Solomon decoder of Phil Karn's libfec (LGPL). The NAVTEX and DSC decoders follow the ones in [SDRangel](https://github.com/f4exb/sdrangel) (Jon Beniston; GPL v3), the CCIR 476 tables are taken from there.

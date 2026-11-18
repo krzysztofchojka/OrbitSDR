@@ -203,6 +203,7 @@ void DSDdPMR::processHIn(int symbolIndex, int dibit) // FIXME
 
         if (checkCRC8(m_bitBuffer, 72)) // CRC8 check OK
         {
+            m_dsdDecoder->crcPassed(2);
             // collect data
             int ht     = (m_bitBuffer[0]<<3) + (m_bitBuffer[1]<<2) + (m_bitBuffer[2]<<1) + m_bitBuffer[3];
             int mode   = (m_bitBuffer[52]<<2) + (m_bitBuffer[53]<<1) + m_bitBuffer[54];
@@ -554,6 +555,7 @@ void DSDdPMR::processCCH(int symbolIndex, int dibit)
 
         if (checkCRC7(m_bitBuffer, 41)) // CRC7 check OK
         {
+            m_dsdDecoder->crcPassed(1);
 //            DSDcc::nullLog() << "DSDdPMR::processCCH: success" << std::endl;
 
             m_frameNumber = (m_bitBuffer[0]<<1) + m_bitBuffer[1];

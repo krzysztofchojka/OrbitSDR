@@ -20,9 +20,7 @@
 #include <stdlib.h>
 #include "export.h"
 
-extern "C" {
-#include <mbelib.h>
-}
+#include <mbelib/mbelib.h>   // mbevocoder's mbelib 1.x API (it has its own extern "C")
 
 namespace DSDcc
 {

@@ -34,7 +34,18 @@ public:
 
     void initMbeParms();
     void processFrame(char imbe_fr[8][23], char ambe_fr[4][24], char imbe7100_fr[7][24]);
-    void processData(char imbe_data[88], char ambe_data[49]);
+    //! quality: the bit errors the protocol's own code corrected in the frame (-1: not known)
+    void processData(char imbe_data[88], char ambe_data[49], int quality = -1);
+
+    // OrbitSDR: the voice gate. A sync pattern matched by chance in noise starts the decoding of
+    // frames that are noise: played, they crackle. Every frame's FEC error count tells: on noise
+    // the Golay words of the AMBE frames always need 4 or more corrections, on a received signal
+    // mostly none. The frames wait (up to GATE_PENDING of them) until two of them have at most
+    // GATE_GOOD errors, then they are all played; noise never opens the gate. It closes after
+    // GATE_CLOSE noise-like frames in a row, or when no frame came for GATE_GAP samples.
+    bool gateOpen() const { return m_gateOpen; }
+    unsigned long long lastGoodSample() const { return m_gateLastGood; }
+    void resetGate();
 
     short *getAudio(int& nbSamples)
     {
@@ -58,6 +69,21 @@ public:
     void useHP(bool useHP) { m_upsamplingFilter.useHP(useHP); }
 
 private:
+    static const int GATE_PENDING = 4;
+    static const int GATE_GOOD = 2;      //!< errors in a frame that noise never has
+    static const int GATE_BAD = 4;       //!< errors noise always has
+    static const int GATE_CLOSE = 6;     //!< noise-like frames in a row that close the gate (120 ms)
+    static const unsigned long long GATE_GAP = 48000 / 4;   //!< a quarter of a second without frames
+    void gateFrame(int quality);
+    bool m_gateOpen;
+    int m_gateBadRun;
+    int m_gatePendingCount;
+    int m_gatePendingGood;
+    unsigned long long m_gateLastFrame;
+    unsigned long long m_gateLastGood;
+    float m_gatePending[GATE_PENDING][160];
+    bool m_gatePendingIsGood[GATE_PENDING];
+
     void processAudio();
     void upsample(int upsampling, float invalue);
 

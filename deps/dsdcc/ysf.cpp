@@ -338,6 +338,7 @@ void DSDYSF::processFICH(int symbolIndex, unsigned char dibit)
         {
             if (checkCRC16(m_fichBits, 4))
             {
+                m_dsdDecoder->crcPassed(4);
                 m_fich.setBytes(m_fichBits);
 //                DSDcc::nullLog() << "DSDYSF::processFICH: CRC OK: " << m_fich << std::endl;
                 m_fichError = FICHNoError;
@@ -657,6 +658,8 @@ void DSDYSF::processVD2Voice(int mbeIndex, unsigned char dibit)
             DSDcc::nullLog() << "DSDYSF::processVD2Voice: error bit 103" << std::endl;
         }
 
+        int repErrors = 0; // OrbitSDR: triplets whose three copies disagree (the voice gate's quality)
+
         for (int i = 0; i < 103; i++)
         {
             if (i < 81)
@@ -664,6 +667,7 @@ void DSDYSF::processVD2Voice(int mbeIndex, unsigned char dibit)
                 if (i%3 == 2)
                 {
                     nbOnes = m_vd2BitsRaw[i-2] + m_vd2BitsRaw[i-1] + m_vd2BitsRaw[i];
+                    if (nbOnes == 1 || nbOnes == 2) repErrors++;
                     bit = nbOnes > 1 ? 1 : 0;
                     m_vd2MBEBits[i/3] = bit;
                     mbeIndex = m_vd2DVSIInterleave[i/3];
@@ -678,7 +682,7 @@ void DSDYSF::processVD2Voice(int mbeIndex, unsigned char dibit)
             }
         }
 
-        m_dsdDecoder->m_mbeDecoder1.processData(0, (char *) m_vd2MBEBits);
+        m_dsdDecoder->m_mbeDecoder1.processData(0, (char *) m_vd2MBEBits, repErrors);
         m_dsdDecoder->m_mbeDVReady1 = true; // Indicate that a DVSI frame is available
     }
 }

@@ -43,6 +43,8 @@ DSDDecoder::DSDDecoder() :
         m_lastSyncType(DSDSyncNone),
         m_signalFormat(signalFormatNone)
 {
+    m_sampleCount = 0;
+    m_crcScore = 0;
     resetFrameSync();
     noCarrier();
     m_squelchTimeoutCount = 0;
@@ -334,6 +336,8 @@ void DSDDecoder::setDataRate(DSDRate dataRate)
 
 void DSDDecoder::run(short sample)
 {
+    m_sampleCount++;
+
     // mode time out if squelch has been closed for a number of samples
     if (m_fsmState != DSDLookForSync)
     {

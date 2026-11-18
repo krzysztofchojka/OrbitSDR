@@ -17,6 +17,7 @@
 #ifndef DMR_H_
 #define DMR_H_
 
+#include <string>
 #include "fec.h"
 #include "export.h"
 
@@ -140,6 +141,20 @@ public:
         unsigned int csbkSrc = 0, csbkDst = 0;
         unsigned int dataSrc = 0, dataDst = 0; //!< data header (SMS, GPS reports ...)
         unsigned int lcOk = 0, lcBad = 0;
+        // OrbitSDR: the last data header (CRC checked), bumped dataSeq on each one
+        unsigned int dataSeq = 0;
+        int dataDpf = -1;              //!< data packet format: 0 UDT, 1 response, 2 unconfirmed, 3 confirmed, 13-15 short data / proprietary
+        int dataSap = -1;              //!< service access point: 0 UDT, 2/3 compressed TCP/UDP, 4 IP, 5 ARP, 9 proprietary, 10 short data
+        int dataBlocks = 0;            //!< blocks that follow the header
+        int dataUdtFormat = -1;        //!< UDT: the format of the appended blocks
+        bool dataGroup = false;
+        // OrbitSDR: the last text message (SMS) reassembled and CRC checked, bumped textSeq
+        unsigned int textSeq = 0;
+        unsigned int textSrc = 0, textDst = 0;
+        bool textGroup = false;
+        char textKind[16] = {0};       //!< "UDT 7-bit", "UTF-16BE/IP", "TMS" ...
+        char text[256] = {0};
+        unsigned int crcOk = 0;        //!< bursts whose CRC / Reed-Solomon checked: the signal is real
     };
     const SlotInfo& getSlotInfo(int slot) const { return m_slotInfo[slot & 1]; }
     unsigned char getSlotTypeColorCode() const { return m_colorCode; }
@@ -182,6 +197,21 @@ private:
     void processDataBurst();
     void updateAlias(SlotInfo& si);
     SlotInfo m_slotInfo[2];
+    // OrbitSDR: reassembly of a data transmission (data header + rate 1/2 blocks) per slot
+    struct DataAssembly
+    {
+        bool udt = false, packet = false, confirmed = false, group = false;
+        int format = 0, padNibbles = 0, padOctets = 0, sap = 0;
+        int blocksExpected = 0, blocksReceived = 0, nextSerial = -1, dataBytes = 0;
+        unsigned int src = 0, dst = 0;
+        unsigned char data[160 * 12];
+    };
+    DataAssembly m_dataAsm[2];
+    void parseDataHeader(const unsigned char *h, int slot);
+    void parseUdtBlock(const unsigned char *b, int slot);
+    void parsePacketBlock(const unsigned char *b, int slot);
+    void publishPacketText(int slot);
+    void setText(int slot, unsigned int src, unsigned int dst, bool group, const char *kind, const std::string& text);
     unsigned char m_dataBits[196];
     bool m_slotTypeOK = false;
     unsigned int m_syncCount = 0;

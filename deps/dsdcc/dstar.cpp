@@ -423,6 +423,7 @@ void DSDDstar::processSlowDataGroup()
         {
             if (m_crcDStar.check_crc((unsigned char *) m_slowData.radioHeader, 41))
         	{
+                m_dsdDecoder->crcPassed(4);
 //                DSDcc::nullLog() << "DSDDstar::processSlowDataGroup: DStarSlowDataHeader OK" << std::endl;
                 m_header.setRpt2((const char *) &m_slowData.radioHeader[3], false);
                 m_header.setRpt1((const char *) &m_slowData.radioHeader[11], false);
@@ -586,6 +587,7 @@ void DSDDstar::processDPRS()
 
         if (crcOK)
         {
+            m_dsdDecoder->crcPassed(4);
             if (m_dprs.matchDSTAR(m_slowData.gpsNMEA))
             {
                 m_dprs.m_locPoint.getLocator().toCSting(m_slowData.locator);

@@ -199,6 +199,9 @@ class DigitalVoiceDecoder : public SDRModule {
             slot->id = id;
             Rx* raw = slot.get();
             slot->core->onCall = [this, raw](const dv::Call& c) { onCall(raw, c); };
+            slot->core->onEvent = [this, raw](const std::string& e) {   // mtx is held: called from process
+                log.add((raw->id == AUDIO_ID ? std::string("audio  ") : mhz(raw->freqHz) + " MHz  ") + e);
+            };
         }
         return *slot;
     }

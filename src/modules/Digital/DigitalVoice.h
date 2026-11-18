@@ -22,17 +22,28 @@
 //
 //  Input: the FM discriminator at 48 kHz (what an NFM receiver hears
 //  without de-emphasis and audio filters). The frames are decoded by
-//  DSDcc (deps/dsdcc, GPL v3), the voice by mbelib (deps/mbelib): the
-//  AMBE / IMBE codecs. Builds with ORBITSDR_NO_VOCODER leave mbelib out:
+//  DSDcc (deps/dsdcc, GPL v3), the voice by mbevocoder (deps/mbevocoder,
+//  GPL v3): the AMBE / IMBE codecs. Builds with ORBITSDR_NO_VOCODER leave it out:
 //  everything is decoded and shown, only the speech stays silent.
 //
 //  "Auto" runs one decoder per symbol rate (4800 Bd: DMR, D-STAR, YSF;
-//  2400 Bd: dPMR, NXDN48) until one of them finds its sync, then only
-//  that one until the signal has been gone for a while.
+//  2400 Bd: dPMR, NXDN48) until one of them has a confirmed signal, then
+//  only that one until the signal has been gone for a while.
+//
+//  Noise: a sync pattern also matches noise by chance (about once a
+//  second). A signal counts only when it is confirmed: speech through the
+//  voice gate (DSDcc's DSDMBEDecoder: the frames' FEC error counts),
+//  signalling whose CRC checks, or a sync held for seconds. The voice gate
+//  also keeps the frames decoded from noise away from the speaker.
 //
 //  Output: the decoded speech at 48 kHz, time locked to the input (one
-//  output sample per input sample), with a small buffer that absorbs
-//  the codec's 20 ms frames (and the TDMA bursts of DMR).
+//  output sample per input sample), with a buffer that absorbs the
+//  codec's 20 ms frames, the TDMA bursts of DMR and the blocks of the
+//  decoder thread (it grows when it runs dry in the middle of a call).
+//
+//  Events: the data a station sends beside its speech (DMR text messages,
+//  data headers, CSBK, talker alias, GPS; D-STAR text and position) go
+//  to onEvent as log lines.
 //
 //  Thread safety: process() on one thread (DSP or decoder), status()
 //  and the settings from any thread.
@@ -169,28 +180,45 @@ inline std::string dmrCsbkName(int fid, int op) {
     return b;
 }
 
-// --- Buffer of decoded speech (48 kHz), with a small pre-buffer ---
+// --- Buffer of decoded speech (48 kHz), with a pre-buffer ---
+// The speech is pushed by the decoder thread a block of I/Q at a time and pulled by the DSP
+// thread a block at a time, so the pre-buffer must hold at least a block and the lag of the
+// decoder thread. It starts at two of the largest pulls seen plus 80 ms, and grows by 60 ms
+// (up to 0.5 s) whenever it runs dry in the middle of a call (speech again within half a second).
 class VoiceFifo {
     std::deque<float> q;
     bool playing = false;
-    static constexpr size_t PREBUF = 48000 / 8;     // 125 ms
+    size_t maxPull = 0;
+    size_t extra = 0;
+    long long dryAt = -1;        // pulled samples when it last ran dry while playing
+    long long pulled = 0;
+    static constexpr size_t MINBUF = 48000 * 3 / 20;   // 150 ms
+    static constexpr size_t MAXBUF = 48000 / 2;
     static constexpr size_t MAXLEN = 48000 * 2;
+    size_t prebuf() const { return std::min(MAXBUF, std::max(MINBUF, 2 * maxPull + 48000 * 8 / 100) + extra); }
 public:
     void push(const float* s, size_t n) {
+        if (!playing && dryAt >= 0 && pulled - dryAt < 48000 / 2 && q.empty()) {
+            extra = std::min(MAXBUF, extra + 48000 * 6 / 100);   // a gap in a call: more margin
+            dryAt = -1;
+        }
         for (size_t i = 0; i < n; i++) q.push_back(s[i]);
         while (q.size() > MAXLEN) q.pop_front();
     }
     // Adds up to n samples to out (zeros when nothing is ready). Returns true while it plays.
     bool pull(float* out, size_t n, float gain) {
-        if (!playing && q.size() >= PREBUF) playing = true;
+        maxPull = std::max(maxPull, n);
+        pulled += (long long)n;
+        if (!playing && q.size() >= prebuf()) playing = true;
         if (!playing) return false;
         const size_t k = std::min(n, q.size());
         for (size_t i = 0; i < k; i++) { out[i] += q.front() * gain; q.pop_front(); }
-        if (q.empty()) playing = false;
+        if (q.empty()) { playing = false; dryAt = pulled; }
         return k > 0;
     }
-    void clear() { q.clear(); playing = false; }
+    void clear() { q.clear(); playing = false; dryAt = -1; }
     size_t size() const { return q.size(); }
+    size_t prebufSamples() const { return prebuf(); }
 };
 
 // --- 8 kHz -> 48 kHz (x6), polyphase windowed sinc, 3.6 kHz ---
@@ -238,6 +266,7 @@ inline std::string wallClock() {
 class Core {
 public:
     std::function<void(const Call&)> onCall;   // a call started (open), changed or ended (open = false)
+    std::function<void(const std::string&)> onEvent;   // data sent beside the speech, as a log line
 
     Core() { configure(); }
 
@@ -341,10 +370,27 @@ private:
         std::string lastKey;
     } talk[2];
 
+    // what has been logged as events (per slot), so each item is logged once
+    struct Logged {
+        unsigned int dataSeq = 0, textSeq = 0;
+        std::string alias, aliasSeen;
+        long long aliasSince = -1;
+        double lat = 1e9, lon = 1e9;
+        std::string csbkKey;
+        long long csbkAt = -1;
+        unsigned int csbkCount = 0;
+    } logged[2];
+    std::string dstarText, dstarTextSeen, dstarLoc;
+    long long dstarTextSince = -1;
+
 #ifdef ENABLE_DSDCC
     struct Inst {
         DSDcc::DSDDecoder d;
         unsigned int dmrSeq[2] = {0, 0};
+        long long confirmedAt = -1;   // sampleCount when the signal was last confirmed
+        long long crcWindowAt = 0;    // the CRC score at the start of the current second
+        unsigned long long crcWindowBase = 0;
+        unsigned long long crcLast = 0;
     };
     std::vector<std::unique_ptr<Inst>> inst;
 
@@ -373,7 +419,8 @@ private:
         locked = -1;
         lastSyncSample = -1;
         { std::lock_guard<std::mutex> f(fifoMtx); fifo[0].clear(); fifo[1].clear(); }
-        for (int i = 0; i < 2; i++) { up[i].reset(); endTalk(i); talk[i] = Talk(); }
+        for (int i = 0; i < 2; i++) { up[i].reset(); endTalk(i); talk[i] = Talk(); logged[i] = Logged(); }
+        dstarText.clear(); dstarTextSeen.clear(); dstarLoc.clear(); dstarTextSince = -1;
         st = Status();
 #ifdef ENABLE_DSDCC
         using D = DSDcc::DSDDecoder;
@@ -421,6 +468,12 @@ private:
                 if (!mute) {
                     upBuf.clear();
                     up[sl].process(a, cnt, upBuf);
+                    // soft limiter: the peaks of the speech (and the overshoot of the
+                    // interpolation) round off above 3/4 of full scale instead of clipping
+                    for (float& v : upBuf) {
+                        const float m = std::fabs(v);
+                        if (m > 0.75f) v = std::copysign(0.75f + 0.25f * std::tanh((m - 0.75f) * 4.0f), v);
+                    }
                     std::lock_guard<std::mutex> f(fifoMtx);
                     fifo[sl].push(upBuf.data(), upBuf.size());
                 }
@@ -437,24 +490,42 @@ private:
         return s.substr(i);
     }
 
+    // Is the signal of an instance real? Speech through the voice gate, or signalling whose CRCs
+    // check: a score of 4 within a second (one CRC of 12 bits or more, or several weak ones).
+    // A sync pattern alone proves nothing: the short ones (dPMR, NXDN) match noise all the time.
+    void confirm(Inst& in) {
+        using D = DSDcc::DSDDecoder;
+        D& d = in.d;
+        bool ok = d.voiceGateOpen(0) || d.voiceGateOpen(1);
+        const unsigned long long score = d.getCrcScore();
+        if (secs(sampleCount - in.crcWindowAt) > 1.0) { in.crcWindowAt = sampleCount; in.crcWindowBase = in.crcLast; }
+        if (score != in.crcLast && score - in.crcWindowBase >= 4) ok = true;
+        in.crcLast = score;
+        if (ok && d.getSyncType() != D::DSDSyncNone) in.confirmedAt = sampleCount;
+    }
+
     // Every 10 ms: which instance has the signal, and what it says
     void poll() {
         using D = DSDcc::DSDDecoder;
-        int best = -1;
         for (size_t k = 0; k < inst.size(); k++) {
             if (locked >= 0 && (int)k != locked) continue;
-            if (inst[k]->d.getSyncType() != D::DSDSyncNone) { best = (int)k; break; }
+            confirm(*inst[k]);
         }
+        auto recent = [&](const Inst& in, double s) { return in.confirmedAt >= 0 && secs(sampleCount - in.confirmedAt) < s; };
+        // the signal is gone: listen with all decoders again
+        if (locked >= 0 && !recent(*inst[locked], 2.0)) locked = -1;
+        int best = locked;
+        if (best < 0)
+            for (size_t k = 0; k < inst.size(); k++)
+                if (recent(*inst[k], 0.5)) { best = (int)k; break; }
         if (best >= 0) {
-            lastSyncSample = sampleCount;
+            if (inst[best]->d.getSyncType() != D::DSDSyncNone) lastSyncSample = sampleCount;
             if (locked < 0 && inst.size() > 1) {
                 locked = best;
                 for (size_t k = 0; k < inst.size(); k++) if ((int)k != best) inst[k]->d.resetAudio1(), inst[k]->d.resetAudio2();
             }
         }
         const double since = lastSyncSample < 0 ? 1e9 : secs(sampleCount - lastSyncSample);
-        // the signal is gone: listen with all decoders again
-        if (locked >= 0 && since > 2.0) locked = -1;
 
         // end of calls: no speech for 0.6 s
         for (int sl = 0; sl < 2; sl++)
@@ -462,7 +533,7 @@ private:
 
         st.sinceSync = since;
         st.sync = since < 0.3;
-        const int src = best >= 0 ? best : (locked >= 0 ? locked : -1);
+        const int src = best;
         if (src < 0) {
             if (!st.sync) for (int sl = 0; sl < 2; sl++) { st.slot[sl].voice = false; st.slot[sl].data = false; }
             return;
@@ -491,6 +562,97 @@ private:
                 if (onCall) onCall(c);
             }
             t.call.seconds = v.voiceSec;
+        }
+    }
+
+    void event(const std::string& line) { if (onEvent) onEvent(line); }
+
+    static const char* dpfName(int dpf) {
+        switch (dpf) {
+        case 0: return "UDT";
+        case 1: return "response";
+        case 2: return "unconfirmed";
+        case 3: return "confirmed";
+        case 13: return "short data (defined)";
+        case 14: return "short data (raw / status)";
+        case 15: return "proprietary";
+        default: return "format ?";
+        }
+    }
+    static const char* sapName(int sap) {
+        switch (sap) {
+        case 0: return "UDT";
+        case 2: return "TCP/IP (compressed)";
+        case 3: return "UDP/IP (compressed)";
+        case 4: return "IP";
+        case 5: return "ARP";
+        case 9: return "proprietary";
+        case 10: return "short data";
+        default: return "SAP ?";
+        }
+    }
+    static const char* udtFormatName(int f) {
+        switch (f) {
+        case 0: return "binary";
+        case 1: return "addresses";
+        case 2: return "BCD";
+        case 3: return "7-bit text";
+        case 4: return "8-bit text";
+        case 5: return "NMEA position";
+        case 6: return "IP address";
+        case 7: return "UTF-16 text";
+        case 8: return "manufacturer";
+        default: return "mixed";
+        }
+    }
+
+    // The DMR data of a slot that has not been logged yet
+    void dmrEvents(int sl, const DSDcc::DSDDMR::SlotInfo& si, int cc, bool ms) {
+        Logged& lg = logged[sl];
+        char b[96];
+        std::snprintf(b, sizeof(b), "DMR%s CC%d  ", ms ? "" : (sl ? " TS2" : " TS1"), cc);
+        const std::string pre = b;
+        auto addr = [](unsigned int src, unsigned int dst, bool group) {
+            return std::to_string(src) + " > " + (group ? "TG " : "ID ") + std::to_string(dst);
+        };
+        if (si.textSeq != lg.textSeq) {
+            lg.textSeq = si.textSeq;
+            event(pre + "SMS  " + addr(si.textSrc, si.textDst, si.textGroup) + "  \"" + si.text + "\"  (" + si.textKind + ")");
+        }
+        if (si.dataSeq != lg.dataSeq) {
+            lg.dataSeq = si.dataSeq;
+            std::string d = pre + "DATA  " + addr(si.dataSrc, si.dataDst, si.dataGroup) + "  " + dpfName(si.dataDpf);
+            if (si.dataDpf == 0) d += std::string(", ") + udtFormatName(si.dataUdtFormat);
+            else if (si.dataDpf >= 2 && si.dataDpf <= 3) d += std::string(", ") + sapName(si.dataSap);
+            if (si.dataBlocks > 0) d += ", " + std::to_string(si.dataBlocks) + (si.dataBlocks == 1 ? " block" : " blocks");
+            event(d);
+        }
+        // CSBK: once per kind and addresses (repeated control blocks only every 30 s)
+        if (si.csbkOpcode >= 0 && si.csbkCount != lg.csbkCount) {
+            lg.csbkCount = si.csbkCount;
+            const bool addressed = si.csbkFid == 0 && (si.csbkOpcode == 0x3D || si.csbkOpcode == 0x04 || si.csbkOpcode == 0x05);
+            const std::string key = std::to_string(si.csbkFid) + "/" + std::to_string(si.csbkOpcode) +
+                                    (addressed ? "/" + std::to_string(si.csbkSrc) + "/" + std::to_string(si.csbkDst) : "");
+            if (key != lg.csbkKey || secs(sampleCount - lg.csbkAt) > 30.0) {
+                std::string c = pre + "CSBK  " + dmrCsbkName(si.csbkFid, si.csbkOpcode);
+                if (addressed) c += "  " + std::to_string(si.csbkSrc) + " > " + std::to_string(si.csbkDst);
+                event(c);
+                lg.csbkKey = key;
+                lg.csbkAt = sampleCount;
+            }
+        }
+        // talker alias: when it has stopped growing for a second
+        const std::string alias = trim(si.alias);
+        if (alias != lg.aliasSeen) { lg.aliasSeen = alias; lg.aliasSince = sampleCount; }
+        else if (!alias.empty() && alias != lg.alias && secs(sampleCount - lg.aliasSince) > 1.0) {
+            lg.alias = alias;
+            event(pre + "ALIAS  " + std::to_string(si.src) + "  \"" + alias + "\"");
+        }
+        if (si.haveGps && (std::fabs(si.lat - lg.lat) > 1e-5 || std::fabs(si.lon - lg.lon) > 1e-5)) {
+            lg.lat = si.lat; lg.lon = si.lon;
+            static const char* errs[8] = {"< 2 m", "< 20 m", "< 200 m", "< 2 km", "< 20 km", "< 200 km", "> 200 km", "?"};
+            std::snprintf(b, sizeof(b), "GPS  %u  %.5f %.5f  (%s)", si.src, si.lat, si.lon, errs[si.posErr & 7]);
+            event(pre + b);
         }
     }
 
@@ -539,6 +701,7 @@ private:
                 if (si.fid > 0) { const char* fn = dmrFidName(si.fid); ex += std::string("features: ") + (fn ? fn : "manufacturer"); }
                 v.extra = trim(ex);
                 const bool voiceNow = talk[sl].active && secs(sampleCount - talk[sl].lastVoice) < 0.3;
+                dmrEvents(sl, si, (int)dmr.getSlotTypeColorCode(), stationType == D::DSDMobileStation);
                 v.data = !voiceNow && si.lastDataType >= 0 && si.lastDataType != 9;
                 if (voiceNow) v.activity = v.encrypted ? "Voice (encrypted)" : "Voice";
                 else if (si.lastDataType == 9) v.activity = "Idle";
@@ -581,6 +744,17 @@ private:
             if (!r2.empty()) st.fields.push_back({"RPT2", r2});
             const std::string loc = trim(ds.getLocator());
             if (!loc.empty()) st.fields.push_back({"Locator", loc});
+            // events: the slow data text and the position, once each
+            const std::string who = v.from.empty() ? "?" : v.from;
+            if (v.alias != dstarTextSeen) { dstarTextSeen = v.alias; dstarTextSince = sampleCount; }
+            else if (!v.alias.empty() && v.alias != dstarText && secs(sampleCount - dstarTextSince) > 1.0) {
+                dstarText = v.alias;
+                event("D-STAR  TEXT  " + who + (v.to.empty() ? "" : " > " + v.to) + "  \"" + v.alias + "\"");
+            }
+            if (!loc.empty() && loc != dstarLoc) {
+                dstarLoc = loc;
+                event("D-STAR  POSITION  " + who + "  " + loc);
+            }
             v.activity = talk[0].active ? "Voice" : "Header / data";
         } else if (sy == D::DSDSyncYSF) {
             st.proto = "YSF";

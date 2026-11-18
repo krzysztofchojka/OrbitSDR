@@ -612,7 +612,7 @@ void DSDNXDN::processRCCH(int index, unsigned char dibit)
         {
             m_cac.unpuncture();
 
-            if (m_cac.decode())
+            if (m_cac.decode() && (m_dsdDecoder->crcPassed(4), true))
             {
                 m_ran = m_cac.getRAN();
                 m_currentMessage.setFromCAC(&m_cac.getData()[1]);
@@ -676,7 +676,7 @@ void DSDNXDN::processRCCH(int index, unsigned char dibit)
         {
             m_cacShort.unpuncture();
 
-            if (m_cacShort.decode())
+            if (m_cacShort.decode() && (m_dsdDecoder->crcPassed(4), true))
             {
                 m_ran = m_cacShort.getRAN();
                 m_currentMessage.setFromCACShort(&m_cacShort.getData()[1]);
@@ -709,7 +709,7 @@ void DSDNXDN::processRCCH(int index, unsigned char dibit)
         {
             m_cacLong.unpuncture();
 
-            if (m_cacLong.decode())
+            if (m_cacLong.decode() && (m_dsdDecoder->crcPassed(4), true))
             {
                 m_ran = m_cacLong.getRAN();
                 m_currentMessage.setFromCACLong(&m_cacLong.getData()[1]);
@@ -749,7 +749,7 @@ void DSDNXDN::processRTDCH(int index, unsigned char dibit)
         {
             m_sacch.unpuncture();
 
-            if (m_sacch.decode())
+            if (m_sacch.decode() && (m_dsdDecoder->crcPassed(1), true))
             {
                 m_ran = m_sacch.getRAN();
 
@@ -833,7 +833,7 @@ void DSDNXDN::processRTDCH(int index, unsigned char dibit)
         {
             m_udch.unpuncture();
 
-            if (m_udch.decode())
+            if (m_udch.decode() && (m_dsdDecoder->crcPassed(4), true))
             {
                 m_ran = m_udch.getRAN();
                 m_currentMessage.setFromFACCH2(&m_udch.getData()[1]);
@@ -873,7 +873,7 @@ void DSDNXDN::processFACCH1(int index, unsigned char dibit)
     {
         m_facch1.unpuncture();
 
-        if (m_facch1.decode())
+        if (m_facch1.decode() && (m_dsdDecoder->crcPassed(4), true))
         {
             m_currentMessage.setFromFACCH1(m_facch1.getData());
             m_messageType = m_currentMessage.getMessageType();

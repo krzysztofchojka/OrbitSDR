@@ -17,6 +17,7 @@
 #ifndef DSDCC_DSD_DECODER_H_
 #define DSDCC_DSD_DECODER_H_
 
+#include <algorithm>
 #include "dsd_opts.h"
 #include "dsd_state.h"
 #include "dsd_logger.h"
@@ -226,6 +227,16 @@ public:
     int getSamplesPerSymbol() const { return m_dsdSymbol.getSamplesPerSymbol(); }
     DSDRate getDataRate() const { return m_dataRate; };
     bool getVoice1On() const { return m_voice1On; }
+    // OrbitSDR: the voice gate of a slot (0, 1) passes speech: the frames are real voice, not noise
+    bool voiceGateOpen(int slot) const { return slot ? m_mbeDecoder2.gateOpen() : m_mbeDecoder1.gateOpen(); }
+    // OrbitSDR: the sample count at the last voice frame the gate passed (0: none yet)
+    unsigned long long lastGoodVoiceSample() const { return std::max(m_mbeDecoder1.lastGoodSample(), m_mbeDecoder2.lastGoodSample()); }
+    unsigned long long getSampleCount() const { return m_sampleCount; }
+    // OrbitSDR: a CRC of the signalling checked. weight: 4 for a CRC that noise passes less than
+    // once in 4096 tries (12 bits and more), 2 for CRC8, 1 for CRC6 / CRC7. The owner reads the
+    // score: a rise of 4 or more in a second says that the signal is real.
+    void crcPassed(int weight) { m_crcScore += (unsigned long long)weight; }
+    unsigned long long getCrcScore() const { return m_crcScore; }
     bool getVoice2On() const { return m_voice2On; }
     void setTDMAStereo(bool tdmaStereo);
     void formatStatusText(char *statusText);
@@ -305,6 +316,8 @@ private:
     int m_t;
     int m_squelchTimeoutCount;
     int m_nxdnInterSyncCount;
+    unsigned long long m_sampleCount; //!< OrbitSDR: input samples so far (the voice gate's clock)
+    unsigned long long m_crcScore;    //!< OrbitSDR: checks passed, weighted by their strength
     // Symbol extraction and operations
     DSDSymbol m_dsdSymbol;
     // MBE decoder

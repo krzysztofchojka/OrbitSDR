@@ -56,6 +56,9 @@ DSDMBEDecoder::DSDMBEDecoder(DSDDecoder *dsdDecoder) :
     m_upsample = 0;
 
 	initMbeParms();
+    m_gateLastFrame = 0;
+    m_gateLastGood = 0;
+    resetGate();
 
 	memset(ambe_d, 0, 49);
 	memset(imbe_d, 0, 88);
@@ -83,12 +86,71 @@ void DSDMBEDecoder::initMbeParms()
     }
 }
 
+void DSDMBEDecoder::resetGate()
+{
+    m_gateOpen = false;
+    m_gateBadRun = 0;
+    m_gatePendingCount = 0;
+    m_gatePendingGood = 0;
+}
+
+// The frame just decoded (m_audio_out_temp_buf) through the voice gate
+void DSDMBEDecoder::gateFrame(int quality)
+{
+    const bool good = quality >= 0 && quality <= GATE_GOOD;
+    const bool bad = quality >= GATE_BAD;
+    if (good) m_gateLastGood = m_dsdDecoder->m_sampleCount;
+
+    if (m_gateOpen)
+    {
+        processAudio();
+        m_gateBadRun = bad ? m_gateBadRun + 1 : 0;
+        if (m_gateBadRun >= GATE_CLOSE) resetGate();
+        return;
+    }
+
+    // closed: the frame waits (the oldest goes when the queue is full)
+    if (m_gatePendingCount == GATE_PENDING)
+    {
+        if (m_gatePendingIsGood[0]) m_gatePendingGood--;
+        memmove(m_gatePending[0], m_gatePending[1], sizeof(m_gatePending[0]) * (GATE_PENDING - 1));
+        memmove(m_gatePendingIsGood, m_gatePendingIsGood + 1, sizeof(bool) * (GATE_PENDING - 1));
+        m_gatePendingCount--;
+    }
+    memcpy(m_gatePending[m_gatePendingCount], m_audio_out_temp_buf, sizeof(m_audio_out_temp_buf));
+    m_gatePendingIsGood[m_gatePendingCount] = good;
+    m_gatePendingCount++;
+    if (good) m_gatePendingGood++;
+
+    // a frame of unknown quality (the protocol checked it with its own CRC) opens it at once
+    if (m_gatePendingGood >= 2 || quality < 0)
+    {
+        m_gateOpen = true;
+        m_gateBadRun = 0;
+        for (int i = 0; i < m_gatePendingCount; i++)
+        {
+            memcpy(m_audio_out_temp_buf, m_gatePending[i], sizeof(m_audio_out_temp_buf));
+            processAudio();
+        }
+        m_gatePendingCount = 0;
+        m_gatePendingGood = 0;
+    }
+}
+
 void DSDMBEDecoder::processFrame(char imbe_fr[8][23], char ambe_fr[4][24], char imbe7100_fr[7][24])
 {
     if (!m_dsdDecoder->m_mbelibEnable) {
         return;
     }
 #ifdef DSD_USE_MBELIB
+    // a new transmission (or the first frames after a pause): the codec starts afresh
+    const unsigned long long now = m_dsdDecoder->m_sampleCount;
+    if (m_gateLastFrame == 0 || now - m_gateLastFrame > GATE_GAP)
+    {
+        resetGate();
+        mbe_initMbeParms(m_mbelibParms->m_cur_mp, m_mbelibParms->m_prev_mp, m_mbelibParms->m_prev_mp_enhanced);
+    }
+    m_gateLastFrame = now;
     memset((void *) imbe_d, 0, 88);
 
     if (m_dsdDecoder->m_mbeRate == DSDDecoder::DSDMBERate7200x4400)
@@ -122,16 +184,25 @@ void DSDMBEDecoder::processFrame(char imbe_fr[8][23], char ambe_fr[4][24], char 
         m_dsdDecoder->getLogger().log("%s", m_err_str);
     }
 
-    processAudio();
+    gateFrame(m_errs2);
 #endif
 }
 
-void DSDMBEDecoder::processData(char imbe_data[88], char ambe_data[49])
+void DSDMBEDecoder::processData(char imbe_data[88], char ambe_data[49], int quality)
 {
     if (!m_dsdDecoder->m_mbelibEnable) {
         return;
     }
 #ifdef DSD_USE_MBELIB
+    const unsigned long long now = m_dsdDecoder->m_sampleCount;
+    if (m_gateLastFrame == 0 || now - m_gateLastFrame > GATE_GAP)
+    {
+        resetGate();
+        mbe_initMbeParms(m_mbelibParms->m_cur_mp, m_mbelibParms->m_prev_mp, m_mbelibParms->m_prev_mp_enhanced);
+    }
+    m_gateLastFrame = now;
+    m_errs = 0;
+    m_errs2 = quality > 0 ? quality : 0;
     if (m_dsdDecoder->m_mbeRate == DSDDecoder::DSDMBERate4400)
     {
         mbe_processImbe4400Dataf(m_audio_out_temp_buf, &m_errs,
@@ -160,7 +231,7 @@ void DSDMBEDecoder::processData(char imbe_data[88], char ambe_data[49])
         m_dsdDecoder->getLogger().log("%s", m_err_str);
     }
 
-    processAudio();
+    gateFrame(quality);
 #endif
 }
 
