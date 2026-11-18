@@ -2,7 +2,8 @@
 
 // =====================================================================
 //  Positions heard by the decoders (AIS ships, APRS stations, ACARS / ADS-B
-//  aircraft, FT8 / WSPR stations by their locator), shown on the satellite map.
+//  aircraft, FT8 / WSPR stations by their locator, TETRA radios' LIP reports),
+//  shown on the satellite map.
 //
 //  Decoders call positionBus().report(...) from their DSP thread; the map
 //  reads snapshot() on the UI thread. Every report is stamped with the
@@ -19,7 +20,7 @@
 #include <atomic>
 #include <chrono>
 
-enum class PosKind { AIS = 0, APRS = 1, ACARS = 2, ADSB = 3, HF = 4, Count = 5 };
+enum class PosKind { AIS = 0, APRS = 1, ACARS = 2, ADSB = 3, HF = 4, TETRA = 5, Count = 6 };
 
 inline const char* posKindName(PosKind k) {
     switch (k) {
@@ -28,6 +29,7 @@ inline const char* posKindName(PosKind k) {
     case PosKind::ACARS: return "ACARS";
     case PosKind::ADSB: return "ADS-B";
     case PosKind::HF: return "HF";   // FT8 / FT4 / WSPR stations (grid locator)
+    case PosKind::TETRA: return "TETRA";   // LIP position reports of TETRA radios
     default: return "?";
     }
 }

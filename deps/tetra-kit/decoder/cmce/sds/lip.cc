@@ -83,7 +83,7 @@ void Lip::parseShortLocationReport(Pdu pdu)
 
         uint32_t latitude = pdu.getValue(pos, 24);
         pos += 24;
-        m_report->add("latitude uint32", longitude);
+        m_report->add("latitude uint32", latitude);
         m_report->add("latitude", decodeLipLatitude(latitude));
 
         uint8_t positionError = pdu.getValue(pos, 3);
@@ -228,10 +228,17 @@ double Lip::decodeLipHorizontalVelocity(uint8_t val)
 {
     double res;
 
+    // km/h. OrbitSDR fix: 0..28 are km/h directly, above that v = C * (1 + x)^(V - A) + B
+    // (upstream had the exponent inverted, A - V, and no linear part; the two parts meet
+    // at 28 km/h: 16 * 1.038^15 = 28.0)
     if (val == 127)
     {
         // unknown
         res = -1.0;
+    }
+    else if (val <= 28)
+    {
+        res = (double)val;
     }
     else
     {
@@ -240,7 +247,7 @@ double Lip::decodeLipHorizontalVelocity(uint8_t val)
         const double A = 13.0;
         const double B = 0.0;
 
-        res = C * pow(1.0 + x, A - (double)val) + B;
+        res = C * pow(1.0 + x, (double)val - A) + B;
     }
 
     return res;

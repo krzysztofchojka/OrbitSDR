@@ -11,6 +11,7 @@
 #include <algorithm>
 
 #include "TetraVoice.h"
+#include "../../Core/PositionBus.h"
 
 // =====================================================================
 //  tetra::Core - OrbitSDR's in-process wrapper around the ported tetra-kit
@@ -322,10 +323,29 @@ private:
             p.lat  = std::atof(r.get("latitude").c_str());
             p.lon  = std::atof(r.get("longitude").c_str());
             if (p.lat == 0.0 && p.lon == 0.0) return;   // no fix: nothing to place
-            std::string dir = r.get("direction of travel");
+            const std::string dir = r.get("direction of travel");       // "22.5 NNE"
+            const std::string vel = r.get("horizontal_velocity");       // km/h, -1 = unknown
+            const std::string err = r.get("position error");            // "< 20 m"
+            const double kmh = vel.empty() ? -1.0 : std::atof(vel.c_str());
             if (!dir.empty()) p.extra = "heading " + dir;
+            if (kmh >= 0.0) p.extra += (p.extra.empty() ? "" : "  ") + std::to_string((int)(kmh + 0.5)) + " km/h";
+            if (!err.empty() && err != "unknown") p.extra += (p.extra.empty() ? "" : "  ") + std::string("error ") + err;
             m_st.lip.push_front(p);
             if (m_st.lip.size() > MAX_LIP) m_st.lip.pop_back();
+
+            // on the map (a radio's position is content: only while content is shown)
+            if (m_contentOn) {
+                PosReport pr;
+                pr.kind = PosKind::TETRA;
+                pr.id = p.from.empty() ? std::string("?") : p.from;
+                pr.label = "SSI " + pr.id;
+                pr.info = (m_st.net.valid ? "MCC " + std::to_string(m_st.net.mcc) + " MNC " + std::to_string(m_st.net.mnc) + "  " : std::string()) + p.extra;
+                pr.lat = p.lat;
+                pr.lon = p.lon;
+                if (!dir.empty()) pr.courseDeg = std::atof(dir.c_str());
+                if (kmh >= 0.0) pr.speedKn = kmh / 1.852;
+                positionBus().report(pr);
+            }
         }
     }
 #endif

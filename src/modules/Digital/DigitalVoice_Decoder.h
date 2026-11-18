@@ -444,6 +444,7 @@ public:
             showTetraContent = !showTetraContent;
             btnTetra->setActive(showTetraContent);
             btnTetra->setText(showTetraContent ? "TETRA content: shown" : "TETRA content: hidden");
+            if (!showTetraContent) positionBus().clear(PosKind::TETRA);   // hidden again: radios leave the map
         };
         btnClear = std::make_shared<SdrButton>(60.0f, 22.0f, "Clear", *font);
         btnClear->onClick = [this]() {

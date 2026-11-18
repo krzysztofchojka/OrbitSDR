@@ -119,8 +119,9 @@ public:
         baseLayer = std::clamp(s.getInt("map_layer", 0), 0, 2);
         placeNames = s.getBool("map_place_names", true);
         const int kinds = s.getInt("map_pos_kinds", 15);
-        for (int i = 0; i < (int)PosKind::Count; i++) showKind[i] = (kinds >> i) & 1;
+        for (int i = 0; i < TOGGLE_KINDS; i++) showKind[i] = (kinds >> i) & 1;
         showKind[(int)PosKind::HF] = s.getBool("map_pos_hf", true);   // added later: own key, on by default
+        showKind[(int)PosKind::TETRA] = true;   // rare: always shown, no toolbar toggle
         posWindowIdx = std::clamp(s.getInt("map_pos_window", 2), 0, (int)POS_WINDOWS.size() - 1);
         syncPanelFromState();
     }
@@ -137,7 +138,7 @@ public:
         s.set("map_layer", baseLayer);
         s.set("map_place_names", placeNames);
         int kinds = 0;
-        for (int i = 0; i < (int)PosKind::Count; i++) if (showKind[i]) kinds |= 1 << i;
+        for (int i = 0; i < TOGGLE_KINDS; i++) if (showKind[i]) kinds |= 1 << i;
         s.set("map_pos_kinds", kinds);
         s.set("map_pos_hf", showKind[(int)PosKind::HF]);
         s.set("map_pos_window", posWindowIdx);
@@ -184,14 +185,17 @@ private:
     int baseLayer = 0;          // 0 satellite photos, 1 street map, 2 Blue Marble only
     bool placeNames = true;     // borders + names over the photos
     std::set<int> layersDrawn;  // for the attribution line
-    bool showKind[(int)PosKind::Count] = {true, true, true, true, true};
+    bool showKind[(int)PosKind::Count] = {true, true, true, true, true, true};
     int posWindowIdx = 2;
     inline static const std::vector<std::pair<double, const char*>> POS_WINDOWS = {
         {15 * 60.0, "15 min"}, {3600.0, "1 h"}, {6 * 3600.0, "6 h"}, {24 * 3600.0, "24 h"}, {1e12, "all"}};
     std::vector<PosTrack> posTracks;   // this frame
     int hoveredPos = -1;               // index into posTracks
     sf::Vector2f hoveredPosUi;
-    SdrButton tbKind[(int)PosKind::Count] = {{64, 24, "AIS", font}, {64, 24, "APRS", font}, {70, 24, "ACARS", font}, {66, 24, "ADS-B", font}, {56, 24, "HF", font}};
+    // kinds with an on/off button on the toolbar: all before TETRA (TETRA LIP positions are
+    // rare and always shown, without a button)
+    static constexpr int TOGGLE_KINDS = (int)PosKind::TETRA;
+    SdrButton tbKind[TOGGLE_KINDS] = {{64, 24, "AIS", font}, {64, 24, "APRS", font}, {70, 24, "ACARS", font}, {66, 24, "ADS-B", font}, {56, 24, "HF", font}};
     SdrButton tbWindow{92, 24, "Last 6 h", font};
 
     // map picture
@@ -541,7 +545,7 @@ private:
         tbNow.onClick = [this]() { simOffsetSec = 0; };
         tbP10.onClick = [this]() { simOffsetSec += 600; };
         tbP1h.onClick = [this]() { simOffsetSec += 3600; };
-        for (int i = 0; i < (int)PosKind::Count; i++) tbKind[i].onClick = [this, i]() { showKind[i] = !showKind[i]; };
+        for (int i = 0; i < TOGGLE_KINDS; i++) tbKind[i].onClick = [this, i]() { showKind[i] = !showKind[i]; };
         tbWindow.onClick = [this]() { posWindowIdx = (posWindowIdx + 1) % (int)POS_WINDOWS.size(); };
     }
 
@@ -1235,6 +1239,7 @@ private:
         case PosKind::AIS: return p.symCode == 'B' ? Icon::Square : p.symCode == 'N' ? Icon::Diamond : Icon::Ship;
         case PosKind::ACARS: case PosKind::ADSB: return Icon::Plane;
         case PosKind::HF: return Icon::Tower;
+        case PosKind::TETRA: return Icon::Person;   // a handheld / vehicle radio
         default: break;
         }
         const std::string n = aprspos::symbolName(p.symTable, p.symCode);
@@ -1256,6 +1261,7 @@ private:
         case PosKind::ACARS: return sf::Color(215, 150, 255);
         case PosKind::ADSB: return sf::Color(255, 220, 0);
         case PosKind::HF: return sf::Color(120, 235, 140);
+        case PosKind::TETRA: return sf::Color::White;
         default: return sf::Color::White;
         }
     }
@@ -1947,7 +1953,7 @@ private:
             rx -= tbWindow.shape.getSize().x;
             tbWindow.setPosition(rx, 6); tbWindow.draw(*win);
             rx -= 8.0f;
-            for (int i = (int)PosKind::Count - 1; i >= 0; i--) {
+            for (int i = TOGGLE_KINDS - 1; i >= 0; i--) {
                 const size_t n = positionBus().count((PosKind)i);
                 tbKind[i].setText(std::string(posKindName((PosKind)i)) + (n ? " " + std::to_string(n) : ""));
                 tbKind[i].setActive(showKind[i]);
