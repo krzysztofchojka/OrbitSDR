@@ -99,7 +99,7 @@ private:
         tetra = false;
         if (envCv > 0.15 && tetraRatio > 8.0) {
             tetra = true;
-            verdict = "TETRA (pi/4-DQPSK, 18 ksym/s): not decoded. Networks are usually encrypted (TEA)";
+            verdict = "TETRA (pi/4-DQPSK, 18 ksym/s)";
         } else if (envCv < 0.3 && devHz < 6000.0) {
             // the lowest rate with a clear line (the transitions also show its harmonics)
             int best = -1;

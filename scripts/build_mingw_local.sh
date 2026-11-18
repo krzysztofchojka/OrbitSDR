@@ -49,6 +49,10 @@ SDR_LIB="$(pwd)/deps/sdrplay/lib/windows"
 . scripts/ft8lib.sh
 # --- DSDcc + mbelib (digital voice: DMR, dPMR, D-STAR, YSF, NXDN): vendored in deps/, compiled once into .cache/ ---
 . scripts/dsdcc.sh
+# --- TETRA metadata decoder (tetra-kit port): vendored in deps/tetra-kit, compiled once into .cache/ ---
+. scripts/tetra.sh
+# --- TETRA speech codec (ETSI EN 300 395-2): downloaded from etsi.org, checked and built once into .cache/ (not in the repo) ---
+. scripts/tetracodec.sh
 
 # 4. Compilation
 echo "------------------------------------------"
@@ -63,6 +67,8 @@ g++ -std=c++17 -O3 \
     $RTL433_FLAGS \
     $FT8LIB_FLAGS \
     $DSDCC_FLAGS \
+    $TETRA_FLAGS \
+    $TETRACODEC_FLAGS \
     -I"$SFML_PATH/include" \
     -I"$SDR_INC" \
     "$SRC_DIR/main.cpp" \
@@ -70,6 +76,8 @@ g++ -std=c++17 -O3 \
     $RTL433_LIB \
     $FT8LIB_LIB \
     $DSDCC_LIB \
+    $TETRA_LIB \
+    $TETRACODEC_LIB \
     -o "$OUT_FILE" \
     -L"$SFML_PATH/lib" \
     -lcomdlg32 -lole32 -lws2_32 -lwininet \

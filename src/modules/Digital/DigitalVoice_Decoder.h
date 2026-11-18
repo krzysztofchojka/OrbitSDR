@@ -6,6 +6,8 @@
 #include "../Core/NarrowChannel.h"
 #include "DigitalVoice.h"
 #include "SignalClassifier.h"
+#include "Tetra/TetraPhy.h"
+#include "Tetra/TetraCore.h"
 #include <SFML/Graphics.hpp>
 #include <mutex>
 #include <deque>
@@ -67,7 +69,28 @@ class DigitalVoiceDecoder : public SDRModule {
         dv::SignalClassifier cls;
         double levelDb = -150.0;
         int calls = 0;
+
+        // TETRA pi/4-DQPSK front end (demod + burst sync). Runs only while the
+        // classifier says the channel is TETRA. Proves the demodulator locks on a
+        // real signal before the full tetra-kit decoder stack is wired in.
+        NarrowChannel tet;                 // dedicated 72 kHz (4 samples/symbol) baseband
+        std::vector<std::complex<float>> bbt;
+        tetra::TetraDemod tdemod;
+        tetra::TetraSync tsync;
+        std::shared_ptr<tetra::Core> tcore = std::make_shared<tetra::Core>();   // ported tetra-kit decoder (+ speech)
+        bool   tetReady = false;           // demod configured for the current rate
+        int    tetBursts = 0;
+        double tetCarrierHz = 0.0;
+        double tetEvmDeg = 180.0;
+        int    tetVariant = -1;
+        double tetSrcRate = 0.0;           // group rate feeding the TETRA channel (diagnostics)
     };
+
+    // TETRA occupies only ~+-12 kHz (Rs*(1+roll-off)/2 = 12.15 kHz), so a 54 kHz baseband
+    // (3 samples/symbol) is ample. NarrowChannel resamples from whatever the group rate is,
+    // up or down, so the demod runs even when the decoder is fed a narrow IQ stream.
+    static constexpr double TETRA_RATE    = 54000.0;   // 3 x 18 ksym/s
+    static constexpr double TETRA_MIN_SRC = 40000.0;   // need at least this at the group output
 
     // what the UI draws of a channel
     struct CardView {
@@ -78,6 +101,13 @@ class DigitalVoiceDecoder : public SDRModule {
         dv::Status st;
         std::string verdict;
         bool tetra = false;
+        bool tetLocked = false;
+        int  tetBursts = 0;
+        double tetCarrierHz = 0.0;
+        double tetEvmDeg = 180.0;
+        int  tetVariant = -1;
+        double tetSrcRate = 0.0;
+        tetra::Status tstat;               // decoded TETRA metadata (network info, SDS, LIP)
         dv::SignalClassifier cls;
         ChSettings set;
         int calls = 0;
@@ -89,6 +119,16 @@ class DigitalVoiceDecoder : public SDRModule {
         bool listen;
         bool follow;
         long long freqHz;
+        std::shared_ptr<tetra::Core> tcore;   // TETRA speech of the same channel
+
+        // one speech source per channel, whichever system it decodes
+        bool pull(float* out, size_t n) {
+            bool a = core->pull(out, n);
+            if (tcore && tcore->pull(out, n)) a = true;
+            return a;
+        }
+        bool hasVoice() const { return core->hasVoice() || (tcore && tcore->hasVoice()); }
+        void discardVoice() { core->discardVoice(); if (tcore) tcore->discardVoice(); }
     };
 
     std::mutex mtx;
@@ -113,6 +153,10 @@ class DigitalVoiceDecoder : public SDRModule {
     std::atomic<bool> mixAll {false};
     std::atomic<bool> duckMain {true};
     std::atomic<bool> muteEnc {true};
+    // TETRA SDS / LIP content and subscriber numbers are hidden until switched on
+    // (network info is infrastructure metadata and always shown). Safe default for
+    // a projector: nothing of a third party's traffic appears unless asked for.
+    std::atomic<bool> showTetraContent {false};
 
     // UI
     const sf::Font* font = nullptr;
@@ -124,7 +168,7 @@ class DigitalVoiceDecoder : public SDRModule {
     struct CardHit { int id; sf::FloatRect card, want, listen, close; };
     std::vector<CardHit> cardHits;
     std::vector<CardView> lastCards;
-    std::shared_ptr<SdrButton> btnAdd, btnMix, btnDuck, btnEnc, btnClear, btnLog, btnExport;
+    std::shared_ptr<SdrButton> btnAdd, btnMix, btnDuck, btnEnc, btnTetra, btnClear, btnLog, btnExport;
     DetailsPopup popup;
 
     // ---------------------------------------------------------------
@@ -150,6 +194,18 @@ class DigitalVoiceDecoder : public SDRModule {
         if (s < 60) std::snprintf(b, sizeof(b), "%.0f s", s);
         else std::snprintf(b, sizeof(b), "%d:%02d", (int)s / 60, (int)s % 60);
         return b;
+    }
+
+    // One SDS as text. Hidden: only its kind, no addresses, no payload.
+    static std::string sdsText(const tetra::SdsMsg& m, bool show) {
+        if (!show) return std::string(tetra::sdsKindName(m.kind)) + " (content hidden)";
+        std::string s = (m.from.empty() ? std::string("?") : m.from) + " > " + (m.to.empty() ? std::string("?") : m.to) + "  ";
+        switch (m.kind) {
+        case tetra::SdsMsg::Kind::Text:   s += "\"" + m.text + "\""; break;
+        case tetra::SdsMsg::Kind::Status: s += "status " + m.text; break;
+        default:                          s += "[" + m.proto + "] " + m.text; break;
+        }
+        return s;
     }
 
     static dv::Want nextWant(dv::Want w) {
@@ -202,6 +258,15 @@ class DigitalVoiceDecoder : public SDRModule {
             slot->core->onEvent = [this, raw](const std::string& e) {   // mtx is held: called from process
                 log.add((raw->id == AUDIO_ID ? std::string("audio  ") : mhz(raw->freqHz) + " MHz  ") + e);
             };
+            // TETRA front end: demod -> sync. Later (decoder port) tsync.onBit feeds
+            // TetraDecoder::rxSymbol(); for now we only track burst lock / quality.
+            slot->tdemod.onSymbol = [raw](int q, double, std::complex<float>) { raw->tsync.pushQuadrant(q); };
+            slot->tsync.onBurst = [raw](int) {
+                raw->tetBursts = raw->tsync.burstCount();
+                raw->tetVariant = raw->tsync.conventionVariant();
+            };
+            // resolved downlink bits -> ported tetra-kit decoder (network info, SDS, LIP)
+            slot->tsync.onBit = [raw](uint8_t b) { raw->tcore->rxBit(b); };
         }
         return *slot;
     }
@@ -211,13 +276,14 @@ class DigitalVoiceDecoder : public SDRModule {
         const ChSettings& s = settings[r.id];
         r.core->setWant(s.want);
         r.core->setMuteEncrypted(muteEnc);
+        r.tcore->setContentEnabled(showTetraContent);   // TETRA speech only while content is shown
     }
 
     void publishVoice() {   // mtx is held
         std::vector<VoiceSrc> v;
         for (auto& kv : rxs) {
             const ChSettings& s = settings[kv.first];
-            v.push_back({kv.first, kv.second->core, s.listen, kv.second->follow, kv.second->freqHz});
+            v.push_back({kv.first, kv.second->core, s.listen, kv.second->follow, kv.second->freqHz, kv.second->tcore});
         }
         std::lock_guard<std::mutex> l(voiceMtx);
         voiceList = std::move(v);
@@ -250,11 +316,62 @@ class DigitalVoiceDecoder : public SDRModule {
         std::snprintf(b, sizeof(b), "%.1f dB   envelope %.2f   deviation %.0f Hz", cv.levelDb, cv.cls.envCv, cv.cls.devHz);
         rows.push_back({"Signal", b});
         if (!cv.verdict.empty() && !st.sync) rows.push_back({"Looks like", cv.verdict});
+        if (cv.tetra) {
+            char tb[96];
+            std::snprintf(tb, sizeof(tb), "%s   %d bursts", cv.tetLocked ? "LOCKED" : "searching", cv.tetBursts);
+            rows.push_back({"TETRA sync", tb});
+            std::snprintf(tb, sizeof(tb), "%+.0f Hz residual   EVM %.0f deg%s", cv.tetCarrierHz, cv.tetEvmDeg,
+                          cv.tetVariant >= 0 ? ("   map v" + std::to_string(cv.tetVariant)).c_str() : "");
+            rows.push_back({"TETRA demod", tb});
+            std::snprintf(tb, sizeof(tb), "%.0f kHz baseband (3 samples/symbol)", cv.tetSrcRate / 1000.0);
+            rows.push_back({"TETRA input", tb});
+
+            const tetra::Status& ts = cv.tstat;
+            if (ts.net.valid) {
+                std::snprintf(tb, sizeof(tb), "MCC %u   MNC %u", ts.net.mcc, ts.net.mnc);
+                rows.push_back({"Network", tb});
+                std::snprintf(tb, sizeof(tb), "colour code %u   location area %u", ts.net.colourCode, ts.net.locationArea);
+                rows.push_back({"Cell", tb});
+            }
+            if (ts.reports) rows.push_back({"PDUs decoded", std::to_string(ts.reports)});
+            const bool show = showTetraContent;
+            if (!ts.sds.empty()) rows.push_back({"SDS received", std::to_string(ts.sds.size())});
+            int n = 0;
+            for (const auto& m : ts.sds) {
+                if (n++ >= 6) break;
+                // "2026-11-18T20:47:01Z" -> "20:47:01"
+                rows.push_back({"SDS " + (m.time.size() >= 19 ? m.time.substr(11, 8) : m.time), sdsText(m, show)});
+            }
+            if (!ts.lip.empty()) rows.push_back({"LIP positions", std::to_string(ts.lip.size())});
+            n = 0;
+            for (const auto& p : ts.lip) {
+                if (n++ >= 6) break;
+                if (show) std::snprintf(tb, sizeof(tb), "%s  %.5f, %.5f  %s", p.from.empty() ? "?" : p.from.c_str(), p.lat, p.lon, p.extra.c_str());
+                else std::snprintf(tb, sizeof(tb), "position (content hidden)");
+                rows.push_back({"LIP", tb});
+            }
+            if (!ts.group.empty() || !ts.talker.empty()) {
+                rows.push_back({"Call", show ? (ts.talker.empty() ? std::string("(idle)") : ts.talker) + " > " + ts.group +
+                                                   (ts.callId.empty() ? "" : "   call id " + ts.callId)
+                                             : std::string("(content hidden)")});
+            }
+            if (!tetra::speechAvailable()) rows.push_back({"Speech", "no codec in this build (scripts/tetracodec.sh)"});
+            else if (!show) rows.push_back({"Speech", "off while content is hidden"});
+            else if (ts.voiceFrames) {
+                std::snprintf(tb, sizeof(tb), "time slot %d   %d / %d frames passed CRC%s", ts.voiceTn, ts.voiceGood,
+                              ts.voiceFrames, ts.voice ? "   (speaking)" : "");
+                rows.push_back({"Speech", tb});
+            }
+        }
         std::string note;
         if (!st.vocoder) note = "This build has no voice codec: the calls are shown, the speech stays silent.\n";
         if (cv.tetra)
-            note += "TETRA: OrbitSDR recognises the signal but does not decode it. Its voice codec is not open, "
-                    "and most networks (police, rescue services) are encrypted with TEA.\n";
+            note += std::string("TETRA: ") + (tetra::available()
+                        ? "the clear-text downlink is decoded: cell identity, call control, unencrypted SDS and LIP, "
+                          "and - with the ETSI speech codec - speech of time slots sent without encryption. "
+                          "TEA-encrypted traffic stays opaque. Speech, SDS / LIP content and subscriber numbers "
+                          "appear only with \"TETRA content: shown\".\n"
+                        : "this build has no TETRA decoder library: only the pi/4-DQPSK lock is shown.\n");
         note += "Encrypted calls are never decrypted: OrbitSDR only shows the signalling that every radio "
                 "on the channel receives in the clear (addresses, colour code, the encryption algorithm id).";
         popup.show("Digital voice  " + (cv.isAudio ? std::string("audio input") : mhz(cv.freqHz) + " MHz"), rows, note);
@@ -321,6 +438,12 @@ public:
             btnEnc->setText(muteEnc ? "Mute encrypted: on" : "Mute encrypted: off");
             std::lock_guard<std::mutex> l(mtx);
             for (auto& kv : rxs) kv.second->core->setMuteEncrypted(muteEnc);
+        };
+        btnTetra = std::make_shared<SdrButton>(132.0f, 22.0f, "TETRA content: hidden", *font);
+        btnTetra->onClick = [this]() {
+            showTetraContent = !showTetraContent;
+            btnTetra->setActive(showTetraContent);
+            btnTetra->setText(showTetraContent ? "TETRA content: shown" : "TETRA content: hidden");
         };
         btnClear = std::make_shared<SdrButton>(60.0f, 22.0f, "Clear", *font);
         btnClear->onClick = [this]() {
@@ -438,6 +561,22 @@ public:
                 r.wide.process(gin, gn, r.bbw);
                 r.cls.process(r.bbw.data(), r.bbw.size());
             } else if (r.cls.windows) r.cls.reset();
+
+            // TETRA pi/4-DQPSK demod: only while the classifier calls it TETRA and the
+            // group rate is high enough for 4 samples/symbol. Feeds the burst synchroniser.
+            if (r.cls.windows && r.cls.tetra && grate >= TETRA_MIN_SRC) {
+                if (!r.tetReady) { r.tdemod.configure(TETRA_RATE); r.tsync.reset(); r.tetReady = true; }
+                r.tet.configure(grate, off, TETRA_RATE, 12700.0, 3000.0, 1.0);
+                r.bbt.clear();
+                r.tet.process(gin, gn, r.bbt);
+                r.tdemod.process(r.bbt.data(), r.bbt.size());
+                r.tetCarrierHz = r.tdemod.carrierHz;
+                r.tetEvmDeg = r.tdemod.evmAcc * 180.0 / 3.14159265358979323846;
+                r.tetSrcRate = grate;
+            } else if (r.tetReady) {
+                r.tetReady = false; r.tsync.reset(); r.tet.reset(); r.tcore->reset();
+                r.tetBursts = 0; r.tetVariant = -1; r.tetSrcRate = 0.0;
+            }
         }
         if (changed) publishVoice();
         info = std::to_string(rc.size()) + " channel(s), " + std::to_string(inBand) + " in band";
@@ -461,8 +600,8 @@ public:
         int spoke = 0;
         if (mixAll) {
             for (auto& v : list) {
-                if (!v.listen || duplicate(v)) { v.core->discardVoice(); continue; }
-                if (v.core->pull(out, n)) { any = true; if (!spoke) spoke = v.id; }
+                if (!v.listen || duplicate(v)) { v.discardVoice(); continue; }
+                if (v.pull(out, n)) { any = true; if (!spoke) spoke = v.id; }
             }
         } else {
             bool holderThere = false;
@@ -470,7 +609,7 @@ public:
             if (!holderThere) holder = 0;
             if (holder) {
                 for (auto& v : list) if (v.id == holder) {
-                    if (v.core->pull(out, n)) { any = true; holderIdle = 0; spoke = holder; }
+                    if (v.pull(out, n)) { any = true; holderIdle = 0; spoke = holder; }
                     else holderIdle += n;
                 }
                 if (holderIdle > 48000 / 2) holder = 0;   // half a second of silence: the next one may talk
@@ -480,11 +619,11 @@ public:
                 for (int pass = 0; pass < 2 && !holder; pass++)
                     for (auto& v : list) {
                         if (!v.listen || duplicate(v) || (pass == 0) == v.follow) continue;
-                        if (v.core->hasVoice()) { holder = v.id; holderIdle = 0; break; }
+                        if (v.hasVoice()) { holder = v.id; holderIdle = 0; break; }
                     }
-                if (holder) for (auto& v : list) if (v.id == holder && v.core->pull(out, n)) { any = true; spoke = holder; }
+                if (holder) for (auto& v : list) if (v.id == holder && v.pull(out, n)) { any = true; spoke = holder; }
             }
-            for (auto& v : list) if (v.id != holder) v.core->discardVoice();
+            for (auto& v : list) if (v.id != holder) v.discardVoice();
         }
         speakingId = spoke;
         duck = any && duckMain;
@@ -495,7 +634,7 @@ public:
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
         if (!enabled) return false;
         if (popup.handleEvent(ev, win)) return true;
-        for (auto* b : {btnAdd.get(), btnMix.get(), btnDuck.get(), btnEnc.get(), btnClear.get(), btnLog.get(), btnExport.get()})
+        for (auto* b : {btnAdd.get(), btnMix.get(), btnDuck.get(), btnEnc.get(), btnTetra.get(), btnClear.get(), btnLog.get(), btnExport.get()})
             if (b && b->handleEvent(ev, win)) return true;
         const sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
         if (const auto* sc = ev.getIf<sf::Event::MouseWheelScrolled>()) {
@@ -562,6 +701,13 @@ public:
                 cv.cls = kv.second->cls;
                 cv.verdict = kv.second->cls.windows ? kv.second->cls.verdict : "";
                 cv.tetra = kv.second->cls.windows && kv.second->cls.tetra;
+                cv.tetLocked = kv.second->tsync.locked();
+                cv.tetBursts = kv.second->tetBursts;
+                cv.tetCarrierHz = kv.second->tetCarrierHz;
+                cv.tetEvmDeg = kv.second->tetEvmDeg;
+                cv.tetVariant = kv.second->tetVariant;
+                cv.tetSrcRate = kv.second->tetSrcRate;
+                if (cv.tetra) cv.tstat = kv.second->tcore->status();
                 cv.set = settings[kv.first];
                 cv.calls = kv.second->calls;
                 cards.push_back(cv);
@@ -597,7 +743,7 @@ public:
         sub.setPosition({x + pad + 112.0f, y + pad + 3.0f});
         win.draw(sub);
         float bx = x + w - pad;
-        for (auto* b : {btnExport.get(), btnLog.get(), btnClear.get(), btnEnc.get(), btnDuck.get(), btnMix.get(), btnAdd.get()}) {
+        for (auto* b : {btnExport.get(), btnLog.get(), btnClear.get(), btnTetra.get(), btnEnc.get(), btnDuck.get(), btnMix.get(), btnAdd.get()}) {
             bx -= b->shape.getSize().x;
             b->setPosition(bx, y + pad - 2.0f);
             bx -= 4.0f;
@@ -606,14 +752,14 @@ public:
         float topY = y + pad + 26.0f;
         if (narrowTop) {
             float bx2 = x + w - pad;
-            for (auto* b : {btnExport.get(), btnLog.get(), btnClear.get(), btnEnc.get(), btnDuck.get(), btnMix.get(), btnAdd.get()}) {
+            for (auto* b : {btnExport.get(), btnLog.get(), btnClear.get(), btnTetra.get(), btnEnc.get(), btnDuck.get(), btnMix.get(), btnAdd.get()}) {
                 bx2 -= b->shape.getSize().x;
                 b->setPosition(bx2, y + pad + 20.0f);
                 bx2 -= 4.0f;
             }
             topY += 22.0f;
         }
-        for (auto* b : {btnAdd.get(), btnMix.get(), btnDuck.get(), btnEnc.get(), btnClear.get(), btnLog.get(), btnExport.get()}) b->draw(win);
+        for (auto* b : {btnAdd.get(), btnMix.get(), btnDuck.get(), btnEnc.get(), btnTetra.get(), btnClear.get(), btnLog.get(), btnExport.get()}) b->draw(win);
         if (!dv::vocoderAvailable()) {
             sf::Text nv = text("This build has no voice codec: calls are shown without speech", 20, sf::Color(230, 150, 120));
             nv.setPosition({x + pad, topY - 4.0f});
@@ -691,8 +837,11 @@ private:
         t.setPosition({x + 6.0f, y + 4.0f});
         win.draw(t);
         float hx = x + 6.0f + t.getGlobalBounds().size.x + 10.0f;
-        const std::string sys = found ? st.proto : (st.everSync ? "lost" : "searching");
-        sf::Text ts = text(sys, 24, found ? (enc ? sf::Color(255, 140, 110) : sf::Color(120, 220, 255)) : sf::Color(130, 130, 140));
+        const bool tetraHead = !found && cv.tetra;
+        const std::string sys = found ? st.proto : tetraHead ? "TETRA" : (st.everSync ? "lost" : "searching");
+        sf::Text ts = text(sys, 24, found ? (enc ? sf::Color(255, 140, 110) : sf::Color(120, 220, 255))
+                                    : tetraHead ? (cv.tetLocked ? sf::Color(120, 220, 140) : sf::Color(255, 190, 100))
+                                    : sf::Color(130, 130, 140));
         ts.setStyle(sf::Text::Bold);
         ts.setPosition({hx, y + 4.0f});
         win.draw(ts);
@@ -734,12 +883,50 @@ private:
             ly += 16.0f;
         };
         if (!found) {
-            if (!cv.verdict.empty() && cv.verdict != "No signal")
-                line(cv.verdict, cv.tetra ? sf::Color(255, 190, 100) : sf::Color(200, 200, 205));
-            else line(st.everSync ? "Signal lost" : "No digital voice found yet", sf::Color(130, 130, 140));
-            line(cv.set.want == dv::Want::Auto ? "Looking for DMR, dPMR, D-STAR, YSF, NXDN" : std::string("Looking for ") + dv::wantName(cv.set.want) + " only",
-                 sf::Color(110, 110, 120));
-            if (cv.tetra) line("Network info (MCC / MNC) is not decoded yet", sf::Color(110, 110, 120));
+            if (!cv.tetra) {
+                if (!cv.verdict.empty() && cv.verdict != "No signal") line(cv.verdict, sf::Color(200, 200, 205));
+                else line(st.everSync ? "Signal lost" : "No digital voice found yet", sf::Color(130, 130, 140));
+                line(cv.set.want == dv::Want::Auto ? "Looking for DMR, dPMR, D-STAR, YSF, NXDN" : std::string("Looking for ") + dv::wantName(cv.set.want) + " only",
+                     sf::Color(110, 110, 120));
+            }
+            if (cv.tetra) {
+                char tb[96];
+                if (cv.tetLocked) {
+                    std::snprintf(tb, sizeof(tb), "TETRA sync LOCKED   %d bursts   %+.0f Hz   EVM %.0f deg",
+                                  cv.tetBursts, cv.tetCarrierHz, cv.tetEvmDeg);
+                    line(tb, sf::Color(120, 220, 140));
+                } else {
+                    std::snprintf(tb, sizeof(tb), "TETRA demod: searching sync   %+.0f Hz   EVM %.0f deg",
+                                  cv.tetCarrierHz, cv.tetEvmDeg);
+                    line(tb, sf::Color(255, 190, 100));
+                }
+                const tetra::Status& ts = cv.tstat;
+                if (ts.net.valid) {
+                    std::snprintf(tb, sizeof(tb), "Network  MCC %u  MNC %u  CC %u  LA %u",
+                                  ts.net.mcc, ts.net.mnc, ts.net.colourCode, ts.net.locationArea);
+                    line(tb, sf::Color(130, 210, 255));
+                }
+                const bool show = showTetraContent;
+                if (ts.voice || !ts.talker.empty()) {
+                    std::string s = ts.voice ? "VOICE TS" + std::to_string(ts.voiceTn) : std::string("CALL");
+                    s += show ? "  " + (ts.talker.empty() ? std::string("?") : ts.talker) + " > " + (ts.group.empty() ? std::string("?") : ts.group)
+                              : std::string("  (content hidden)");
+                    if (ts.voice && ts.voiceFrames)
+                        s += "  CRC " + std::to_string(100 * ts.voiceGood / ts.voiceFrames) + "%";
+                    else if (!tetra::speechAvailable()) s += "  (no speech codec in this build)";
+                    line(s, ts.voice ? sf::Color(140, 235, 150) : sf::Color(200, 200, 205));
+                }
+                if (!ts.sds.empty())
+                    line("SDS (" + std::to_string(ts.sds.size()) + ")  " + sdsText(ts.sds.front(), show), sf::Color(220, 210, 140));
+                if (!ts.lip.empty()) {
+                    if (show) std::snprintf(tb, sizeof(tb), "GPS (%zu)  %.5f, %.5f  %s", ts.lip.size(), ts.lip.front().lat,
+                                            ts.lip.front().lon, ts.lip.front().from.c_str());
+                    else std::snprintf(tb, sizeof(tb), "GPS (%zu)  positions (content hidden)", ts.lip.size());
+                    line(tb, sf::Color(160, 220, 160));
+                }
+                if (ts.reports && !ts.net.valid && ts.sds.empty() && ts.lip.empty())
+                    line(std::to_string(ts.reports) + " PDUs decoded (awaiting SYSINFO)", sf::Color(150, 150, 160));
+            }
             if (cv.calls) line(std::to_string(cv.calls) + " calls heard on this channel", sf::Color(110, 110, 120));
             return;
         }

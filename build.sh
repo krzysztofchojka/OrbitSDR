@@ -74,9 +74,13 @@ echo "Compiling with modules: $MODULE_SOURCES"
 . scripts/ft8lib.sh
 # DSDcc + mbevocoder (digital voice: DMR, dPMR, D-STAR, YSF, NXDN): vendored, compiled once into .cache/
 . scripts/dsdcc.sh
+# TETRA metadata decoder (tetra-kit port): vendored in deps/tetra-kit, compiled once into .cache/
+. scripts/tetra.sh
+# TETRA speech codec (ETSI EN 300 395-2): downloaded from etsi.org, checked and built once into .cache/ (not in the repo)
+. scripts/tetracodec.sh
 
-$CXX -std=c++17 -O3 $SDR_FLAGS $RTL433_FLAGS $FT8LIB_FLAGS $DSDCC_FLAGS $FINAL_INCLUDES \
-    $SRC_DIR/main.cpp $MODULE_SOURCES $RTL433_LIB $FT8LIB_LIB $DSDCC_LIB \
+$CXX -std=c++17 -O3 $SDR_FLAGS $RTL433_FLAGS $FT8LIB_FLAGS $DSDCC_FLAGS $TETRA_FLAGS $TETRACODEC_FLAGS $FINAL_INCLUDES \
+    $SRC_DIR/main.cpp $MODULE_SOURCES $RTL433_LIB $FT8LIB_LIB $DSDCC_LIB $TETRA_LIB $TETRACODEC_LIB \
     -o $OUT_FILE $FINAL_LIBS $EXTRAS
 
 if [ $? -ne 0 ]; then
