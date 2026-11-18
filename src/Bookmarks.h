@@ -41,16 +41,8 @@ struct Bookmark {
 inline const std::string& defaultBank() { static const std::string b = "General"; return b; }
 
 inline const char* modeShortName(Mode m) {
-    switch (m) {
-    case Mode::AM: return "AM";
-    case Mode::NFM: return "NFM";
-    case Mode::WFM: return "WFM";
-    case Mode::LSB: return "LSB";
-    case Mode::USB: return "USB";
-    case Mode::CW: return "CW";
-    case Mode::RAW: return "RAW";
-    default: return "OFF";
-    }
+    if (m == Mode::DIGITAL) return "DIG";
+    return modeName(m);
 }
 
 class BookmarkStore {
@@ -103,7 +95,7 @@ public:
             b.name = v.getString("name");
             b.freqHz = (long long)v.getNumber("freq", 0);
             const int m = (int)v.getNumber("mode", (int)Mode::NFM);
-            b.mode = (m >= 0 && m <= (int)Mode::CW) ? (Mode)m : Mode::NFM;
+            b.mode = (m >= 0 && m <= MODE_LAST) ? (Mode)m : Mode::NFM;
             b.bandwidthHz = (float)v.getNumber("bw", 12500);
             b.scan = v.getBool("scan", true);
             b.bank = v.getString("bank", defaultBank());
@@ -306,13 +298,16 @@ public:
 // ---------------------------------------------------------------------
 class Scanner {
 public:
-    enum class State { Off, Settle, Listen, Hold, Hang };
+    // Verify: a digital voice bookmark has a carrier; held only once speech is decoded (DMR
+    // repeaters send idle frames in their hang time, trunking control channels never stop)
+    enum class State { Off, Settle, Listen, Verify, Hold, Hang };
     State state = State::Off;
     int current = -1;          // bookmark index
     float thresholdDb = 12.0f; // SNR that stops the scan
     float hangSec = 3.0f;      // stay this long after the signal is gone
     float settleSec = 0.25f;   // after a retune: wait for fresh samples
     float listenSec = 0.15f;   // then look this long for a signal
+    float verifySec = 1.5f;    // digital voice: wait this long for speech on a carrier
     long long tunedHz = 0;     // where the scanner put the tuner (manual tuning stops it)
 
     std::function<void(int)> tune;       // tunes to a bookmark
@@ -330,8 +325,9 @@ public:
 
     void skip(const std::vector<Bookmark>& b, double now) { clock = now; if (running()) next(b); }
 
-    // snrDb: the tuner band's SNR; fresh: a new value since the last call
-    void update(const std::vector<Bookmark>& b, double now, float snrDb, bool fresh) {
+    // snrDb: the tuner band's SNR; fresh: a new value since the last call.
+    // voice: -1 analog bookmark (the SNR decides), 0 / 1 digital voice bookmark without / with speech
+    void update(const std::vector<Bookmark>& b, double now, float snrDb, bool fresh, int voice = -1) {
         clock = now;
         if (state == State::Off) return;
         if (!anyMarked(b)) { state = State::Off; return; }
@@ -341,15 +337,23 @@ public:
             if (now - t0 >= settleSec) { state = State::Listen; t0 = now; }
             break;
         case State::Listen:
-            if (fresh && snrDb >= thresholdDb) { state = State::Hold; lastSignal = now; }
+            if (voice > 0) { state = State::Hold; lastSignal = now; }
+            else if (fresh && snrDb >= thresholdDb) {
+                if (voice < 0) { state = State::Hold; lastSignal = now; }
+                else { state = State::Verify; t0 = now; }
+            }
             else if (now - t0 >= listenSec) next(b);
             break;
+        case State::Verify:
+            if (voice > 0) { state = State::Hold; lastSignal = now; }
+            else if (now - t0 >= verifySec) next(b);
+            break;
         case State::Hold:
-            if (fresh && snrDb >= thresholdDb - 3.0f) lastSignal = now;   // a little hysteresis
+            if (voice < 0 ? (fresh && snrDb >= thresholdDb - 3.0f) : voice > 0) lastSignal = now;   // a little hysteresis
             if (now - lastSignal > 0.4) { state = State::Hang; }
             break;
         case State::Hang:
-            if (fresh && snrDb >= thresholdDb) { state = State::Hold; lastSignal = now; }
+            if (voice < 0 ? (fresh && snrDb >= thresholdDb) : voice > 0) { state = State::Hold; lastSignal = now; }
             else if (now - lastSignal >= hangSec + 0.4) next(b);
             break;
         default: break;
@@ -357,7 +361,7 @@ public:
     }
 
     // The speaker is on only while a signal is held
-    bool muteWanted() const { return state == State::Settle || state == State::Listen; }
+    bool muteWanted() const { return state == State::Settle || state == State::Listen || state == State::Verify; }
 
     std::string status(const std::vector<Bookmark>& b) const {
         if (state == State::Off) return "Scanner: off";
@@ -365,6 +369,7 @@ public:
                             ? (b[current].name.empty() ? std::to_string(b[current].freqHz) : b[current].name) : "-";
         switch (state) {
         case State::Hold: return "Signal: " + n;
+        case State::Verify: return "Digital carrier, waiting for voice: " + n;
         case State::Hang: return "Signal gone, waiting: " + n;
         default: return "Scanning... " + n;
         }

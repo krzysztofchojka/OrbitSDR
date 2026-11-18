@@ -95,6 +95,11 @@ struct SharedData {
     std::atomic<unsigned long long> decoderDrops {0};   // blocks the decoders had to skip (CPU too slow)
     // Input signal type (Source / Input switch): false = I/Q from a radio, true = demodulated audio
     bool audioInput = false;
+    // Digital voice modes of the demodulator (DMR, dPMR, ...): the decoder, its status is read by
+    // the UI (thread safe); DMR time slots to listen to (1, 2, 3 = both); mute encrypted calls
+    std::shared_ptr<dv::Core> digital = std::make_shared<dv::Core>();
+    int digSlotMask = 3;
+    bool digMuteEncrypted = true;
     
     std::deque<AprsLastPacket> aprsHistory;
     AprsLastPacket lastAprs;

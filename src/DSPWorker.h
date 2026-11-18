@@ -176,6 +176,7 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
     double paceSamples = -1.0; // background file playback: samples played since paceStart
     auto paceStart = std::chrono::steady_clock::now();
     std::vector<float> fftMags(FFT_SIZE), fftSorted(FFT_SIZE);
+    std::vector<float> decVoice;   // speech of the digital voice decoders (mono)
     DecoderRunner decoders(shared);   // the decoders' thread (stops when dspWorker returns)
     bool decodersReset = false;
 
@@ -234,6 +235,9 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
         bool anyDecoder = false;
         bool burstAgc = false;
         bool audioIn = false;
+        int digSlots = 3;
+        bool digMuteEnc = true;
+        std::vector<SDRModule*> voiceMods;
 
         {
             std::lock_guard<std::mutex> lock(shared.mtx);
@@ -263,12 +267,16 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
             for (SDRModule* m : shared.activeDecoders)
                 if (m && m->enabled) { anyDecoder = true; burstAgc = burstAgc || m->wantsBurstAgc(); }
             audioIn = shared.audioInput;
+            digSlots = shared.digSlotMask;
+            digMuteEnc = shared.digMuteEncrypted;
+            voiceMods = shared.activeDecoders;
         }
 
         bool justSeeked = false;
         if (seekReq >= 0.0 && src->isSeekable()) {
             src->seek(seekReq);
             demod.clear();
+            if (shared.digital) shared.digital->reset();
             audio.clear(shared.audioStream);
             justSeeked = true;
             paceSamples = -1.0;
@@ -338,6 +346,7 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
         double sr = src->getSampleRate();
         if (sr != lastSampleRate) {
             demod = Demodulator(sr, AUDIO_RATE);
+            demod.digital = shared.digital;
             lastSampleRate = sr;
         }
 
@@ -347,7 +356,12 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
         // Input set to Audio (Source / Input switch): the samples already are audio, so
         // only RAW makes sense (any other demodulator would turn the audio into noise)
         const bool audioSource = audioIn;
-        if (audioSource) mode = Mode::RAW;
+        // (the digital voice modes also decode audio: the discriminator audio of a receiver)
+        if (audioSource && !isDigitalMode(mode)) mode = Mode::RAW;
+        demod.digitalFromAudio = audioSource;
+        if (!demod.digital) demod.digital = shared.digital;
+        demod.digital->setSlotMask(digSlots);
+        demod.digital->setMuteEncrypted(digMuteEnc);
 
         // RDS runs only in WFM mode. Its data belongs to one station, so it is
         // cleared whenever the receiver moves to a different frequency.
@@ -371,6 +385,7 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
         int readCount = src->read(iqBuffer.data(), chunkSize);
         if (src->didLoop()) {
             demod.clear();
+            if (shared.digital) shared.digital->reset();
             decodersReset = true;   // the decoders start again with the next block
         }
 
@@ -450,8 +465,11 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                 }
 
                 if (anyDecoder) {
-                    decJob.mono.reserve(audioData.size() / 2);
-                    for (size_t i = 0; i < audioData.size(); i += 2) decJob.mono.push_back(audioData[i]);
+                    if (isDigitalMode(mode)) decJob.mono = demod.discTap;   // the discriminator, not the speech
+                    else {
+                        decJob.mono.reserve(audioData.size() / 2);
+                        for (size_t i = 0; i < audioData.size(); i += 2) decJob.mono.push_back(audioData[i]);
+                    }
                     decoders.push(std::move(decJob));
                 }
 
@@ -460,6 +478,27 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
 
                 // Similar loudness for all modes (speaker only, the decoders above got the raw audio)
                 leveler.process(audioData);
+
+                // Speech of the digital voice decoders (their own channels), after the squelch
+                // and the leveler of the main demodulator
+                {
+                    const size_t frames = audioData.size() / 2;
+                    bool any = false, duck = false;
+                    for (SDRModule* m : voiceMods) {
+                        if (!m || !m->enabled) continue;
+                        if (decVoice.size() != frames) decVoice.assign(frames, 0.0f);
+                        if (!any) std::fill(decVoice.begin(), decVoice.end(), 0.0f);
+                        bool d = false;
+                        if (m->mixVoice(decVoice.data(), frames, d)) { any = true; duck = duck || d; }
+                    }
+                    if (any) {
+                        if (duck) std::fill(audioData.begin(), audioData.end(), 0.0f);
+                        for (size_t i = 0; i < frames; i++) {
+                            audioData[2 * i] += decVoice[i];
+                            audioData[2 * i + 1] += decVoice[i];
+                        }
+                    }
+                }
 
                 bool scanMuted = false;
                 { std::lock_guard<std::mutex> l(shared.mtx); scanMuted = shared.scanMute; }

@@ -5,9 +5,53 @@
 #include <cmath>
 #include <algorithm>
 #include <complex>
+#include <memory>
+#include "modules/Digital/DigitalVoice.h"
 
-// CW was added last: the saved "mode_index" of older versions stays valid
-enum class Mode { AM, NFM, WFM, LSB, USB, RAW, OFF, CW };
+// New modes go at the end: the saved "mode_index" and the bookmarks of older versions stay valid.
+// DIGITAL: digital voice with automatic detection (DMR, dPMR, D-STAR, YSF, NXDN).
+enum class Mode { AM, NFM, WFM, LSB, USB, RAW, OFF, CW, DIGITAL, DMR, DPMR, DSTAR, YSF, NXDN };
+inline constexpr int MODE_LAST = (int)Mode::NXDN;
+
+inline bool isDigitalMode(Mode m) { return (int)m >= (int)Mode::DIGITAL && (int)m <= (int)Mode::NXDN; }
+
+inline dv::Want digitalWant(Mode m) {
+    switch (m) {
+    case Mode::DMR: return dv::Want::DMR;
+    case Mode::DPMR: return dv::Want::DPMR;
+    case Mode::DSTAR: return dv::Want::DSTAR;
+    case Mode::YSF: return dv::Want::YSF;
+    case Mode::NXDN: return dv::Want::NXDN;
+    default: return dv::Want::Auto;
+    }
+}
+
+inline const char* modeName(Mode m) {
+    switch (m) {
+    case Mode::AM: return "AM";
+    case Mode::NFM: return "NFM";
+    case Mode::WFM: return "WFM";
+    case Mode::LSB: return "LSB";
+    case Mode::USB: return "USB";
+    case Mode::RAW: return "RAW";
+    case Mode::OFF: return "OFF";
+    case Mode::CW: return "CW";
+    case Mode::DIGITAL: return "DIGITAL";
+    case Mode::DMR: return "DMR";
+    case Mode::DPMR: return "dPMR";
+    case Mode::DSTAR: return "D-STAR";
+    case Mode::YSF: return "YSF";
+    case Mode::NXDN: return "NXDN";
+    }
+    return "?";
+}
+
+// FM discriminator (radians per sample at 48 kHz) -> the 16 bit scale the digital voice
+// decoder expects: 5 units per Hz of deviation (DMR's outer symbols at +-1944 Hz ~ +-9700)
+inline short discToShort(double phaseDelta) {
+    const double v = phaseDelta * (48000.0 / (2.0 * 3.14159265358979323846)) * 5.0;
+    return (short)std::clamp(v, -32767.0, 32767.0);
+}
 
 // CW: a carrier on the tuned frequency is heard as this tone
 inline constexpr double CW_PITCH_HZ = 700.0;
@@ -107,6 +151,15 @@ public:
     bool mpxTapEnabled = false;
     std::vector<float> mpxTap;
 
+    // Digital voice modes: the decoder (shared with the UI, which reads its status), the input
+    // is audio instead of I/Q (the discriminator audio of a receiver or a recording), and a copy
+    // of the discriminator for the other decoders (they get it instead of the speech)
+    std::shared_ptr<dv::Core> digital;
+    bool digitalFromAudio = false;
+    std::vector<short> discBuf;
+    std::vector<float> digVoice;
+    std::vector<float> discTap;
+
     void clear() {
         audioLpfState = 0.0f;
         deemphStateL = 0.0f; deemphStateR = 0.0f;
@@ -149,7 +202,10 @@ public:
     std::vector<float> process(const std::vector<Complex>& rawIQ, double freqOffset, double bandwidthHz, Mode mode, bool stereoEnabled) {
         std::vector<float> audioOut;
         mpxTap.clear();
+        discBuf.clear();
+        discTap.clear();
         if (rawIQ.empty()) return audioOut;
+        const bool dig = isDigitalMode(mode) && digital;
         const bool tapMpx = mpxTapEnabled && mode == Mode::WFM;
         if (tapMpx) mpxTap.reserve(rawIQ.size());
 
@@ -321,6 +377,22 @@ public:
                         continue;
                     }
 
+                    if (dig) {
+                        // channel filter, then the discriminator for the digital voice decoder
+                        channelFir.push(decimated);
+                        const Complex f = channelFir.compute();
+                        short v;
+                        if (digitalFromAudio) v = (short)std::clamp(f.real() * 32768.0, -32767.0, 32767.0);
+                        else {
+                            const Complex pd = f * std::conj(lastSample);
+                            lastSample = f;
+                            v = discToShort(std::arg(pd));
+                        }
+                        discBuf.push_back(v);
+                        discTap.push_back(v / 32768.0f);
+                        continue;
+                    }
+
                     Complex filtered = {0,0};
 
                     if (mode == Mode::LSB || mode == Mode::USB) {
@@ -412,6 +484,12 @@ public:
                     audioOut.push_back(finalAudio);
                 }
             }
+        }
+        if (dig) {
+            digVoice.clear();
+            digital->setWant(digitalWant(mode));
+            digital->process(discBuf.data(), discBuf.size(), &digVoice);
+            for (float v : digVoice) { const float o = std::tanh(v * 1.5f); audioOut.push_back(o); audioOut.push_back(o); }
         }
         return audioOut;
     }

@@ -42,6 +42,11 @@ public:
     // guessed (from the file date), the decoder then has to find the slot boundaries itself.
     virtual void setStreamTime(double /*unixUtc*/, bool /*reliable*/) {}
 
+    // Speech for the speaker (digital voice decoders): adds up to n samples (48 kHz mono) to
+    // `out`, returns true while it speaks. duckMain = true: mute the main demodulator meanwhile.
+    // Called by the DSP thread for every block of the speaker.
+    virtual bool mixVoice(float* /*out*/, size_t /*n*/, bool& /*duckMain*/) { return false; }
+
     // The channels this decoder listens to (yellow bands + handles on the tuning bar).
     // nullptr for decoders without channels. Not shown while the input is audio.
     virtual ChannelSet* channelSet() { return nullptr; }

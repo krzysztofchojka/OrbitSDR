@@ -47,6 +47,8 @@ SDR_LIB="$(pwd)/deps/sdrplay/lib/windows"
 . scripts/rtl433.sh
 # --- ft8_lib (FT8 / FT4 decoder): vendored in deps/ft8_lib, compiled once into .cache/ ---
 . scripts/ft8lib.sh
+# --- DSDcc + mbelib (digital voice: DMR, dPMR, D-STAR, YSF, NXDN): vendored in deps/, compiled once into .cache/ ---
+. scripts/dsdcc.sh
 
 # 4. Compilation
 echo "------------------------------------------"
@@ -60,12 +62,14 @@ g++ -std=c++17 -O3 \
     -D_USE_MATH_DEFINES \
     $RTL433_FLAGS \
     $FT8LIB_FLAGS \
+    $DSDCC_FLAGS \
     -I"$SFML_PATH/include" \
     -I"$SDR_INC" \
     "$SRC_DIR/main.cpp" \
     "$BUILD_DIR/resource.res" \
     $RTL433_LIB \
     $FT8LIB_LIB \
+    $DSDCC_LIB \
     -o "$OUT_FILE" \
     -L"$SFML_PATH/lib" \
     -lcomdlg32 -lole32 -lws2_32 -lwininet \
@@ -130,6 +134,10 @@ fi
 
 echo "------------------------------------------"
 if [ "$FT8LIB_OK" = "1" ]; then echo "FT8 / FT4: included (ft8_lib)"; else echo "FT8 / FT4: NOT included (see the [ft8_lib] messages above); WSPR still works"; fi
+if [ "$DSDCC_OK" = "1" ]; then
+    if [ "$DSDCC_VOCODER" = "1" ]; then echo "Digital voice (DMR, dPMR, D-STAR, YSF, NXDN): included, with speech"
+    else echo "Digital voice: included WITHOUT the voice codec (info only)"; fi
+else echo "Digital voice: NOT included (see the [dsdcc] messages above)"; fi
 if [ "$RTL433_OK" = "1" ]; then echo "ISM (rtl_433): included"; else echo "ISM (rtl_433): NOT included (see the [rtl_433] messages above)"; fi
 echo "------------------------------------------"
 echo "DONE! The complete application is located in the folder: /$BUILD_DIR"

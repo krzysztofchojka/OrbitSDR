@@ -386,6 +386,49 @@ public: std::vector<std::shared_ptr<Widget>> widgets; float height = 30.0f; floa
     void updateStyle() override { for(auto& w : widgets) w->updateStyle(); }
 };
 
+// A group of widgets under each other that can be hidden (it then takes no room: the sidebar
+// adds 5 px after every widget, a hidden group gives them back). Call the sidebar's
+// recalculateLayout() after setShown().
+class WidgetGroup : public Widget {
+public:
+    std::vector<std::shared_ptr<Widget>> widgets;
+    bool shown = true;
+    void add(std::shared_ptr<Widget> w) { widgets.push_back(w); }
+    bool setShown(bool s) { const bool ch = s != shown; shown = s; return ch; }
+    float getHeight() const override {
+        if (!shown || widgets.empty()) return -5.0f;
+        float h = 0.0f;
+        for (const auto& w : widgets) h += w->getHeight() + 5.0f;
+        return h - 5.0f;
+    }
+    void setPosition(float x, float y) override { for (auto& w : widgets) { w->setPosition(x, y); y += w->getHeight() + 5.0f; } }
+    void draw(sf::RenderWindow& win) override { if (shown) for (auto& w : widgets) w->draw(win); }
+    void drawOverlay(sf::RenderWindow& win) override { if (shown) for (auto& w : widgets) w->drawOverlay(win); }
+    bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
+        if (!shown) return false;
+        for (auto it = widgets.rbegin(); it != widgets.rend(); ++it) if ((*it)->handleEvent(ev, win)) return true;
+        return false;
+    }
+    void update(const sf::RenderWindow& win) override { if (shown) for (auto& w : widgets) w->update(win); }
+    void setEnabled(bool e) override { for (auto& w : widgets) w->setEnabled(e); }
+    bool isMouseOver(const sf::RenderWindow& win) const override { if (!shown) return false; for (const auto& w : widgets) if (w->isMouseOver(win)) return true; return false; }
+    void updateStyle() override { for (auto& w : widgets) w->updateStyle(); }
+};
+
+// A label whose text colour can be changed (Label takes the theme colour)
+class ColorLabel : public Widget {
+    sf::Text text; sf::Color col;
+public:
+    ColorLabel(std::string c, const sf::Font& f, int s = 12, sf::Color cl = sf::Color::White) : text(f, u8(c), s * 2), col(cl) {
+        text.setScale({0.5f, 0.5f}); text.setFillColor(cl);
+    }
+    float getHeight() const override { return text.getGlobalBounds().size.y + 8.0f; }
+    void setPosition(float x, float y) override { text.setPosition({x, y}); }
+    void setText(const std::string& s) { text.setString(u8(s)); }
+    void setColor(sf::Color c) { col = c; text.setFillColor(c); }
+    void draw(sf::RenderWindow& w) override { w.draw(text); }
+};
+
 class FrequencyDisplay {
 public:
     long long frequency; const sf::Font& font; sf::Text text; sf::RectangleShape hoverRect; long long hoverPower = 0; bool isHovered = false, isTopHalf = true, enabled = true; float x, y;

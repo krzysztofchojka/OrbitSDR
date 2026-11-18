@@ -40,6 +40,7 @@
 #include "modules/ImageDecoders/WEFAX_Module.h"
 #include "modules/ISM/ISM_Decoder.h"
 #include "modules/ACARS/ACARS_Decoder.h"
+#include "modules/Digital/DigitalVoice_Decoder.h"
 #include "modules/ADSB/ADSB_Decoder.h"
 #include "modules/WSJT/WSJT_Decoder.h"
 #include "modules/VDL2/VDL2_Decoder.h"
@@ -119,6 +120,7 @@ struct Receiver {
     CWDecoder* cw = nullptr;
     NAVTEXDecoder* navtex = nullptr;
     DSCDecoder* dsc = nullptr;
+    DigitalVoiceDecoder* dvoice = nullptr;
 
     // a short name for the tab
     std::string title() const {
@@ -316,8 +318,11 @@ int main() {
         rx->dsc = add(new DSCDecoder());
         rx->dsc->log.setPath(getConfigFilePath("dsc.log"));
         rx->dsc->exportDir = getDefaultExportPath();
+        rx->dvoice = add(new DigitalVoiceDecoder());
+        rx->dvoice->log.setPath(getConfigFilePath("digitalvoice.log"));
+        rx->dvoice->exportDir = getDefaultExportPath();
         // the order of the Decoders checkboxes
-        rx->decMods = { nullptr, rx->ais, rx->sstv, rx->wefax, rx->ism, rx->acars, rx->vdl2, rx->adsb, rx->wsjt, rx->cw, rx->navtex, rx->dsc };
+        rx->decMods = { nullptr, rx->dvoice, rx->ais, rx->sstv, rx->wefax, rx->ism, rx->acars, rx->vdl2, rx->adsb, rx->wsjt, rx->cw, rx->navtex, rx->dsc };
         rx->sd.visible = false;
         rx->sd.audioOut = true;          // its speaker button on the tab (on by default)
         rx->sd.audioStream = rx->id;     // its own stream in the speaker's mix
@@ -361,6 +366,46 @@ int main() {
     rowModes->spacing = 3.0f;
     rowModes->add(btnNFM); rowModes->add(btnAM); rowModes->add(btnWFM);
     rowModes->add(btnUSB); rowModes->add(btnLSB); rowModes->add(btnCW); rowModes->add(btnRAW); rowModes->add(btnOFF);
+
+    // Digital voice (second row): DIGITAL finds the system by itself, the others decode only that one
+    auto btnDIG   = std::make_shared<SdrButton>(56, 25, "DIGITAL", font);
+    auto btnDMR   = std::make_shared<SdrButton>(38, 25, "DMR", font);
+    auto btnDPMR  = std::make_shared<SdrButton>(42, 25, "dPMR", font);
+    auto btnDSTAR = std::make_shared<SdrButton>(50, 25, "D-STAR", font);
+    auto btnYSF   = std::make_shared<SdrButton>(34, 25, "YSF", font);
+    auto btnNXDN  = std::make_shared<SdrButton>(42, 25, "NXDN", font);
+    auto rowDigital = std::make_shared<RowContainer>();
+    rowDigital->spacing = 3.0f;
+    rowDigital->add(btnDIG); rowDigital->add(btnDMR); rowDigital->add(btnDPMR);
+    rowDigital->add(btnDSTAR); rowDigital->add(btnYSF); rowDigital->add(btnNXDN);
+    const std::vector<std::pair<Mode, SdrButton*>> modeButtons = {
+        {Mode::NFM, btnNFM.get()}, {Mode::AM, btnAM.get()}, {Mode::WFM, btnWFM.get()}, {Mode::USB, btnUSB.get()},
+        {Mode::LSB, btnLSB.get()}, {Mode::CW, btnCW.get()}, {Mode::RAW, btnRAW.get()}, {Mode::OFF, btnOFF.get()},
+        {Mode::DIGITAL, btnDIG.get()}, {Mode::DMR, btnDMR.get()}, {Mode::DPMR, btnDPMR.get()},
+        {Mode::DSTAR, btnDSTAR.get()}, {Mode::YSF, btnYSF.get()}, {Mode::NXDN, btnNXDN.get()} };
+    auto buttonFor = [modeButtons](Mode m) {
+        for (const auto& mb : modeButtons) if (mb.first == m) return mb.second;
+        return modeButtons[7].second;   // OFF
+    };
+
+    // Below the rows while a digital mode is on: what is heard, the DMR time slots
+    auto grpDigital = std::make_shared<WidgetGroup>();
+    auto lblDigital = std::make_shared<ColorLabel>("Searching...\n \n \n ", font, 11, sf::Color(200, 200, 210));
+    auto btnTsBoth = std::make_shared<SdrButton>(70, 22, "TS1 + TS2", font);
+    auto btnTs1 = std::make_shared<SdrButton>(64, 22, "TS1 only", font);
+    auto btnTs2 = std::make_shared<SdrButton>(64, 22, "TS2 only", font);
+    auto rowTs = std::make_shared<RowContainer>();
+    rowTs->spacing = 3.0f;
+    rowTs->add(btnTsBoth); rowTs->add(btnTs1); rowTs->add(btnTs2);
+    auto chkMuteEnc = std::make_shared<Checkbox>("Mute encrypted calls", font, true);
+    grpDigital->add(lblDigital);
+    grpDigital->add(rowTs);
+    grpDigital->add(chkMuteEnc);
+    if (!dv::available())
+        grpDigital->add(std::make_shared<Label>("Digital voice is not in this build", font, 11, sf::Color(230, 150, 120)));
+    else if (!dv::vocoderAvailable())
+        grpDigital->add(std::make_shared<Label>("Built without the voice codec: info only, no speech", font, 11, sf::Color(230, 150, 120)));
+    grpDigital->setShown(false);
 
     auto slBW = std::make_shared<Slider>(SIDEBAR_W - 40, 1000.0f, 200000.0f, 12500.0f, "Bandwidth (Hz)", font);
 
@@ -962,6 +1007,8 @@ int main() {
 
     auto modDemod = sidebar.addModule("Demodulator");
     modDemod->addWidget(rowModes);
+    modDemod->addWidget(rowDigital);
+    modDemod->addWidget(grpDigital);
 
     slBW->onChange = [&](float v) {
         std::lock_guard<std::mutex> l(cur->sd.mtx);
@@ -989,16 +1036,20 @@ int main() {
 
     // --- Demodulator mode buttons (only for listening: the decoders have their own channels) ---
     auto setMode = [&](Mode m, SdrButton* me) {
-        if (cur->inputIsAudio && m != Mode::RAW && m != Mode::OFF) { m = Mode::RAW; me = btnRAW.get(); }
+        // audio input: only RAW (and the digital voice modes, which decode discriminator audio)
+        if (cur->inputIsAudio && m != Mode::RAW && m != Mode::OFF && !isDigitalMode(m)) { m = Mode::RAW; me = btnRAW.get(); }
+        if (isDigitalMode(m) && !dv::available()) { m = Mode::NFM; me = btnNFM.get(); }
 
         rowModes->setEnabled(true);
-        btnNFM->setActive(false); btnAM->setActive(false); btnWFM->setActive(false);
-        btnUSB->setActive(false); btnLSB->setActive(false); btnCW->setActive(false); btnRAW->setActive(false); btnOFF->setActive(false);
+        rowDigital->setEnabled(dv::available());
+        for (const auto& mb : modeButtons) mb.second->setActive(false);
         me->setActive(true);
         if (cur->inputIsAudio) {   // audio input: the other demodulators make no sense
             btnNFM->setEnabled(false); btnAM->setEnabled(false); btnWFM->setEnabled(false);
             btnUSB->setEnabled(false); btnLSB->setEnabled(false); btnCW->setEnabled(false);
         }
+        if (grpDigital->setShown(isDigitalMode(m))) sidebar.recalculateLayout();
+        rowTs->setEnabled(m == Mode::DIGITAL || m == Mode::DMR);
 
         std::lock_guard<std::mutex> l(cur->sd.mtx);
         cur->sd.mode = m;
@@ -1015,6 +1066,12 @@ int main() {
         } else if (m == Mode::CW) {
             slBW->setLimits(50, 3000); slBW->setValueSilent(500);
             cur->sd.bandwidth = 500; slBW->setText("Bandwidth: 500 Hz");
+        } else if (m == Mode::DPMR) {
+            slBW->setLimits(4000, 25000); slBW->setValueSilent(7000);
+            cur->sd.bandwidth = 7000; slBW->setText("Bandwidth: 7.0 kHz");
+        } else if (isDigitalMode(m)) {
+            slBW->setLimits(4000, 25000); slBW->setValueSilent(12500);
+            cur->sd.bandwidth = 12500; slBW->setText("Bandwidth: 12.5 kHz");
         } else if (m == Mode::OFF) {
         } else {
             slBW->setLimits(1000, 10000); slBW->setValueSilent(3000);
@@ -1022,24 +1079,58 @@ int main() {
         }
     };
 
-    btnNFM->onClick = [&](){ setMode(Mode::NFM, btnNFM.get()); };
-    btnAM->onClick  = [&](){ setMode(Mode::AM, btnAM.get()); };
-    btnWFM->onClick = [&](){ setMode(Mode::WFM, btnWFM.get()); };
-    btnUSB->onClick = [&](){ setMode(Mode::USB, btnUSB.get()); };
-    btnLSB->onClick = [&](){ setMode(Mode::LSB, btnLSB.get()); };
-    btnCW->onClick  = [&](){ setMode(Mode::CW, btnCW.get()); };
-    btnRAW->onClick = [&](){ setMode(Mode::RAW, btnRAW.get()); };
-    btnOFF->onClick = [&](){ setMode(Mode::OFF, btnOFF.get()); };
+    for (const auto& mb : modeButtons) {
+        const Mode m = mb.first;
+        SdrButton* b = mb.second;
+        b->onClick = [&setMode, m, b]() { setMode(m, b); };
+    }
+    auto restoreMode = [&](Mode m) { setMode(m, buttonFor(m)); };
 
-    auto restoreMode = [&](Mode m) {
-        if (m == Mode::NFM) setMode(Mode::NFM, btnNFM.get());
-        else if (m == Mode::AM) setMode(Mode::AM, btnAM.get());
-        else if (m == Mode::WFM) setMode(Mode::WFM, btnWFM.get());
-        else if (m == Mode::RAW) setMode(Mode::RAW, btnRAW.get());
-        else if (m == Mode::USB) setMode(Mode::USB, btnUSB.get());
-        else if (m == Mode::LSB) setMode(Mode::LSB, btnLSB.get());
-        else if (m == Mode::CW) setMode(Mode::CW, btnCW.get());
-        else setMode(Mode::OFF, btnOFF.get());
+    auto setTsUi = [&](int mask) {
+        btnTsBoth->setActive(mask == 3); btnTs1->setActive(mask == 1); btnTs2->setActive(mask == 2);
+    };
+    setTsUi(3);
+    btnTsBoth->onClick = [&]() { setTsUi(3); std::lock_guard<std::mutex> l(cur->sd.mtx); cur->sd.digSlotMask = 3; };
+    btnTs1->onClick = [&]() { setTsUi(1); std::lock_guard<std::mutex> l(cur->sd.mtx); cur->sd.digSlotMask = 1; };
+    btnTs2->onClick = [&]() { setTsUi(2); std::lock_guard<std::mutex> l(cur->sd.mtx); cur->sd.digSlotMask = 2; };
+    chkMuteEnc->onToggle = [&](bool b) { std::lock_guard<std::mutex> l(cur->sd.mtx); cur->sd.digMuteEncrypted = b; };
+
+    // Four lines about the digital voice signal for the demodulator panel
+    sf::Clock digitalUiClock;
+    auto digitalStatusText = [](const dv::Status& ds, Mode m) {
+        std::string l1, l2, l3, l4;
+        if (ds.proto.empty() || ds.sinceSync > 3.0) {
+            l1 = m == Mode::DIGITAL ? "Searching: DMR, dPMR, D-STAR, YSF, NXDN..." : std::string("Searching for ") + modeName(m) + "...";
+            l2 = ds.everSync ? "(signal lost)" : "Tune to a digital voice channel";
+        } else {
+            l1 = ds.proto;
+            for (const auto& f : ds.fields) { if (f.first == "Color code" || f.first == "Colour code") l1 += "   CC " + f.second; else if (f.first == "RAN") l1 += "   RAN " + f.second; }
+            if (!ds.station.empty()) l1 += "   " + ds.station;
+            if (!ds.sync) l1 += "   (no frames)";
+            auto slotLine = [&](int sl) {
+                const dv::SlotView& v = ds.slot[sl];
+                std::string t = ds.nSlots > 1 ? "TS" + std::to_string(sl + 1) + ": " : "";
+                if (v.voice) t += v.encrypted ? "ENCRYPTED  " : "VOICE  ";
+                else t += v.activity.empty() ? "-" : v.activity;
+                if (!v.from.empty() || !v.to.empty()) t += (v.voice ? "" : "   last ") + v.from + (v.to.empty() ? "" : " > " + v.to);
+                if (v.voice && v.voiceSec > 0.5) t += "  " + std::to_string((int)v.voiceSec) + " s";
+                return t;
+            };
+            l2 = slotLine(0);
+            if (ds.nSlots > 1) l3 = slotLine(1);
+            // talker alias, encryption details, emergency / GPS of the slot that speaks
+            int sp = -1;
+            for (int sl = 0; sl < ds.nSlots && sl < 2; sl++) if (ds.slot[sl].voice) { sp = sl; break; }
+            if (sp >= 0) {
+                const dv::SlotView& v = ds.slot[sp];
+                if (v.encrypted && !v.encText.empty()) l4 = "Encrypted: " + v.encText;
+                else if (!v.alias.empty()) l4 = "Alias: " + v.alias;
+                else if (!v.extra.empty()) l4 = v.extra;
+            } else if (!ds.system.empty()) l4 = ds.system;
+            if (ds.nSlots == 1) { l3 = l4; l4.clear(); }
+        }
+        auto cut = [](std::string s) { return s.size() > 52 ? s.substr(0, 51) + "." : s; };
+        return cut(l1) + "\n" + cut(l2) + "\n" + cut(l3) + "\n" + cut(l4);
     };
 
     // --- Bookmarks and the scanner (see Bookmarks.h) ---
@@ -1188,7 +1279,7 @@ int main() {
         if (audioIn) cur->modeBeforeAudio = curMode;
         cur->inputIsAudio = audioIn;
         { std::lock_guard<std::mutex> l(cur->sd.mtx); cur->sd.audioInput = audioIn; }
-        if (audioIn) setMode(Mode::RAW, btnRAW.get());
+        if (audioIn) restoreMode(isDigitalMode(curMode) ? curMode : Mode::RAW);   // digital voice also decodes audio
         else restoreMode(cur->modeBeforeAudio);
     };
 
@@ -1209,13 +1300,15 @@ int main() {
     auto chkCW    = std::make_shared<Checkbox>("CW (Morse code)", font);
     auto chkNAVTEX = std::make_shared<Checkbox>("NAVTEX (518 / 490 kHz)", font);
     auto chkDSC   = std::make_shared<Checkbox>("DSC (VHF ch70 156.525, MF/HF)", font);
+    auto chkDV    = std::make_shared<Checkbox>(DigitalVoiceDecoder::available() ? "Digital voice (DMR, dPMR, D-STAR, YSF...)"
+                                                                               : "Digital voice (not in this build)", font);
     auto chkWSJT  = std::make_shared<Checkbox>(WSJTDecoder::ft8Available() ? "FT8 / FT4 / WSPR (HF digital)"
                                                                            : "WSPR (FT8 / FT4 not in this build)", font);
 
     // The checkboxes; the modules are the shown receiver's (cur->decMods[i], nullptr = APRS)
     struct DecoderEntry { std::shared_ptr<Checkbox> chk; };
     std::vector<DecoderEntry> decoders = {
-        {chkAprs}, {chkAIS}, {chkSSTV}, {chkWEFAX}, {chkISM}, {chkACARS}, {chkVDL2}, {chkADSB}, {chkWSJT}, {chkCW}, {chkNAVTEX}, {chkDSC} };
+        {chkAprs}, {chkDV}, {chkAIS}, {chkSSTV}, {chkWEFAX}, {chkISM}, {chkACARS}, {chkVDL2}, {chkADSB}, {chkWSJT}, {chkCW}, {chkNAVTEX}, {chkDSC} };
 
     auto activateDecoderOn = [&](Receiver* r, size_t idx, bool on) {
         SDRModule* const mod = r->decMods[idx];
@@ -1457,15 +1550,8 @@ int main() {
     ddSnap->setSelection(settingsMgr.getInt("step_index", 5));
 
     int savedMode = settingsMgr.getInt("mode_index", 1);
-    Mode mEnum = (Mode)savedMode;
-    if (mEnum == Mode::NFM) setMode(Mode::NFM, btnNFM.get());
-    else if (mEnum == Mode::AM) setMode(Mode::AM, btnAM.get());
-    else if (mEnum == Mode::WFM) setMode(Mode::WFM, btnWFM.get());
-    else if (mEnum == Mode::USB) setMode(Mode::USB, btnUSB.get());
-    else if (mEnum == Mode::LSB) setMode(Mode::LSB, btnLSB.get());
-    else if (mEnum == Mode::RAW) setMode(Mode::RAW, btnRAW.get());
-    else if (mEnum == Mode::CW) setMode(Mode::CW, btnCW.get());
-    else setMode(Mode::OFF, btnOFF.get());
+    Mode mEnum = (Mode)std::clamp(savedMode, 0, MODE_LAST);
+    setMode(mEnum, buttonFor(mEnum));
 
     float savedBw = settingsMgr.getFloat("bandwidth", 12500.0f);
     slBW->setValueSilent(savedBw); slBW->onChange(savedBw);
@@ -1667,8 +1753,10 @@ int main() {
         // demodulator and display (kept in the receiver's SharedData)
         Mode m; float bw, sq, minDb, maxDb, zoom; bool st, rds, rec, play; RecMode rm; std::string recPath;
         double pct;
+        int tsMask; bool muteEnc;
         {
             std::lock_guard<std::mutex> l(r->sd.mtx);
+            tsMask = r->sd.digSlotMask; muteEnc = r->sd.digMuteEncrypted;
             m = r->sd.mode; bw = (float)r->sd.bandwidth; sq = r->sd.squelchThreshold;
             st = r->sd.stereoEnabled; rds = r->sd.rdsEnabled; minDb = r->sd.minDb; maxDb = r->sd.maxDb; zoom = r->sd.zoomLevel;
             rec = r->sd.isRecording; rm = r->sd.recMode; recPath = r->sd.recPath; play = r->sd.isPlaying;
@@ -1676,6 +1764,8 @@ int main() {
         }
         restoreMode(m);
         if (m != Mode::OFF) { slBW->setValueSilent(bw); slBW->onChange(slBW->currentVal); }
+        setTsUi(tsMask);
+        chkMuteEnc->checked = muteEnc;
         slSq->setValueSilent(sq);
         chkStereo->checked = st;
         chkRds->checked = rds;
@@ -1931,7 +2021,7 @@ int main() {
                 }
             }
             const int m = settingsMgr.getInt(k + "mode", (int)Mode::NFM);
-            restoreMode((Mode)std::clamp(m, 0, (int)Mode::CW));
+            restoreMode((Mode)std::clamp(m, 0, MODE_LAST));
             const float bw = settingsMgr.getFloat(k + "bandwidth", 12500.0f);
             slBW->setValueSilent(bw);
             slBW->onChange(slBW->currentVal);
@@ -2702,7 +2792,17 @@ int main() {
             // tuning by hand stops the scanner
             if (scanner.running() && pendingBookmarkTune < 0 && freqVFO.getFrequency() != scanner.tunedHz) { scanner.stop(); setScanUi(); }
             const bool wasRunning = scanner.running();
-            scanner.update(bookmarks.items, scanClock.getElapsedTime().asSeconds(), snr, fresh);
+            // digital voice bookmarks: held while speech is decoded, not on a bare carrier
+            int voice = -1;
+            if (scanner.running() && scanner.current >= 0 && scanner.current < (int)bookmarks.items.size() &&
+                isDigitalMode(bookmarks.items[scanner.current].mode)) {
+                // (encrypted calls that are muted are skipped too)
+                const dv::Status ds = cur->sd.digital->status();
+                voice = 0;
+                for (int sl = 0; sl < ds.nSlots && sl < 2; sl++)
+                    if (ds.slot[sl].voice && !(ds.slot[sl].encrypted && chkMuteEnc->checked)) voice = 1;
+            }
+            scanner.update(bookmarks.items, scanClock.getElapsedTime().asSeconds(), snr, fresh, voice);
             if (wasRunning != scanner.running()) setScanUi();
             if (pendingBookmarkTune >= 0 && pendingBookmarkTune < (int)bookmarks.items.size()) {
                 const Bookmark b = bookmarks.items[pendingBookmarkTune];
@@ -2720,6 +2820,18 @@ int main() {
             const std::string st = scanner.status(bookmarks.items);
             static std::string lastSt;
             if (st != lastSt) { lblScan->setText(st); lastSt = st; }
+        }
+
+        // --- Digital voice status under the demodulator buttons (5 times a second) ---
+        if (grpDigital->shown && digitalUiClock.getElapsedTime().asMilliseconds() > 200) {
+            digitalUiClock.restart();
+            const dv::Status ds = cur->sd.digital->status();
+            Mode dm;
+            { std::lock_guard<std::mutex> l(cur->sd.mtx); dm = cur->sd.mode; }
+            lblDigital->setText(digitalStatusText(ds, dm));
+            bool enc = false, voice = false;
+            for (int sl = 0; sl < ds.nSlots && sl < 2; sl++) { enc = enc || (ds.slot[sl].voice && ds.slot[sl].encrypted); voice = voice || ds.slot[sl].voice; }
+            lblDigital->setColor(enc ? sf::Color(255, 140, 110) : voice ? sf::Color(140, 230, 150) : ds.sync ? sf::Color(200, 200, 210) : sf::Color(140, 140, 150));
         }
 
         // --- Satellite map window and frequency / Doppler tracking ---

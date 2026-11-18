@@ -65,6 +65,7 @@ class ChannelSet {
     std::vector<DecoderChannel> channels;
     int nextId = 1;
     long long lastCentre = -1;
+    long long lastVfo = 0;
     double lastRate = 0.0;
     bool placed = false;
 
@@ -200,6 +201,7 @@ public:
         }
         lastCentre = centreHz;
         lastRate = rate;
+        lastVfo = vfoHz;
 
         std::vector<ResolvedChannel> out;
         for (auto& c : channels) {
@@ -216,6 +218,25 @@ public:
     }
 
     // --- UI thread ---
+    // A channel placed by the user (at the tuner when freqHz is 0); returns its id, 0 if full
+    int addChannel(long long freqHz = 0) {
+        std::lock_guard<std::mutex> l(mtx);
+        if (freqHz == 0) freqHz = lastVfo;
+        size_t fixed = 0;
+        for (const auto& c : channels) if (!c.followVfo) fixed++;
+        if (fixed >= maxChannels) return 0;
+        for (const auto& c : channels) if (!c.followVfo && std::llabs(c.freqHz - freqHz) < 500) return c.id;
+        auto c = make(freqHz);
+        c.autoPlaced = false; c.followVfo = false; c.fallback = false;
+        channels.push_back(c);
+        return c.id;
+    }
+    void removeChannel(int id) {
+        std::lock_guard<std::mutex> l(mtx);
+        channels.erase(std::remove_if(channels.begin(), channels.end(), [&](const DecoderChannel& c) { return c.id == id && !c.followVfo; }), channels.end());
+    }
+    long long tunerHz() const { std::lock_guard<std::mutex> l(mtx); return lastVfo; }
+
     std::vector<DecoderChannel> snapshot() const {
         std::lock_guard<std::mutex> l(mtx);
         return channels;

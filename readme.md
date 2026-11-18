@@ -58,6 +58,7 @@ xattr -dr com.apple.quarantine /Applications/OrbitSDR.app
 
 | Decoder | Typical frequency | What you get |
 |---|---|---|
+| **Digital voice** (DMR, dPMR, D-STAR, YSF, NXDN) | e.g. PMR446 (446.0–446.2 MHz), ham repeaters, ports, events, business radio | Finds the system by itself. DMR: colour code, repeater or direct mode, both time slots with source ID → talkgroup / private call, talker alias, GPS, emergency, the manufacturer feature set and the system type (Tier II, Capacity Plus, Connect Plus, Tier III). dPMR: colour code, IDs. D-STAR: callsigns, repeaters, text, locator. YSF: callsigns, uplink / downlink. NXDN: RAN, IDs. Several channels at once (**+ Channel at tuner** pins the tuner's frequency), a card per channel and a list of calls; the speech goes to the speaker (one channel at a time or all mixed). Encrypted calls are marked with the algorithm and key id and kept silent: nothing is ever decrypted. Signals no decoder understands are described (TETRA, analog FM, FSK of an unknown system). Also decodes a scanner's discriminator audio (Input: Audio). |
 | **AIS** | 161.975 / 162.025 MHz | Ships: name, call sign, type, position, speed, course. Both channels decoded at once. |
 | **ISM** (rtl_433) | 433.92 / 868 / 315 / 915 MHz | About 300 device types: weather stations, thermometers, tyre pressure sensors (TPMS), door sensors, remotes, utility meters. |
 | **ACARS** | 129–137 MHz | Aircraft datalink: registration, flight, label, message text. All ACARS channels in the bandwidth are decoded at once. |
@@ -72,7 +73,9 @@ xattr -dr com.apple.quarantine /Applications/OrbitSDR.app
 | **NAVTEX** | 518 / 490 kHz, 4209.5 kHz | Maritime safety broadcasts (SITOR-B): navigational and weather warnings, forecasts, search and rescue. Station, subject and number of each message; the text appears while it is being received. All NAVTEX frequencies in the bandwidth are decoded at once (USB/CW to listen). |
 | **DSC** | 156.525 MHz (VHF ch 70), 2187.5 / 4207.5 / 6312 / 8414.5 / 12577 / 16804.5 kHz | Digital Selective Calling (GMDSS): distress, urgency, safety and routine calls between ships and coast stations. MMSI of caller and called station, nature of distress, position, working channel. Distress calls are shown in red; positions go on the map (with the ship's AIS track, same MMSI). Also decodes a scanner's FM audio (Input: Audio). |
 
-Decoded messages are logged in the settings folder (`ism.log`, `acars.log`, `vdl2.log`, `wsjt.log`, `cw.log`, `navtex.log`, `dsc.log`, `aprs.log`). **Export** saves the messages of the current session to a file. Click a row in any decoder table to see all of its fields.
+The digital voice modes are also in the **Demodulator** (second row: DIGITAL finds the system, or DMR / dPMR / D-STAR / YSF / NXDN): they just play the speech like NFM, with a short status below the buttons and a choice of the DMR time slot. Bookmarks keep the mode, so the **scanner** can scan NFM and DMR channels mixed; on a digital voice bookmark it stops only for speech, not for a repeater's idle frames.
+
+Decoded messages are logged in the settings folder (`digitalvoice.log`, `ism.log`, `acars.log`, `vdl2.log`, `wsjt.log`, `cw.log`, `navtex.log`, `dsc.log`, `aprs.log`). **Export** saves the messages of the current session to a file. Click a row in any decoder table to see all of its fields.
 
 ## Features
 
@@ -112,6 +115,7 @@ OrbitSDR is under active development. macOS on Apple Silicon and Windows with SD
 - AIS, ISM, APRS, RDS, SSTV and WEFAX have been tested on real off-air signals.
 - **ACARS has only been tested with recordings so far.** If you live near an airport, please try it and [report the result](https://github.com/krzysztofchojka/OrbitSDR/issues).
 - **VDL2, FT8 / FT4 / WSPR, CW, NAVTEX and DSC are new and have been tested with generated signals only.** Reports with real signals (and recordings that don't decode) are very welcome.
+- **Digital voice has been tested with a DMR recording (discriminator audio) and generated signals.** dPMR, D-STAR, YSF and NXDN use the same proven library (DSDcc, as in SDRangel) but have not been tried with OrbitSDR yet: recordings are welcome.
 - More digital decoders are planned.
 
 Bug reports, recordings of signals that don't decode, and feature requests are very welcome in [Issues](https://github.com/krzysztofchojka/OrbitSDR/issues). If OrbitSDR is useful to you, a ⭐ helps other people find it.
@@ -177,10 +181,14 @@ The rtl_433 sources are not stored in this repository. The build scripts call `s
 
 [ft8_lib](https://github.com/kgoba/ft8_lib) (MIT) is kept in `deps/ft8_lib`. The build scripts call `scripts/ft8lib.sh`, which compiles it once with the C compiler into `.cache/`. If that fails, OrbitSDR is built without FT8 / FT4 (WSPR still works).
 
+### DSDcc and mbelib (digital voice)
+
+[DSDcc](https://github.com/f4exb/dsdcc) (GPL v3, with OrbitSDR's additions, see `deps/dsdcc/README.md`) and [mbelib](https://github.com/szechyjs/mbelib) (ISC) are kept in `deps/`. The build scripts call `scripts/dsdcc.sh`, which compiles them once into `.cache/`. The voice codecs (AMBE / IMBE) may be covered by patents in some countries: `./build.sh --no-vocoder` (or `ORBITSDR_NO_VOCODER=1` for any build script) leaves mbelib out, the calls are then shown without speech. `--disable-digital` (`ORBITSDR_NO_DIGITAL=1`) leaves out digital voice entirely.
+
 ## License and credits
 
 OrbitSDR is licensed under the [GNU GPL v3](LICENSE).
 
-It uses [SFML](https://www.sfml-dev.org/), [miniaudio](https://miniaud.io/), [librtlsdr](https://osmocom.org/projects/rtl-sdr), [rtl_433](https://github.com/merbanan/rtl_433) (GPL-2.0-or-later), [ft8_lib](https://github.com/kgoba/ft8_lib) (MIT) and the [SDRplay API](https://www.sdrplay.com/).
+It uses [SFML](https://www.sfml-dev.org/), [miniaudio](https://miniaud.io/), [librtlsdr](https://osmocom.org/projects/rtl-sdr), [rtl_433](https://github.com/merbanan/rtl_433) (GPL-2.0-or-later), [ft8_lib](https://github.com/kgoba/ft8_lib) (MIT), [DSDcc](https://github.com/f4exb/dsdcc) (Edouard Griffiths F4EXB; GPL v3), [mbelib](https://github.com/szechyjs/mbelib) (ISC) and the [SDRplay API](https://www.sdrplay.com/).
 
 The WSPR decoder is a C++ port of wsprd from [WSJT-X](https://wsjt.sourceforge.io/) (K1JT, K9AN; GPL v3), the VDL2 decoder follows [dumpvdl2](https://github.com/szpajder/dumpvdl2) (Tomasz Lemiech; GPL v3) with the Reed-Solomon decoder of Phil Karn's libfec (LGPL). The NAVTEX and DSC decoders follow the ones in [SDRangel](https://github.com/f4exb/sdrangel) (Jon Beniston; GPL v3), the CCIR 476 tables are taken from there.

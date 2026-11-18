@@ -16,6 +16,10 @@ for arg in "$@"; do
   case $arg in
     --enable-sdrplay) SDRPLAY_MODE="yes"; shift ;;
     --disable-sdrplay) SDRPLAY_MODE="no"; shift ;;
+    # digital voice (DMR, dPMR, D-STAR, YSF, NXDN) is built in; these leave out the voice codec
+    # (frames and info only, no speech) or the whole digital voice support
+    --no-vocoder) export ORBITSDR_NO_VOCODER=1; shift ;;
+    --disable-digital) export ORBITSDR_NO_DIGITAL=1; shift ;;
   esac
 done
 
@@ -69,8 +73,8 @@ echo "Compiling with modules: $MODULE_SOURCES"
 # ft8_lib (FT8 / FT4 decoder): vendored in deps/ft8_lib, compiled once into .cache/
 . scripts/ft8lib.sh
 
-$CXX -std=c++17 -O3 $SDR_FLAGS $RTL433_FLAGS $FT8LIB_FLAGS $FINAL_INCLUDES \
-    $SRC_DIR/main.cpp $MODULE_SOURCES $RTL433_LIB $FT8LIB_LIB \
+$CXX -std=c++17 -O3 $SDR_FLAGS $RTL433_FLAGS $FT8LIB_FLAGS $DSDCC_FLAGS $FINAL_INCLUDES \
+    $SRC_DIR/main.cpp $MODULE_SOURCES $RTL433_LIB $FT8LIB_LIB $DSDCC_LIB \
     -o $OUT_FILE $FINAL_LIBS $EXTRAS
 
 if [ $? -ne 0 ]; then
