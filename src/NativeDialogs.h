@@ -247,6 +247,66 @@ inline std::string saveTextFileDialog(const std::string& folder, const std::stri
     return result;
 }
 
+// Opens a native file picker for a JSON file (bookmark banks). Empty when cancelled.
+inline std::string openJsonFileDialog(const std::string& title = "Import bookmarks") {
+    std::string result = "";
+    #ifdef _WIN32
+        char filename[MAX_PATH] = {0};
+        OPENFILENAMEA ofn;
+        ZeroMemory(&ofn, sizeof(ofn));
+        ofn.lStructSize = sizeof(ofn);
+        ofn.lpstrFile = filename;
+        ofn.nMaxFile = sizeof(filename);
+        ofn.lpstrFilter = "JSON file (*.json)\0*.json\0All Files\0*.*\0";
+        ofn.nFilterIndex = 1;
+        ofn.lpstrTitle = title.c_str();
+        ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+        if (GetOpenFileNameA(&ofn)) result = filename;
+    #elif __APPLE__
+        result = runDialog("osascript -e 'try' -e 'POSIX path of (choose file with prompt \"" + title + "\")' -e 'on error' -e 'return \"\"' -e 'end try'");
+    #elif __linux__
+        result = runDialog("zenity --file-selection --file-filter='*.json' --title='" + title + "' 2>/dev/null");
+    #endif
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) result.pop_back();
+    return result;
+}
+
+// Opens a native "Save as" dialog for a JSON file; the .json extension is added when missing
+inline std::string saveJsonFileDialog(const std::string& folder, const std::string& fileName,
+                                      const std::string& title = "Export bookmarks") {
+    std::string result = "";
+    #ifdef _WIN32
+        char filename[MAX_PATH] = {0};
+        fileName.copy(filename, MAX_PATH - 1);
+        std::string initialDir = folder;
+        for (auto& c : initialDir) if (c == '/') c = '\\';
+        OPENFILENAMEA ofn;
+        ZeroMemory(&ofn, sizeof(ofn));
+        ofn.lStructSize = sizeof(ofn);
+        ofn.lpstrFile = filename;
+        ofn.nMaxFile = sizeof(filename);
+        ofn.lpstrFilter = "JSON file (*.json)\0*.json\0All Files\0*.*\0";
+        ofn.nFilterIndex = 1;
+        ofn.lpstrInitialDir = initialDir.c_str();
+        ofn.lpstrDefExt = "json";
+        ofn.lpstrTitle = title.c_str();
+        ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if (GetSaveFileNameA(&ofn)) result = filename;
+    #elif __APPLE__
+        result = runDialog("osascript -e 'try' -e 'POSIX path of (choose file name with prompt \"" + title + "\" default name \"" + fileName +
+                           "\" default location (POSIX file \"" + folder + "\"))' -e 'on error' -e 'return \"\"' -e 'end try'");
+    #elif __linux__
+        result = runDialog("zenity --file-selection --save --confirm-overwrite --title='" + title + "' --filename='" + folder + "/" + fileName + "' 2>/dev/null");
+    #endif
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) result.pop_back();
+    if (!result.empty()) {
+        std::string lower = result;
+        for (auto& c : lower) c = (char)std::tolower((unsigned char)c);
+        if (lower.size() < 5 || lower.compare(lower.size() - 5, 5, ".json") != 0) result += ".json";
+    }
+    return result;
+}
+
 // Opens a file (e.g. a log) in the system's default application
 inline void openWithDefaultApp(const std::string& path) {
     #ifdef _WIN32

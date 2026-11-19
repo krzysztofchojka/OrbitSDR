@@ -80,17 +80,59 @@ public:
         items.clear();
         banks.clear();
         ensureBank(defaultBank());
-        std::ifstream f(path);
-        if (!f.is_open()) return;
+        std::vector<Bookmark> got;
+        std::vector<std::string> gotBanks;
+        if (!readFile(path, got, gotBanks)) return;
+        for (const auto& b : gotBanks) ensureBank(b);
+        for (const auto& b : got) { ensureBank(b.bank); items.push_back(b); }
+        sort();
+    }
+
+    void save() const {
+        if (path.empty()) return;
+        writeFile(path, std::string());
+    }
+
+    // Writes the bookmarks of one bank ("" = all banks) in the bookmarks.json format
+    bool writeFile(const std::string& file, const std::string& onlyBank) const {
+        std::ofstream f(file, std::ios::trunc);
+        if (!f.is_open()) return false;
+        f << "{\n  \"banks\": [";
+        bool firstBank = true;
+        for (const auto& bk : banks) {
+            if (!onlyBank.empty() && bk != onlyBank) continue;
+            f << (firstBank ? "" : ", ") << "\"" << jsonEscape(bk) << "\"";
+            firstBank = false;
+        }
+        f << "],\n  \"bookmarks\": [\n";
+        bool first = true;
+        for (const Bookmark& b : items) {
+            if (!onlyBank.empty() && b.bank != onlyBank) continue;
+            f << (first ? "" : ",\n")
+              << "    {\"name\": \"" << jsonEscape(b.name) << "\", \"freq\": " << b.freqHz << ", \"mode\": " << (int)b.mode
+              << ", \"bw\": " << (long long)b.bandwidthHz << ", \"scan\": " << (b.scan ? "true" : "false")
+              << ", \"bank\": \"" << jsonEscape(b.bank) << "\"}";
+            first = false;
+        }
+        f << (first ? "" : "\n") << "  ]\n}\n";
+        return f.good();
+    }
+
+    // Reads a bookmarks.json-style file (also a bare array of bookmarks); false if it is not one
+    static bool readFile(const std::string& file, std::vector<Bookmark>& out, std::vector<std::string>& outBanks) {
+        std::ifstream f(file);
+        if (!f.is_open()) return false;
         std::stringstream ss;
         ss << f.rdbuf();
         orbit::JsonValue root;
-        if (!orbit::parseJson(ss.str(), root)) return;
+        if (!orbit::parseJson(ss.str(), root)) return false;
         if (const orbit::JsonValue* bl = root.get("banks"); bl && bl->type == orbit::JsonValue::Array)
-            for (const auto& v : bl->arr) if (v.type == orbit::JsonValue::String) ensureBank(v.str);
+            for (const auto& v : bl->arr)
+                if (v.type == orbit::JsonValue::String && !v.str.empty()) outBanks.push_back(v.str);
         const orbit::JsonValue* arr = root.type == orbit::JsonValue::Array ? &root : root.get("bookmarks");
-        if (!arr || arr->type != orbit::JsonValue::Array) return;
+        if (!arr || arr->type != orbit::JsonValue::Array) return !outBanks.empty();
         for (const auto& v : arr->arr) {
+            if (v.type != orbit::JsonValue::Object) continue;
             Bookmark b;
             b.name = v.getString("name");
             b.freqHz = (long long)v.getNumber("freq", 0);
@@ -100,27 +142,28 @@ public:
             b.scan = v.getBool("scan", true);
             b.bank = v.getString("bank", defaultBank());
             if (b.bank.empty()) b.bank = defaultBank();
-            ensureBank(b.bank);
-            if (b.freqHz > 0) items.push_back(b);
+            if (b.freqHz > 0) out.push_back(b);
         }
-        sort();
+        return true;
     }
 
-    void save() const {
-        if (path.empty()) return;
-        std::ofstream f(path, std::ios::trunc);
-        if (!f.is_open()) return;
-        f << "{\n  \"banks\": [";
-        for (size_t i = 0; i < banks.size(); i++) f << (i ? ", " : "") << "\"" << jsonEscape(banks[i]) << "\"";
-        f << "],\n  \"bookmarks\": [\n";
-        for (size_t i = 0; i < items.size(); i++) {
-            const Bookmark& b = items[i];
-            f << "    {\"name\": \"" << jsonEscape(b.name) << "\", \"freq\": " << b.freqHz << ", \"mode\": " << (int)b.mode
-              << ", \"bw\": " << (long long)b.bandwidthHz << ", \"scan\": " << (b.scan ? "true" : "false")
-              << ", \"bank\": \"" << jsonEscape(b.bank) << "\"}"
-              << (i + 1 < items.size() ? "," : "") << "\n";
+    // Adds the banks and bookmarks of a file; a bookmark on the same frequency in the same
+    // bank is replaced. Returns the number of bookmarks read, -1 if the file is not valid.
+    int importFile(const std::string& file) {
+        std::vector<Bookmark> got;
+        std::vector<std::string> gotBanks;
+        if (!readFile(file, got, gotBanks)) return -1;
+        for (const auto& b : gotBanks) ensureBank(b);
+        for (const auto& b : got) {
+            ensureBank(b.bank);
+            bool replaced = false;
+            for (auto& x : items)
+                if (x.freqHz == b.freqHz && x.bank == b.bank) { x = b; replaced = true; break; }
+            if (!replaced) items.push_back(b);
         }
-        f << "  ]\n}\n";
+        sort();
+        save();
+        return (int)got.size();
     }
 
     void sort() {

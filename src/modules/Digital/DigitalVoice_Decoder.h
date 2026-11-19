@@ -524,6 +524,8 @@ class DigitalVoiceDecoder : public SDRModule {
 public:
     ModuleLog log;
     std::string exportDir;
+    // The user's name for a frequency (the bookmark saved on it), "" if none: shown on the cards
+    static inline std::function<std::string(long long)> channelLabel;
 
     static bool available() { return dv::available(); }
 
@@ -984,6 +986,24 @@ private:
         sf::Text tl = text(lv, 20, sf::Color(140, 140, 150));
         tl.setPosition({hx, y + 6.0f});
         win.draw(tl);
+        hx += tl.getGlobalBounds().size.x + 8.0f;
+        // the bookmark's name, in what is left before the card's buttons
+        if (!cv.isAudio && channelLabel) {
+            const std::string name = channelLabel(cv.freqHz);
+            const float btnLeft = x + w - 6.0f - (cv.follow ? 0.0f : 20.0f) - 48.0f - 50.0f - 6.0f;
+            const size_t room = (size_t)std::max(0.0f, (btnLeft - hx) / 6.2f);
+            if (!name.empty() && room >= 4) {
+                std::string shown = name;
+                if (shown.size() > room) {   // cut on a UTF-8 character boundary (Polish letters)
+                    size_t n = room - 1;
+                    while (n > 0 && ((unsigned char)shown[n] & 0xC0) == 0x80) n--;
+                    shown = shown.substr(0, n) + ".";
+                }
+                sf::Text tn = text(shown, 22, sf::Color(255, 220, 120));
+                tn.setPosition({hx, y + 5.0f});
+                win.draw(tn);
+            }
+        }
 
         // buttons on the card: system choice, speaker, remove
         float bx = x + w - 6.0f;

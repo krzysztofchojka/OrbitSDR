@@ -12,6 +12,7 @@
 #include <iostream>
 #include <optional>
 #include <regex>
+#include <cstring>
 
 // Core System
 #include "DSP.h"
@@ -1164,6 +1165,10 @@ int main() {
     auto btnBankDel = std::make_shared<SdrButton>(128, 25, "Delete bank", font);
     auto rowBank = std::make_shared<RowContainer>();
     rowBank->add(btnBankNew); rowBank->add(btnBankDel);
+    auto btnBankExport = std::make_shared<SdrButton>(128, 25, "Export bank...", font);
+    auto btnBankImport = std::make_shared<SdrButton>(128, 25, "Import...", font);
+    auto rowBankIo = std::make_shared<RowContainer>();
+    rowBankIo->add(btnBankExport); rowBankIo->add(btnBankImport);
     auto txtBookName = std::make_shared<TextInput>(SIDEBAR_W - 40, 25.0f, font);
     auto btnBookAdd = std::make_shared<SdrButton>(128, 25, "Add current", font);
     auto btnBookSave = std::make_shared<SdrButton>(128, 25, "Update selected", font);
@@ -1178,12 +1183,16 @@ int main() {
     auto slScanThr = std::make_shared<Slider>(SIDEBAR_W - 40, 3.0f, 40.0f, 12.0f, "Stop at SNR >= 12 dB", font);
     auto slScanHang = std::make_shared<Slider>(SIDEBAR_W - 40, 0.0f, 15.0f, 3.0f, "Resume 3 s after the signal", font);
     auto lblScan = std::make_shared<Label>("Scanner: off", font, 11, sf::Color(150, 150, 160));
+    auto chkBookMarks = std::make_shared<Checkbox>("Show the bank's bookmarks on the spectrum", font,
+                                                   settingsMgr.getBool("bookmark_markers", true));
     modBook->addWidget(std::make_shared<Label>("Bank (memory group):", font));
     modBook->addWidget(ddBank);
+    modBook->addWidget(chkBookMarks);
     modBook->addWidget(std::make_shared<Label>("Name (bookmark or new bank):", font));
     modBook->addWidget(txtBookName);
     modBook->addWidget(rowBook);
     modBook->addWidget(rowBank);
+    modBook->addWidget(rowBankIo);
     modBook->addWidget(bookList);
     modBook->addWidget(rowScan);
     modBook->addWidget(slScanThr);
@@ -1201,6 +1210,7 @@ int main() {
         ddBank->setSelection(sel);
         bookList->bankFilter = sel == 0 ? std::string() : opts[sel];
         btnBankDel->setEnabled(sel > 0 && opts[sel] != defaultBank());
+        btnBankExport->setText(sel == 0 ? "Export all..." : "Export bank...");
         sidebar.recalculateLayout();
     };
     auto currentBank = [&]() { return bookList->bankFilter.empty() ? defaultBank() : bookList->bankFilter; };
@@ -1224,12 +1234,52 @@ int main() {
         refreshBanks(defaultBank());
     };
     scanner.eligible = [&](int i) { return bookList->shows(i); };
+    // The digital voice cards show the name of the bookmark saved on their frequency
+    // (the nearest one within 2.5 kHz; the chosen bank wins a tie)
+    DigitalVoiceDecoder::channelLabel = [&](long long hz) -> std::string {
+        if (hz <= 0) return std::string();
+        int best = -1;
+        long long bestD = 2500;
+        for (int i = 0; i < (int)bookmarks.items.size(); i++) {
+            const Bookmark& b = bookmarks.items[i];
+            if (b.name.empty()) continue;
+            const long long d = std::llabs(b.freqHz - hz);
+            if (d < bestD || (d == bestD && best >= 0 && bookList->shows(i) && !bookList->shows(best))) { bestD = d; best = i; }
+        }
+        return best >= 0 ? bookmarks.items[best].name : std::string();
+    };
     auto setScanUi = [&]() {
         btnScan->setText(scanner.running() ? "Stop scan" : "Scan");
         btnScan->setActive(scanner.running());
         btnScanSkip->setEnabled(scanner.running());
     };
     setScanUi();
+    // Export: the chosen bank (or all of them) in the bookmarks.json format; import: adds its
+    // banks and bookmarks (the same frequency in the same bank is replaced)
+    btnBankExport->onClick = [&]() {
+        const std::string bank = bookList->bankFilter;
+        std::string fname = bank.empty() ? "bookmarks_all" : "bookmarks_" + bank;
+        for (auto& c : fname) if (std::strchr("\\/:*?\"<>| ", c)) c = '_';
+        const std::string path = saveJsonFileDialog(getDefaultExportPath(), fname + ".json");
+        if (path.empty()) return;
+        int n = 0;
+        for (const auto& b : bookmarks.items) if (bank.empty() || b.bank == bank) n++;
+        if (bookmarks.writeFile(path, bank))
+            showPopup("Bookmarks", std::to_string(n) + " bookmarks exported to\n" + path);
+        else
+            showPopup("Bookmarks", "Could not write\n" + path);
+    };
+    btnBankImport->onClick = [&]() {
+        const std::string path = openJsonFileDialog();
+        if (path.empty()) return;
+        if (scanner.running()) { scanner.stop(); setScanUi(); }
+        const int n = bookmarks.importFile(path);
+        if (n < 0) { showPopup("Bookmarks", "Not a bookmarks file:\n" + path); return; }
+        bookList->selected = -1;
+        bookList->active = -1;
+        refreshBanks(bookList->bankFilter);
+        showPopup("Bookmarks", std::to_string(n) + " bookmarks imported from\n" + path);
+    };
     slScanThr->onChange = [&](float v) {
         scanner.thresholdDb = v;
         char b[48]; std::snprintf(b, sizeof(b), "Stop at SNR >= %.0f dB", v); slScanThr->setText(b);
@@ -2242,6 +2292,10 @@ int main() {
             int best = -1;
             float bestD = 10.0f;
             for (size_t i = 0; i < chHandles.size(); i++) {
+                // a decoder that always keeps a channel on the tuner (digital voice, FT8): that
+                // handle sits on the tuner, grabbing it moves the tuner, not the channel (dragged
+                // off, the decoder would just put a new channel on the tuner)
+                if (chHandles[i].ch.followVfo && chHandles[i].set->alwaysTuner) continue;
                 const float d = std::abs(chHandles[i].x - m.x);
                 if (d <= bestD) { bestD = d; best = (int)i; }   // <=: the later (selected decoder) wins a tie
             }
@@ -3283,6 +3337,45 @@ int main() {
             window.draw(centerLine);
         }
 
+        // --- Bookmarks of the chosen bank: a thin line on the spectrum, the name near its bottom ---
+        if (chkBookMarks->checked && cf > 0 && !cur->inputIsAudio && visibleSpan > 0.0) {
+            const sf::Color lineCol(120, 200, 255, 110), textCol(160, 215, 255, 230);
+            const float specTop = (float)TOP_BAR_H, specBot = specTop + (float)layout.specH;
+            std::vector<float> rowEnd;   // labels in up to 3 rows, so neighbours don't overlap
+            for (int i = 0; i < (int)bookmarks.items.size(); i++) {
+                if (!bookList->shows(i)) continue;
+                const Bookmark& b = bookmarks.items[i];
+                if (b.freqHz < startFreq || b.freqHz > endFreq) continue;
+                const float bx = std::round(layout.specW * (float)((b.freqHz - startFreq) / visibleSpan));
+                sf::VertexArray ln(sf::PrimitiveType::Lines, 2);
+                ln[0].position = {bx + 0.5f, specTop + 4.0f}; ln[0].color = lineCol;
+                ln[1].position = {bx + 0.5f, specBot};        ln[1].color = lineCol;
+                window.draw(ln);
+                char fb[32];
+                std::snprintf(fb, sizeof(fb), "%.4f", b.freqHz / 1e6);
+                const std::string name = b.name.empty() ? std::string(fb) : b.name;
+                sf::Text t(font, sf::String::fromUtf8(name.begin(), name.end()), 20);
+                t.setScale({0.5f, 0.5f});
+                const float tw = t.getGlobalBounds().size.x;
+                const float lx = std::clamp(bx + 3.0f, 2.0f, std::max(2.0f, layout.specW - tw - 2.0f));
+                int row = -1;
+                for (size_t r = 0; r < rowEnd.size(); r++) if (rowEnd[r] <= lx) { row = (int)r; break; }
+                if (row < 0) {
+                    if (rowEnd.size() < 3) { row = (int)rowEnd.size(); rowEnd.push_back(0.0f); }
+                    else continue;   // crowded: the line alone
+                }
+                rowEnd[row] = lx + tw + 6.0f;
+                const float ly = specBot - 14.0f - 12.0f * (float)row;
+                sf::RectangleShape tbg({tw + 4.0f, 12.0f});
+                tbg.setPosition({lx - 2.0f, ly});
+                tbg.setFillColor(sf::Color(10, 14, 20, 170));
+                window.draw(tbg);
+                t.setFillColor(textCol);
+                t.setPosition({std::round(lx), std::round(ly - 1.0f)});
+                window.draw(t);
+            }
+        }
+
         // --- Decoder channels: yellow bands (spectrum, waterfall) and handles (tuning bar) ---
         if (!chHandles.empty()) {
             const float specTop = (float)TOP_BAR_H;
@@ -4008,6 +4101,8 @@ int main() {
     saveMgr.set("scan_threshold", slScanThr->currentVal);
     saveMgr.set("scan_hang", slScanHang->currentVal);
     saveMgr.set("bookmark_bank", bookList->bankFilter);
+    saveMgr.set("bookmark_markers", chkBookMarks->checked);
+    DigitalVoiceDecoder::channelLabel = nullptr;   // it refers to this function's locals
     saveMgr.set("stereo", chkStereo->checked);
     saveMgr.set("rds", chkRds->checked);
     saveMgr.set("picture_path", pictureDirCustom);
