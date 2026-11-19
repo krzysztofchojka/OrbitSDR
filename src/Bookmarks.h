@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cstdio>
 #include "UI.h"
+#include "modules/Core/ScrollDrag.h"
 #include "Demodulator.h"
 #include "orbit/Json.h"
 
@@ -150,6 +151,7 @@ class BookmarkList : public Widget {
     int maxRows = 10;
     int scroll = 0;
     int hoverRow = -1;
+    ScrollDrag sb;   // the list's scroll bar (draggable)
 
     // store indices of the rows shown (the chosen bank)
     std::vector<int> rowsIdx() const {
@@ -168,7 +170,7 @@ public:
     std::function<void(int)> onTune;
     std::function<void()> onChanged;   // scan flag / delete: saved, the sidebar re-lays out
 
-    BookmarkList(float width, const sf::Font& f) : font(f), w(width) {}
+    BookmarkList(float width, const sf::Font& f) : font(f), w(width) { sb.setHitWidth(8.0f); }   // the delete "x" is next to it
 
     int count() const { return (int)rowsIdx().size(); }
     bool shows(int storeIdx) const {
@@ -202,7 +204,9 @@ public:
     }
 
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
-        if (!store || !isMouseOver(win)) return false;
+        if (!store) return false;
+        if (sb.handleEvent(ev, win, scroll)) return true;   // the scroll bar (just right of the list)
+        if (!isMouseOver(win)) return false;
         const sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
         if (const auto* sc = ev.getIf<sf::Event::MouseWheelScrolled>()) {
             if (count() <= maxRows) return false;   // let the sidebar scroll
@@ -281,14 +285,12 @@ public:
             txt(modeShortName(b.mode), x + w - 52.0f, ry + 2.0f, sf::Color(150, 150, 160));
             txt("x", x + w - 12.0f, ry + 1.0f, idx == hoverRow ? sf::Color(255, 120, 120) : sf::Color(120, 120, 125));
         }
+        sb.hide();
         if (count() > maxRows) {   // scroll bar
             const float h = rows * rowH;
             const float th = std::max(12.0f, h * maxRows / (float)count());
-            const float ty = y + (h - th) * scroll / (float)(count() - maxRows);
-            sf::RectangleShape t({3.0f, th});
-            t.setPosition({x + w + 2.0f, ty});
-            t.setFillColor(sf::Color(150, 150, 150, 160));
-            win.draw(t);
+            sb.layout({{x + w + 2.0f, y}, {3.0f, h}}, th, (float)scroll, (float)(count() - maxRows));
+            sb.draw(win, sf::Color(150, 150, 150, 160));
         }
     }
 };

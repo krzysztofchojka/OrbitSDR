@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ScrollDrag.h"
 #include <SFML/Graphics.hpp>
 #include <string>
 #include <vector>
@@ -26,6 +27,7 @@ class DetailsPopup {
     std::shared_ptr<SdrButton> btnClose, btnCopy;
     sf::FloatRect rect;
     float scroll = 0.0f, contentH = 0.0f, viewH = 0.0f;
+    ScrollDrag sbText;   // the text's scroll bar (draggable)
 
     sf::Text text(const std::string& s, unsigned size, sf::Color c) const {
         sf::Text t(*font, sf::String::fromUtf8(s.begin(), s.end()), size);
@@ -88,6 +90,7 @@ public:
         if (!open) return false;
         if (btnClose->handleEvent(ev, win)) return true;
         if (btnCopy->handleEvent(ev, win)) return true;
+        if (sbText.handleEvent(ev, win, scroll)) return true;   // the text's scroll bar
         sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
         if (const auto* k = ev.getIf<sf::Event::KeyPressed>()) {
             if (k->code == sf::Keyboard::Key::Escape) open = false;
@@ -169,13 +172,12 @@ public:
             }
         }
         contentH = cy + scroll - top;
+        sbText.hide();
         if (contentH > viewH) {
             const float thumbH = std::max(20.0f, viewH * viewH / contentH);
             const float maxScroll = contentH - viewH;
-            sf::RectangleShape thumb({4.0f, thumbH});
-            thumb.setPosition({x + w - 10.0f, top + (viewH - thumbH) * (scroll / maxScroll)});
-            thumb.setFillColor(sf::Color(200, 200, 200, 140));
-            win.draw(thumb);
+            sbText.layout({{x + w - 10.0f, top}, {4.0f, viewH}}, thumbH, scroll, maxScroll);
+            sbText.draw(win);
         }
 
         btnCopy->setPosition(x + 20.0f, y + h - 42.0f);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../Core/SDRModule.h"
+#include "../Core/ScrollDrag.h"
 #include "../Core/DetailsPopup.h"
 #include "../Core/ModuleLog.h"
 #include "../Core/PositionBus.h"
@@ -94,6 +95,7 @@ inline bool looksLikeGrid(const std::string& t) {
 } // namespace wsjt
 
 class WSJTDecoder : public SDRModule {
+    ScrollDrag sbTable;   // the table's scroll bar (draggable)
     using Mode = wsjt::Mode;
 
     struct Entry {
@@ -597,6 +599,7 @@ public:
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
         if (!enabled) return false;
         if (popup.handleEvent(ev, win)) return true;
+        if (sbTable.handleEvent(ev, win, scrollRows)) return true;   // the table's scroll bar
         for (auto* b : {&btnClear, &btnLog, &btnExport, &btnFT8, &btnFT4, &btnWSPR, &btnCQ})
             if (*b && (*b)->handleEvent(ev, win)) return true;
         sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
@@ -735,14 +738,13 @@ public:
                 px += cols[c].w;
             }
         }
+        sbTable.hide();   // laid out again below when there is a bar
         if (count > visibleRows) {
             const float trackH = tableRect.size.y - rowH - 4.0f;
             const float thumbH = std::max(16.0f, trackH * visibleRows / (float)count);
             const float maxFirst = (float)(count - visibleRows);
-            sf::RectangleShape thumb({4.0f, thumbH});
-            thumb.setPosition({tableRect.position.x + tableRect.size.x - 6.0f, tableBodyY + (trackH - thumbH) * (tableFirst / maxFirst)});
-            thumb.setFillColor(sf::Color(200, 200, 200, 140));
-            win.draw(thumb);
+            sbTable.layout({{tableRect.position.x + tableRect.size.x - 6.0f, tableBodyY}, {4.0f, trackH}}, thumbH, scrollRows, maxFirst);
+            sbTable.draw(win);
         }
 
         // --- side column ---

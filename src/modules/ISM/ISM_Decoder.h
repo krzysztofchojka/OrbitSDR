@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../Core/SDRModule.h"
+#include "../Core/ScrollDrag.h"
 #include "IsmChannel.h"
 #include "../Core/DetailsPopup.h"
 #include "../Core/ModuleLog.h"
@@ -34,6 +35,7 @@
 // =====================================================================
 
 class ISMDecoder : public SDRModule {
+    ScrollDrag sbTable;   // the table's scroll bar (draggable)
     struct Field { std::string key, label, value; };
     struct Device {
         std::string key;          // model|id|channel
@@ -334,6 +336,7 @@ public:
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
         if (!enabled) return false;
         if (popup.handleEvent(ev, win)) return true;
+        if (sbTable.handleEvent(ev, win, scrollRows)) return true;   // the table's scroll bar
         if (btnClear && btnClear->handleEvent(ev, win)) return true;
         if (btnLog && btnLog->handleEvent(ev, win)) return true;
         if (btnExport && btnExport->handleEvent(ev, win)) return true;
@@ -481,14 +484,13 @@ public:
                 px += cols[c].w;
             }
         }
+        sbTable.hide();   // laid out again below when there is a bar
         if ((int)list.size() > visibleRows) {
             float trackH = tableRect.size.y - rowH - 4.0f;
             float thumbH = std::max(16.0f, trackH * visibleRows / (float)list.size());
             float maxFirst = (float)(list.size() - visibleRows);
-            sf::RectangleShape thumb({4.0f, thumbH});
-            thumb.setPosition({tableRect.position.x + tableRect.size.x - 6.0f, tableBodyY + (trackH - thumbH) * (first / maxFirst)});
-            thumb.setFillColor(sf::Color(200, 200, 200, 140));
-            win.draw(thumb);
+            sbTable.layout({{tableRect.position.x + tableRect.size.x - 6.0f, tableBodyY}, {4.0f, trackH}}, thumbH, scrollRows, maxFirst);
+            sbTable.draw(win);
         }
 
         // --- side column: status, buttons, details of the selected device or the latest messages ---

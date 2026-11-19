@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../Core/SDRModule.h"
+#include "../Core/ScrollDrag.h"
 #include "../Core/DetailsPopup.h"
 #include "../Core/ModuleLog.h"
 #include "../Core/PositionBus.h"
@@ -112,6 +113,7 @@ public:
 } // namespace acars
 
 class ACARSDecoder : public SDRModule {
+    ScrollDrag sbTable;   // the table's scroll bar (draggable)
     struct Entry {
         std::string time;
         long long freqHz = 0;
@@ -399,6 +401,7 @@ public:
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
         if (!enabled) return false;
         if (popup.handleEvent(ev, win)) return true;
+        if (sbTable.handleEvent(ev, win, scrollRows)) return true;   // the table's scroll bar
         if (btnClear && btnClear->handleEvent(ev, win)) return true;
         if (btnLog && btnLog->handleEvent(ev, win)) return true;
         if (btnExport && btnExport->handleEvent(ev, win)) return true;
@@ -514,15 +517,13 @@ public:
                 px += cols[c].w;
             }
         }
+        sbTable.hide();   // laid out again below when there is a bar
         if (count > visibleRows) {
             float trackH = tableRect.size.y - rowH - 4.0f;
             float thumbH = std::max(16.0f, trackH * visibleRows / (float)count);
             float maxFirst = (float)(count - visibleRows);
-            sf::RectangleShape thumb({4.0f, thumbH});
-            thumb.setPosition({tableRect.position.x + tableRect.size.x - 6.0f,
-                               tableBodyY + (trackH - thumbH) * (tableFirst / maxFirst)});
-            thumb.setFillColor(sf::Color(200, 200, 200, 140));
-            win.draw(thumb);
+            sbTable.layout({{tableRect.position.x + tableRect.size.x - 6.0f, tableBodyY}, {4.0f, trackH}}, thumbH, scrollRows, maxFirst);
+            sbTable.draw(win);
         }
 
         // --- side column ---

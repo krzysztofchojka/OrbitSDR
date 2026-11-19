@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../Core/SDRModule.h"
+#include "../Core/ScrollDrag.h"
 #include "../Core/DetailsPopup.h"
 #include "../Core/ModuleLog.h"
 #include "../Core/NarrowChannel.h"
@@ -50,6 +51,8 @@
 // =====================================================================
 
 class DigitalVoiceDecoder : public SDRModule {
+    ScrollDrag sbTable;   // the table's scroll bar (draggable)
+    ScrollDrag sbCards;   // the channel cards' scroll bar
     using C = std::complex<double>;
     static constexpr int AUDIO_ID = -1;
     static constexpr size_t MAX_CHANNELS = 12;
@@ -841,6 +844,8 @@ public:
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
         if (!enabled) return false;
         if (popup.handleEvent(ev, win)) return true;
+        if (sbTable.handleEvent(ev, win, tableScroll)) return true;   // the table's scroll bar
+        if (sbCards.handleEvent(ev, win, cardScroll)) return true;
         for (auto* b : {btnAdd.get(), btnMix.get(), btnDuck.get(), btnEnc.get(), btnTetra.get(), btnClear.get(), btnLog.get(), btnExport.get()})
             if (b && b->handleEvent(ev, win)) return true;
         const sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
@@ -1007,13 +1012,12 @@ private:
             if (cy < cardsRect.position.y - 1.0f || cy + ch > cardsRect.position.y + cardsRect.size.y + 1.0f) continue;   // only whole cards
             drawCard(win, cv, cx, cy, realW, ch, speaking == cv.id);
         }
+        sbCards.hide();
         if (maxScroll > 0) {
             const float trackH = cardsRect.size.y;
             const float thumbH = std::max(20.0f, trackH * cardsRect.size.y / (cardsRect.size.y + maxScroll));
-            sf::RectangleShape thumb({4.0f, thumbH});
-            thumb.setPosition({cardsRect.position.x + cardsRect.size.x + 2.0f, cardsRect.position.y + (trackH - thumbH) * (cardScroll / maxScroll)});
-            thumb.setFillColor(sf::Color(200, 200, 200, 140));
-            win.draw(thumb);
+            sbCards.layout({{cardsRect.position.x + cardsRect.size.x + 2.0f, cardsRect.position.y}, {4.0f, trackH}}, thumbH, cardScroll, maxScroll);
+            sbCards.draw(win);
         }
     }
 
@@ -1229,14 +1233,13 @@ private:
                 px += cols[k].w;
             }
         }
+        sbTable.hide();   // laid out again below when there is a bar
         if (count > visibleRows) {
             const float trackH = tableRect.size.y - rowH - 4.0f;
             const float thumbH = std::max(16.0f, trackH * visibleRows / (float)count);
             const float maxFirst = (float)(count - visibleRows);
-            sf::RectangleShape thumb({4.0f, thumbH});
-            thumb.setPosition({tableRect.position.x + tableRect.size.x - 6.0f, tableBodyY + (trackH - thumbH) * (tableFirst / maxFirst)});
-            thumb.setFillColor(sf::Color(200, 200, 200, 140));
-            win.draw(thumb);
+            sbTable.layout({{tableRect.position.x + tableRect.size.x - 6.0f, tableBodyY}, {4.0f, trackH}}, thumbH, tableScroll, maxFirst);
+            sbTable.draw(win);
         }
     }
 };

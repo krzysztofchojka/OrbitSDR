@@ -51,6 +51,7 @@
 // Satellite map and tracking
 #include "orbit/MapWindow.h"
 #include "MacWindowFix.h"
+#include "UiScale.h"
 
 // =====================================================================
 //  One receiver = one tab: a source (radio, file, sound card, rtl_tcp),
@@ -216,17 +217,20 @@ int main() {
     // --- UI SCALE SETUP ---
     // The whole UI is drawn in "logical" coordinates and the window view is scaled,
     // so every widget / mouse hit-test automatically follows the chosen scale.
-    const std::vector<std::string> UI_SCALE_NAMES  = {"Auto (system)", "100%", "125%", "150%", "175%", "200%", "250%"};
-    const std::vector<float>       UI_SCALE_VALUES = {0.0f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f, 2.5f};
+    // index 0 = Auto (the system's scale, see UiScale.h); Ctrl / Cmd + "+", "-", "0" step it
+    const std::vector<std::string> UI_SCALE_NAMES  = {"Auto (system)", "75%", "100%", "125%", "150%", "175%", "200%", "250%", "300%"};
+    const std::vector<float>       UI_SCALE_VALUES = {0.0f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f, 2.5f, 3.0f};
     int uiScaleIdx = 0;
     float autoUiScale = 1.0f;
-    #ifdef _WIN32
-    autoUiScale = detectWindowsUiScale((void*)window.getNativeHandle());
-    std::cout << "[INFO] Detected Windows UI scale: " << autoUiScale << std::endl;
-    #elif defined(__APPLE__)
-    autoUiScale = detectMacUiScale(window);
-    std::cout << "[INFO] Detected macOS backing scale: " << autoUiScale << std::endl;
-    #endif
+    auto detectAutoScale = [&]() -> bool {   // true when it changed
+        const uiscale::Detected d = uiscale::detect(window);
+        if (std::fabs(d.scale - autoUiScale) < 0.01f) return false;
+        autoUiScale = d.scale;
+        std::cout << "[INFO] System UI scale: " << autoUiScale << " (" << d.source << ")" << std::endl;
+        return true;
+    };
+    autoUiScale = 0.0f;
+    detectAutoScale();
     auto getUiScale = [&]() -> float {
         int idx = std::clamp(uiScaleIdx, 0, (int)UI_SCALE_VALUES.size() - 1);
         if (idx == 0) return autoUiScale;
@@ -1440,7 +1444,11 @@ int main() {
         uiScaleIdx = idx;
         if (applyUiScale) applyUiScale();
     };
-    modDisp->addWidget(std::make_shared<Label>("UI Scale:", font));
+#ifdef __APPLE__
+    modDisp->addWidget(std::make_shared<Label>("UI Scale (Cmd +/-/0):", font));
+#else
+    modDisp->addWidget(std::make_shared<Label>("UI Scale (Ctrl +/-/0):", font));
+#endif
     modDisp->addWidget(ddScale);
 
     auto ddSnap = std::make_shared<Dropdown>(150.0f, 25.0f, font);
@@ -1507,6 +1515,8 @@ int main() {
 
     LayoutState layout;
     sf::Vector2u lastSize = window.getSize();
+    sf::Clock scaleRecheck;          // Auto UI scale: when it was last looked up
+    bool scaleRecheckFocus = false;  // the window got the focus: look again (Linux)
 
     // w / h are LOGICAL sizes (window pixels divided by the UI scale)
     auto updateLayout = [&](int w, int h) {
@@ -1547,8 +1557,18 @@ int main() {
         updateLayout((int)lw, (int)lh);
     };
 
-    // Restore saved scale before the first layout pass
-    uiScaleIdx = std::clamp(settingsMgr.getInt("ui_scale", 0), 0, (int)UI_SCALE_VALUES.size() - 1);
+    // Restore saved scale before the first layout pass. Saved as a percentage (0 = Auto);
+    // older versions saved the index into {Auto, 100, 125, 150, 175, 200, 250}.
+    {
+        int pct = settingsMgr.getInt("ui_scale_pct", -1);
+        if (pct < 0) {
+            static const int OLD[] = {0, 100, 125, 150, 175, 200, 250};
+            pct = OLD[std::clamp(settingsMgr.getInt("ui_scale", 0), 0, 6)];
+        }
+        uiScaleIdx = 0;
+        for (int i = 1; i < (int)UI_SCALE_VALUES.size(); i++)
+            if (std::lround(UI_SCALE_VALUES[i] * 100.0f) == pct) uiScaleIdx = i;
+    }
     ddScale->setSelection(uiScaleIdx);
     applyUiScale();
 
@@ -2067,7 +2087,19 @@ int main() {
         }
         syncMacWindowSize(window);   // macOS window tiling resizes without telling SFML
         sf::Vector2u currSize = window.getSize();
-        if (currSize != lastSize && currSize.x > 0 && currSize.y > 0) {
+        // Auto scale: look again now and then (the window moved to another monitor, the
+        // system scale was changed). Windows / macOS: a cheap query, every second; Linux asks
+        // the X server and gsettings, so only when the window was resized or got the focus.
+        bool rescale = false;
+        if (uiScaleIdx == 0) {
+#if defined(__linux__)
+            const bool look = currSize != lastSize || scaleRecheckFocus;
+#else
+            const bool look = currSize != lastSize || scaleRecheck.getElapsedTime().asSeconds() > 1.0f;
+#endif
+            if (look) { scaleRecheck.restart(); scaleRecheckFocus = false; rescale = detectAutoScale(); }
+        }
+        if ((currSize != lastSize || rescale) && currSize.x > 0 && currSize.y > 0) {
             applyUiScale();
             lastSize = currSize;
         }
@@ -2428,6 +2460,35 @@ int main() {
         };
         while (const std::optional<sf::Event> ev = nextEvent()) {
             if (ev->is<sf::Event::Closed>()) window.close();
+            if (ev->is<sf::Event::FocusGained>()) scaleRecheckFocus = true;
+
+            // UI scale from the keyboard: Ctrl (Cmd on macOS) + "+" / "-" one step, "0" Auto
+            if (const auto* kp = ev->getIf<sf::Event::KeyPressed>()) {
+#ifdef __APPLE__
+                const bool mod = kp->system;
+#else
+                const bool mod = kp->control;
+#endif
+                using K = sf::Keyboard::Key;
+                const bool up = kp->code == K::Equal || kp->code == K::Add;
+                const bool down = kp->code == K::Hyphen || kp->code == K::Subtract;
+                const bool reset = kp->code == K::Num0 || kp->code == K::Numpad0;
+                if (mod && (up || down || reset)) {
+                    int idx = 0;
+                    if (!reset) {
+                        const float s = getUiScale();
+                        idx = uiScaleIdx;
+                        if (up) { for (int i = 1; i < (int)UI_SCALE_VALUES.size(); i++) if (UI_SCALE_VALUES[i] > s + 0.01f) { idx = i; break; } }
+                        else    { for (int i = (int)UI_SCALE_VALUES.size() - 1; i >= 1; i--) if (UI_SCALE_VALUES[i] < s - 0.01f) { idx = i; break; } }
+                    }
+                    if (idx != uiScaleIdx) {
+                        uiScaleIdx = idx;
+                        ddScale->setSelection(idx);
+                        applyUiScale();
+                    }
+                    continue;
+                }
+            }
 
             // Global mouse-release catcher - prevents UI from getting stuck
             if (const auto* mr = ev->getIf<sf::Event::MouseButtonReleased>()) {
@@ -3997,7 +4058,7 @@ int main() {
     for (auto& mod : sidebar.modules) saveMgr.set("sidebar_" + mod->title, mod->isOpen);
 
     saveMgr.set("theme", ddTheme->selectedIndex);
-    saveMgr.set("ui_scale", uiScaleIdx);
+    saveMgr.set("ui_scale_pct", uiScaleIdx == 0 ? 0 : (int)std::lround(UI_SCALE_VALUES[uiScaleIdx] * 100.0f));
     saveMgr.set("zoom", slZoom->currentVal);
     saveMgr.set("min_db", slMinDb->currentVal);
     saveMgr.set("max_db", slMaxDb->currentVal);
