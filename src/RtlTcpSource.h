@@ -85,6 +85,11 @@ class RtlTcpSource : public IQSource {
     }
     uint32_t tunerType = 0, gainCount = 0;
     std::atomic<long long> centerFreq {100000000};
+    // Retune bookkeeping for samplesCenterHz(): rtl_tcp does not say when the new frequency
+    // arrives, so after a retune the samples still in the network pipe are dropped (skipLeft,
+    // in output samples) and only then the label switches
+    std::atomic<long long> samplesRf {100000000};
+    std::atomic<long long> skipLeft {0};
 
     static const int BUF = 65536;
 
@@ -179,6 +184,14 @@ class RtlTcpSource : public IQSource {
                     conv[i] = Complex((buf[2 * i] - 127.5) * inv, (buf[2 * i + 1] - 127.5) * inv);
                 size_t outCount = 0;
                 const Complex* out = decimator.process(conv.data(), samples, outCount);
+                if (outCount > 0 && skipLeft.load() > 0) {
+                    if (skipLeft.fetch_sub((long long)outCount) - (long long)outCount <= 0) {
+                        ringBuffer.clear();
+                        samplesRf = centerFreq.load();
+                        skipLeft = 0;
+                    }
+                    outCount = 0;
+                }
                 if (outCount > 0) ringBuffer.push(out, outCount);
                 carry = total % 2;
                 if (carry) buf[0] = buf[total - 1];
@@ -248,6 +261,8 @@ public:
         sampleRate = hwSampleRate / decimator.getFactor();
         sendCmd(CMD_SAMPLERATE, hwSampleRate);
         sendCmd(CMD_FREQ, (uint32_t)centerFreq.load());
+        samplesRf = centerFreq.load();
+        skipLeft = 0;
         {
             std::lock_guard<std::mutex> l(agcMtx);
             agc.gains = tunerGains(tunerType);
@@ -291,9 +306,12 @@ public:
 
     void setCenterFrequency(long long hz) override {
         centerFreq = hz;
+        if (running && active) skipLeft = (long long)(sampleRate * 0.08);   // ~80 ms in flight
+        else samplesRf = hz;
         sendCmd(CMD_FREQ, (uint32_t)hz);
         ringBuffer.clear();
     }
+    long long samplesCenterHz() override { return samplesRf.load(); }
 
     void setGain(int db) override {
         if (db == -1) {

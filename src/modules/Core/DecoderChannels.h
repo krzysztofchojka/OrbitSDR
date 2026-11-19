@@ -68,6 +68,10 @@ class ChannelSet {
     long long lastVfo = 0;
     double lastRate = 0.0;
     bool placed = false;
+    // alwaysTuner: the user dragged the tuner's channel off it. Retunes don't put a new one
+    // there (each pan of the spectrum added a channel); dropping one on the tuner or
+    // "channel at tuner" does.
+    bool tunerDetached = false;
 
     static constexpr double EDGE_MARGIN = 2000.0;
 
@@ -121,6 +125,7 @@ class ChannelSet {
 
     void placeAll(long long centre, double rate, long long vfoHz) {
         channels.clear();
+        tunerDetached = false;
         auto in = presetsInBand(centre, rate);
         if (in.size() > maxChannels) in.resize(maxChannels);
         for (long long f : in) { auto c = make(f); c.autoPlaced = true; channels.push_back(c); }
@@ -142,7 +147,7 @@ class ChannelSet {
             if (!hasChannelAt(f)) { auto c = make(f); c.autoPlaced = true; channels.push_back(c); }
         }
         if (alwaysTuner) {
-            if (!hasTunerChannel()) addTunerChannel(vfoHz);
+            if (!hasTunerChannel() && !tunerDetached) addTunerChannel(vfoHz);
             return;
         }
         bool anyFixed = false;
@@ -221,6 +226,12 @@ public:
     // A channel placed by the user (at the tuner when freqHz is 0); returns its id, 0 if full
     int addChannel(long long freqHz = 0) {
         std::lock_guard<std::mutex> l(mtx);
+        // the tuner's channel was dragged off: "channel at tuner" puts it back first
+        if (freqHz == 0 && alwaysTuner && !hasTunerChannel()) {
+            tunerDetached = false;
+            addTunerChannel(lastVfo);
+            return channels.back().id;
+        }
         if (freqHz == 0) freqHz = lastVfo;
         size_t fixed = 0;
         for (const auto& c : channels) if (!c.followVfo) fixed++;
@@ -245,6 +256,7 @@ public:
     void moveTo(int id, long long freqHz) {
         std::lock_guard<std::mutex> l(mtx);
         for (auto& c : channels) if (c.id == id) {
+            if (c.followVfo && alwaysTuner) tunerDetached = true;
             c.freqHz = freqHz;
             c.followVfo = false; c.autoPlaced = false; c.fallback = false;
             applyShape(c);
@@ -275,6 +287,14 @@ public:
     void followTuner(int id) {
         std::lock_guard<std::mutex> l(mtx);
         for (auto& c : channels) if (c.id == id) { c.followVfo = true; c.autoPlaced = false; c.fallback = false; }
+        // one channel on the tuner is enough: another one already there goes
+        bool seen = false;
+        for (const auto& c : channels) if (c.followVfo && c.id == id) seen = true;
+        if (seen) {
+            channels.erase(std::remove_if(channels.begin(), channels.end(), [&](const DecoderChannel& c) {
+                return c.followVfo && c.id != id && c.autoPlaced; }), channels.end());
+            tunerDetached = false;
+        }
     }
 
     void setWidth(double w) {

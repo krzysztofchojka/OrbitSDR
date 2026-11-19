@@ -387,7 +387,19 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
         // Burst decoders (ISM) need a gain that stays put during a packet
         src->setBurstAgc(burstAgc);
 
+        // The decoders place their fixed channels from the radio frequency, so they get the one
+        // the samples were really taken at: the UI changes centreFreq at once (dragging the
+        // spectrum does it on every mouse move), the radio retunes a little later and the
+        // samples already buffered still come from the old frequency. A block read across a
+        // retune could be either: the decoders skip it.
+        const long long rfBefore = src->samplesCenterHz();
         int readCount = src->read(iqBuffer.data(), chunkSize);
+        const long long rfAfter = src->samplesCenterHz();
+        bool acrossRetune = false;
+        if (rfBefore > 0) {
+            if (rfBefore == rfAfter) centerHz = rfBefore;
+            else acrossRetune = true;
+        }
         if (src->didLoop()) {
             demod.clear();
             if (shared.digital) shared.digital->reset();
@@ -469,7 +481,9 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                     if (!mono.empty()) aprsDecoder.process(mono);
                 }
 
-                if (anyDecoder) {
+                if (anyDecoder && acrossRetune) {
+                    decodersReset = decodersReset || decJob.reset;   // a reset waits for the next block
+                } else if (anyDecoder) {
                     if (isDigitalMode(mode)) decJob.mono = demod.discTap;   // the discriminator, not the speech
                     else {
                         decJob.mono.reserve(audioData.size() / 2);

@@ -68,7 +68,12 @@ public:
     virtual std::vector<std::string> getAvailableSampleRatesText() { return {}; }
     virtual std::vector<uint32_t> getAvailableSampleRatesValues() { return {}; }
     virtual void setCenterFrequency(long long hz) {}
-    virtual void setGain(int gainDb) {} 
+    // The radio frequency of the samples read() returns now: a retune takes effect some
+    // time after setCenterFrequency (worker thread, USB / network buffers). 0 = not known.
+    // The decoders place their fixed channels with it; it changes only between reads that
+    // return samples from before and after the retune.
+    virtual long long samplesCenterHz() { return 0; }
+    virtual void setGain(int gainDb) {}
     virtual void setHardwareOption(std::string name, int value) {}
     virtual bool isHardware() { return false; }
     // True when the samples are plain (already demodulated) audio, not I/Q:
@@ -628,6 +633,8 @@ public:
     void setCenterFrequency(long long hz) override {
         pendingCenterFreq = hz;
     }
+    // The worker sets it after clearing the buffers and before pushing the first new sample
+    long long samplesCenterHz() override { return currentCenterFreq.load(); }
     
     void setGain(int db) override {
         pendingGain = db;
@@ -714,6 +721,11 @@ class SdrPlaySource : public IQSource {
     std::atomic<bool> deviceLost{false};
     std::atomic<bool> reconnecting{false};
     std::atomic<long long> lastStreamMs{0};
+    // Retune bookkeeping for samplesCenterHz(): the frequency asked for, and the one of the
+    // samples in the ring (switched by the stream callback at the first packet after the change)
+    std::atomic<long long> requestedRf{100000000};
+    std::atomic<long long> samplesRf{100000000};
+    double samplesSinceRequest = 0.0;   // stream callback only
 
     // Watchdog: notices a removed, failed or stalled device and reconnects it
     std::thread watchdog;
@@ -735,6 +747,18 @@ class SdrPlaySource : public IQSource {
         auto& buf = self->cbBuf;
         buf.resize(numSamples);
         for (unsigned int i = 0; i < numSamples; i++) buf[i] = Complex(xi[i] * scale, xq[i] * scale);
+        // a retune: the API flags the first packet on the new frequency; older samples go
+        // (a fallback after 0.3 s in case the flag never comes)
+        const long long want = self->requestedRf.load();
+        if (want != self->samplesRf.load()) {
+            self->samplesSinceRequest += numSamples;
+            if ((params && params->rfChanged) || self->samplesSinceRequest > self->hwSampleRate * 0.3) {
+                self->ringBuffer.clear();
+                self->decimator.reset();
+                self->samplesRf = want;
+                self->samplesSinceRequest = 0.0;
+            }
+        } else self->samplesSinceRequest = 0.0;
         size_t outCount = 0;
         const Complex* out = self->decimator.process(buf.data(), numSamples, outCount);
         if (outCount > 0) self->ringBuffer.push(out, outCount);
@@ -827,6 +851,8 @@ class SdrPlaySource : public IQSource {
         deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)centerFreq;
         decimator.reset();
         ringBuffer.clear();   // never play samples left over from before the pause
+        requestedRf = centerFreq;
+        samplesRf = centerFreq;
         overloaded = false;
         deviceLost = false;
         lastStreamMs = nowMs();
@@ -984,9 +1010,13 @@ public:
     float getOverloadFraction() override { return overloaded ? 1.0f : 0.0f; }
     bool isReconnecting() override { return reconnecting; }
 
+    long long samplesCenterHz() override { return samplesRf.load(); }
+
     void setCenterFrequency(long long hz) override {
         std::lock_guard<std::mutex> lock(hwMtx);
         centerFreq = hz;
+        requestedRf = hz;
+        if (!running) samplesRf = hz;   // nothing streams: the next start begins there
         if (running && deviceParams) {
             deviceParams->rxChannelA->tunerParams.rfFreq.rfHz = (double)hz;
             sdrplay_api_Update(currentDevice.dev, sdrplay_api_Tuner_A, sdrplay_api_Update_Tuner_Frf, sdrplay_api_Update_Ext1_None);

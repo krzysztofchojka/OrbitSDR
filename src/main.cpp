@@ -2324,10 +2324,6 @@ int main() {
             int best = -1;
             float bestD = 10.0f;
             for (size_t i = 0; i < chHandles.size(); i++) {
-                // a decoder that always keeps a channel on the tuner (digital voice, FT8): that
-                // handle sits on the tuner, grabbing it moves the tuner, not the channel (dragged
-                // off, the decoder would just put a new channel on the tuner)
-                if (chHandles[i].ch.followVfo && chHandles[i].set->alwaysTuner) continue;
                 const float d = std::abs(chHandles[i].x - m.x);
                 if (d <= bestD) { bestD = d; best = (int)i; }   // <=: the later (selected decoder) wins a tie
             }

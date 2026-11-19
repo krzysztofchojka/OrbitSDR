@@ -80,9 +80,8 @@ class DigitalVoiceDecoder : public SDRModule {
         double levelDb = -150.0;
         int calls = 0;
 
-        // TETRA pi/4-DQPSK front end (demod + burst sync). Runs only while the
-        // classifier says the channel is TETRA. Proves the demodulator locks on a
-        // real signal before the full tetra-kit decoder stack is wired in.
+        // TETRA pi/4-DQPSK front end (demod + burst sync). Starts when the classifier
+        // says the channel is TETRA, stays on while it is locked (see TETRA_HOLD_SEC).
         NarrowChannel tet;                 // dedicated 72 kHz (4 samples/symbol) baseband
         std::vector<std::complex<float>> bbt;
         tetra::TetraDemod tdemod;
@@ -94,6 +93,8 @@ class DigitalVoiceDecoder : public SDRModule {
         double tetEvmDeg = 180.0;
         int    tetVariant = -1;
         double tetSrcRate = 0.0;           // group rate feeding the TETRA channel (diagnostics)
+        double tetHoldSec = 0.0;           // keeps the TETRA path on this long after the last TETRA verdict
+        long long tetFreqHz = 0;           // where the TETRA path started (a jump away resets it)
 
         // the TETRA transmission (over) shown as a "live" row of the calls table
         struct TetraTx {
@@ -116,6 +117,13 @@ class DigitalVoiceDecoder : public SDRModule {
     // up or down, so the demod runs even when the decoder is fed a narrow IQ stream.
     static constexpr double TETRA_RATE    = 54000.0;   // 3 x 18 ksym/s
     static constexpr double TETRA_MIN_SRC = 40000.0;   // need at least this at the group output
+    // The classifier judges 0.5 s windows; one that misses (a fade, a glitch while the radio
+    // retunes, a false DMR sync that restarts it) must not tear down a locked TETRA path:
+    // that cost the sync, SYSINFO and the call state. It stays on while the bursts are
+    // locked, and this long after the last TETRA verdict.
+    static constexpr double TETRA_HOLD_SEC = 3.0;
+    // The channel moved this far (dragged, or it follows the tuner): another signal
+    static constexpr long long TETRA_JUMP_HZ = 6000;
     // span the per-channel first stage keeps: its output rate ends up in [1.25, 2.5) x this, which
     // is what the NarrowChannels below would decimate to on their own anyway (no quality change)
     static constexpr double PRE_SPAN = 96000.0;
@@ -164,6 +172,7 @@ class DigitalVoiceDecoder : public SDRModule {
     std::map<int, ChSettings> settings;
     ChannelSet channels;
     faststage::Stage group;                          // shared first stage of the channels in band
+    double groupFs = 0.0;                            // the radio rate it was planned for (0: not yet)
     std::deque<dv::Call> calls;                      // newest first
     long long centerHz = 0;
     double lastRate = 0.0;
@@ -686,8 +695,14 @@ public:
 
         // TETRA pi/4-DQPSK demod: only while the classifier calls it TETRA and the
         // rate is high enough. Feeds the burst synchroniser -> tetra-kit decoder.
-        if (r.cls.windows && r.cls.tetra && prate >= TETRA_MIN_SRC) {
-            if (!r.tetReady) { r.tdemod.configure(TETRA_RATE); r.tsync.reset(); r.tetReady = true; }
+        const bool jumped = r.tetReady && std::llabs(r.freqHz - r.tetFreqHz) > TETRA_JUMP_HZ;
+        if (jumped) { r.cls.reset(); r.tetHoldSec = 0.0; }   // judge the new signal afresh
+        const bool clsTetra = r.cls.windows && r.cls.tetra;
+        if (clsTetra) r.tetHoldSec = TETRA_HOLD_SEC;
+        else if (prate > 0.0) r.tetHoldSec = std::max(0.0, r.tetHoldSec - (double)pn / prate);
+        const bool hold = r.tetReady && (r.tsync.locked() || r.tetHoldSec > 0.0);
+        if (!jumped && (clsTetra || hold) && prate >= TETRA_MIN_SRC) {
+            if (!r.tetReady) { r.tdemod.configure(TETRA_RATE); r.tsync.reset(); r.tetReady = true; r.tetFreqHz = r.freqHz; }
             r.tet.configure(prate, 0.0, TETRA_RATE, 12700.0, 3000.0, 1.0);
             r.bbt.clear();
             r.tet.process(pin, pn, r.bbt);
@@ -735,7 +750,18 @@ public:
         src.rate = sampleRate;
         double gcentre = 0.0;
         if (hi > lo) {
-            group.configure(sampleRate, (lo + hi) / 2.0, hi - lo);
+            // Kept while it still covers every channel: the channel following the tuner moves
+            // on every pan / tuner drag, and a new centre or decimation re-tuned (or rebuilt)
+            // the first stage of every channel. Re-planned when a channel leaves its band, or
+            // when the channels would fit a band a quarter of its width (more decimation).
+            const double usable = group.outputRate() / 1.25;
+            const double gc = group.centreHz();
+            const bool covers = groupFs == sampleRate && lo >= gc - usable / 2.0 && hi <= gc + usable / 2.0 &&
+                                (hi - lo) > usable * 0.25;
+            if (!covers) {
+                group.configure(sampleRate, (lo + hi) / 2.0, hi - lo);
+                groupFs = sampleRate;
+            }
             if (group.decimation() > 1) {
                 group.process(iq.data(), iq.size());
                 src.dbl = nullptr;
