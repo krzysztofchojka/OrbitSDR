@@ -1,10 +1,13 @@
 #pragma once
 
 #include "../Core/SDRModule.h"
+#include "../Core/ScrollDrag.h"
 #include "../Core/DetailsPopup.h"
 #include "../Core/ModuleLog.h"
 #include "../Core/PositionBus.h"
 #include "../Core/NarrowChannel.h"
+#include "../Core/WorkPool.h"
+#include <chrono>
 #include <regex>
 #include <cmath>
 #include "../../Decimator.h"
@@ -110,6 +113,7 @@ public:
 } // namespace acars
 
 class ACARSDecoder : public SDRModule {
+    ScrollDrag sbTable;   // the table's scroll bar (draggable)
     struct Entry {
         std::string time;
         long long freqHz = 0;
@@ -119,6 +123,8 @@ class ACARSDecoder : public SDRModule {
         long long freqHz = 0;
         acars::ChannelRx rx;
         int messages = 0;
+        DeferredCalls ev;      // messages -> the table, from a pool thread (see processIQ)
+        double cost = 0.0;     // processing time per block (s, smoothed): biggest first
     };
 
     // Known ACARS channels (Europe, North America, Asia / world)
@@ -357,22 +363,37 @@ public:
             grate = group.outputRate();
             gcentre = group.centreHz();
         }
+        struct Job { Rx* r; double off; };
+        std::vector<Job> jobs;
         for (const auto& c : rc) {
             auto& slot = rxs[c.id];
             if (!slot) {
                 slot = std::make_unique<Rx>();
                 Rx* raw = slot.get();
                 slot->rx.demod.onMessage = [this, raw](const acars::Message& m) {
-                    raw->messages++;
-                    onMessage(raw->freqHz, m);
+                    raw->ev.post([this, raw, m] {   // on the decoder thread, mtx held
+                        raw->messages++;
+                        onMessage(raw->freqHz, m);
+                    });
                 };
             }
             Rx& r = *slot;
             r.freqHz = c.freqHz;
             if (!c.inBand) continue;
-            r.rx.configure(grate, c.offsetHz - gcentre);
-            r.rx.process(gin, gn);
+            jobs.push_back({&r, c.offsetHz - gcentre});
         }
+        // the channels in parallel on the pool, the most expensive first (see WorkPool)
+        std::stable_sort(jobs.begin(), jobs.end(), [](const Job& a, const Job& b) { return a.r->cost > b.r->cost; });
+        WorkPool::instance().parallelFor(jobs.size(), [&](size_t k) {
+            Rx& r = *jobs[k].r;
+            const auto t0 = std::chrono::steady_clock::now();
+            r.ev.begin();
+            r.rx.configure(grate, jobs[k].off);
+            r.rx.process(gin, gn);
+            r.ev.end();
+            r.cost += 0.2 * (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() - r.cost);
+        });
+        for (const Job& j : jobs) j.r->ev.flush();
         channelInfo = tunedOnly ? "No ACARS channel in band: decoding at the tuner"
                                 : std::to_string(rxs.size()) + " channel(s)";
     }
@@ -380,6 +401,7 @@ public:
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
         if (!enabled) return false;
         if (popup.handleEvent(ev, win)) return true;
+        if (sbTable.handleEvent(ev, win, scrollRows)) return true;   // the table's scroll bar
         if (btnClear && btnClear->handleEvent(ev, win)) return true;
         if (btnLog && btnLog->handleEvent(ev, win)) return true;
         if (btnExport && btnExport->handleEvent(ev, win)) return true;
@@ -495,15 +517,13 @@ public:
                 px += cols[c].w;
             }
         }
+        sbTable.hide();   // laid out again below when there is a bar
         if (count > visibleRows) {
             float trackH = tableRect.size.y - rowH - 4.0f;
             float thumbH = std::max(16.0f, trackH * visibleRows / (float)count);
             float maxFirst = (float)(count - visibleRows);
-            sf::RectangleShape thumb({4.0f, thumbH});
-            thumb.setPosition({tableRect.position.x + tableRect.size.x - 6.0f,
-                               tableBodyY + (trackH - thumbH) * (tableFirst / maxFirst)});
-            thumb.setFillColor(sf::Color(200, 200, 200, 140));
-            win.draw(thumb);
+            sbTable.layout({{tableRect.position.x + tableRect.size.x - 6.0f, tableBodyY}, {4.0f, trackH}}, thumbH, scrollRows, maxFirst);
+            sbTable.draw(win);
         }
 
         // --- side column ---

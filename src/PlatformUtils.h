@@ -104,26 +104,4 @@ inline std::string findResourceFile(const std::string& name) {
     return "";
 }
 
-#ifdef _WIN32
-// Detects the Windows display scaling (100% / 125% / 150% ...) for the window.
-// Returns a value rounded to 0.25 and clamped to 1.0 - 3.0.
-inline float detectWindowsUiScale(void* hwndPtr) {
-    HWND hwnd = (HWND)hwndPtr;
-    UINT dpi = 96;
-
-    HMODULE user32 = GetModuleHandleA("user32.dll");
-    if (user32 && hwnd) {
-        typedef UINT (WINAPI *GetDpiForWindowProc)(HWND);
-        void* fnPtr = (void*)GetProcAddress(user32, "GetDpiForWindow");
-        if (fnPtr) {
-            GetDpiForWindowProc fn = (GetDpiForWindowProc)fnPtr;
-            UINT d = fn(hwnd);
-            if (d > 0) dpi = d;
-        }
-    }
-
-    float scale = (float)dpi / 96.0f;
-    scale = std::round(scale * 4.0f) / 4.0f;
-    return std::clamp(scale, 1.0f, 3.0f);
-}
-#endif
+// (the system UI scale: see UiScale.h)

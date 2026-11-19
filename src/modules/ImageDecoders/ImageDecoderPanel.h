@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <atomic>
 #include "../Core/SDRModule.h"
+#include "../Core/ScrollDrag.h"
 #include "../../NativeDialogs.h"
 #include "ToneDemod.h"
 
@@ -127,6 +128,7 @@ protected:
 
     sf::FloatRect panelRect, imageRect;
     float scrollY = 0.0f;
+    ScrollDrag sbImage;   // the picture's scroll bar (draggable)
     bool followNewest = true;
     std::string message;                            // last user facing message (e.g. "Saved ...")
 
@@ -323,6 +325,10 @@ public:
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
         if (!enabled) return false;
         for (auto& w : widgets) if (w->handleEvent(ev, win)) return true;
+        if (sbImage.handleEvent(ev, win, scrollY)) {   // the picture's scroll bar
+            followNewest = false;   // re-enabled in draw() when dragged to the bottom
+            return true;
+        }
         sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
         if (const auto* sc = ev.getIf<sf::Event::MouseWheelScrolled>()) {
             if (!panelRect.contains(m)) return false;
@@ -338,6 +344,7 @@ public:
 
     void draw(sf::RenderWindow& win, float x, float y, float w, float h) override {
         if (!enabled || !font) return;
+        sbImage.hide();   // laid out below when the picture is taller than the view
         panelRect = sf::FloatRect({x, y}, {w, h});
 
         std::string status;
@@ -392,11 +399,8 @@ public:
             if (maxScroll > 0.0f) {   // scroll bar
                 float trackH = imageRect.size.y;
                 float thumbH = std::max(20.0f, trackH * imageRect.size.y / contentH);
-                float thumbY = imageRect.position.y + (trackH - thumbH) * (scrollY / maxScroll);
-                sf::RectangleShape thumb({4.0f, thumbH});
-                thumb.setPosition({imageRect.position.x + imageRect.size.x - 6.0f, thumbY});
-                thumb.setFillColor(sf::Color(200, 200, 200, 140));
-                win.draw(thumb);
+                sbImage.layout({{imageRect.position.x + imageRect.size.x - 6.0f, imageRect.position.y}, {4.0f, trackH}}, thumbH, scrollY, maxScroll);
+                sbImage.draw(win);
             }
         } else {
             sf::Text t = text("No picture yet", 28, sf::Color(110, 110, 120));

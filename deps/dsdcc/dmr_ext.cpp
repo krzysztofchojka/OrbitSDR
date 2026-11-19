@@ -49,20 +49,23 @@ inline int synd13(const unsigned char *d)
 template <int N, int (*S)(const unsigned char *)>
 bool fixHamming(unsigned char *d, bool& changed)
 {
-    static int table[16];
-    static bool built = false;
-    if (!built)
-    {
-        for (int i = 0; i < 16; i++) table[i] = -1;
-        unsigned char t[N];
-        for (int b = 0; b < N; b++)
-        {
-            memset(t, 0, N);
-            t[b] = 1;
-            table[S(t)] = b;
+    // syndrome -> bit position; built once (a function-local static object is initialised
+    // thread-safely, the decoders of several channels run in parallel)
+    struct Table {
+        int v[16];
+        Table() {
+            for (int i = 0; i < 16; i++) v[i] = -1;
+            unsigned char t[N];
+            for (int b = 0; b < N; b++)
+            {
+                memset(t, 0, N);
+                t[b] = 1;
+                v[S(t)] = b;
+            }
         }
-        built = true;
-    }
+    };
+    static const Table tab;
+    const int* table = tab.v;
     const int s = S(d);
     if (s == 0) return true;
     if (table[s] < 0) return false;

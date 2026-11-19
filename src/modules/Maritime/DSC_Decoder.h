@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../Core/SDRModule.h"
+#include "../Core/ScrollDrag.h"
 #include "../Core/DetailsPopup.h"
 #include "../Core/ModuleLog.h"
 #include "../Core/PositionBus.h"
@@ -27,6 +28,7 @@
 // =====================================================================
 
 class DSCDecoder : public SDRModule {
+    ScrollDrag sbTable;   // the table's scroll bar (draggable)
     struct Entry {
         std::string time;
         long long freqHz = 0;
@@ -229,6 +231,7 @@ public:
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
         if (!enabled) return false;
         if (popup.handleEvent(ev, win)) return true;
+        if (sbTable.handleEvent(ev, win, scrollRows)) return true;   // the table's scroll bar
         for (auto* b : {&btnClear, &btnLog, &btnExport}) if (*b && (*b)->handleEvent(ev, win)) return true;
         const sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
         if (const auto* sc = ev.getIf<sf::Event::MouseWheelScrolled>()) {
@@ -335,13 +338,12 @@ public:
                 px += cols[c].w;
             }
         }
+        sbTable.hide();   // laid out again below when there is a bar
         if (count > visibleRows) {
             const float trackH = tableRect.size.y - rowH - 4.0f;
             const float thumbH = std::max(16.0f, trackH * visibleRows / (float)count);
-            sf::RectangleShape thumb({4.0f, thumbH});
-            thumb.setPosition({tableRect.position.x + tableRect.size.x - 6.0f, tableBodyY + (trackH - thumbH) * (tableFirst / (float)(count - visibleRows))});
-            thumb.setFillColor(sf::Color(200, 200, 200, 140));
-            win.draw(thumb);
+            sbTable.layout({{tableRect.position.x + tableRect.size.x - 6.0f, tableBodyY}, {4.0f, trackH}}, thumbH, scrollRows, (float)(count - visibleRows));
+            sbTable.draw(win);
         }
         const float sx = x + w - sideW;
         float sy = y + pad;

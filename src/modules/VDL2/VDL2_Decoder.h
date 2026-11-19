@@ -1,10 +1,13 @@
 #pragma once
 
 #include "../Core/SDRModule.h"
+#include "../Core/ScrollDrag.h"
 #include "../Core/DetailsPopup.h"
 #include "../Core/ModuleLog.h"
 #include "../Core/PositionBus.h"
 #include "../Core/NarrowChannel.h"
+#include "../Core/WorkPool.h"
+#include <chrono>
 #include "Vdl2Core.h"
 #include <SFML/Graphics.hpp>
 #include <mutex>
@@ -34,6 +37,7 @@
 // =====================================================================
 
 class VDL2Decoder : public SDRModule {
+    ScrollDrag sbTable;   // the table's scroll bar (draggable)
     struct Entry {
         std::string time;
         long long freqHz = 0;
@@ -48,6 +52,8 @@ class VDL2Decoder : public SDRModule {
         std::vector<std::complex<float>> tmp;
         int frames = 0;
         double level = 0.0;
+        DeferredCalls ev;      // frames -> the table, from a pool thread (see processIQ)
+        double cost = 0.0;     // processing time per block (s, smoothed): biggest first
     };
 
     static const std::vector<long long>& knownChannels() {
@@ -291,28 +297,44 @@ public:
             grate = group.outputRate();
             gcentre = group.centreHz();
         }
+        struct Job { Rx* r; double off; };
+        std::vector<Job> jobs;
         for (const auto& c : rc) {
             auto& slot = rxs[c.id];
             if (!slot) {
                 slot = std::make_unique<Rx>();
                 Rx* raw = slot.get();
-                slot->rx.onFrame = [this, raw](const vdl2::Frame& f, float lv, int corr) {   // mtx held
-                    raw->frames++;
-                    onFrame(raw->freqHz, f, lv, corr);
+                slot->rx.onFrame = [this, raw](const vdl2::Frame& f, float lv, int corr) {
+                    raw->ev.post([this, raw, f, lv, corr] {   // on the decoder thread, mtx held
+                        raw->frames++;
+                        onFrame(raw->freqHz, f, lv, corr);
+                    });
                 };
             }
             Rx& r = *slot;
             r.freqHz = c.freqHz;
             if (!c.inBand) continue;
-            r.ch.configure(grate, c.offsetHz - gcentre, vdl2::SAMPLE_RATE, 9000.0, 6000.0, 1.0);
+            jobs.push_back({&r, c.offsetHz - gcentre});
+        }
+        // the channels in parallel on the pool, the most expensive first (see WorkPool)
+        std::stable_sort(jobs.begin(), jobs.end(), [](const Job& a, const Job& b) { return a.r->cost > b.r->cost; });
+        WorkPool::instance().parallelFor(jobs.size(), [&](size_t k) {
+            Rx& r = *jobs[k].r;
+            const auto t0 = std::chrono::steady_clock::now();
+            r.ev.begin();
+            r.ch.configure(grate, jobs[k].off, vdl2::SAMPLE_RATE, 9000.0, 6000.0, 1.0);
             r.tmp.clear();
             r.ch.process(gin, gn, r.tmp);
-            if (r.tmp.empty()) continue;
-            double lv = 0.0;
-            for (const auto& v : r.tmp) lv += std::norm(v);
-            r.level = 0.9 * r.level + 0.1 * (lv / r.tmp.size());
-            r.rx.process(r.tmp.data(), r.tmp.size());
-        }
+            if (!r.tmp.empty()) {
+                double lv = 0.0;
+                for (const auto& v : r.tmp) lv += std::norm(v);
+                r.level = 0.9 * r.level + 0.1 * (lv / r.tmp.size());
+                r.rx.process(r.tmp.data(), r.tmp.size());
+            }
+            r.ev.end();
+            r.cost += 0.2 * (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() - r.cost);
+        });
+        for (const Job& j : jobs) j.r->ev.flush();
         channelInfo = tunedOnly ? "No VDL2 channel in band: decoding at the tuner"
                                 : std::to_string(rxs.size()) + " channel(s)";
     }
@@ -320,6 +342,7 @@ public:
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
         if (!enabled) return false;
         if (popup.handleEvent(ev, win)) return true;
+        if (sbTable.handleEvent(ev, win, scrollRows)) return true;   // the table's scroll bar
         for (auto* b : {&btnClear, &btnLog, &btnExport, &btnFilter})
             if (*b && (*b)->handleEvent(ev, win)) return true;
         sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
@@ -461,14 +484,13 @@ public:
                 px += cols[c].w;
             }
         }
+        sbTable.hide();   // laid out again below when there is a bar
         if (count > visibleRows) {
             const float trackH = tableRect.size.y - rowH - 4.0f;
             const float thumbH = std::max(16.0f, trackH * visibleRows / (float)count);
             const float maxFirst = (float)(count - visibleRows);
-            sf::RectangleShape thumb({4.0f, thumbH});
-            thumb.setPosition({tableRect.position.x + tableRect.size.x - 6.0f, tableBodyY + (trackH - thumbH) * (tableFirst / maxFirst)});
-            thumb.setFillColor(sf::Color(200, 200, 200, 140));
-            win.draw(thumb);
+            sbTable.layout({{tableRect.position.x + tableRect.size.x - 6.0f, tableBodyY}, {4.0f, trackH}}, thumbH, scrollRows, maxFirst);
+            sbTable.draw(win);
         }
 
         const float sx = x + w - sideW;

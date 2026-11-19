@@ -90,17 +90,20 @@ inline uint32_t headerSyndrome(uint32_t r) {
 
 // --- CRC-16-CCITT (reflected, as used by HDLC / AVLC and ACARS) ---
 inline uint16_t crc16(const uint8_t* d, size_t n, uint16_t crc) {
-    static uint16_t table[256];
-    static bool init = false;
-    if (!init) {
-        for (int i = 0; i < 256; i++) {
-            uint16_t c = (uint16_t)i;
-            for (int k = 0; k < 8; k++) c = (c & 1) ? (uint16_t)((c >> 1) ^ 0x8408) : (uint16_t)(c >> 1);
-            table[i] = c;
+    // built once; a function-local static object is initialised thread-safely (the channels
+    // of a decoder run in parallel on the WorkPool)
+    struct Table {
+        uint16_t v[256];
+        Table() {
+            for (int i = 0; i < 256; i++) {
+                uint16_t c = (uint16_t)i;
+                for (int k = 0; k < 8; k++) c = (c & 1) ? (uint16_t)((c >> 1) ^ 0x8408) : (uint16_t)(c >> 1);
+                v[i] = c;
+            }
         }
-        init = true;
-    }
-    while (n--) crc = (uint16_t)((crc >> 8) ^ table[(crc ^ *d++) & 0xff]);
+    };
+    static const Table table;
+    while (n--) crc = (uint16_t)((crc >> 8) ^ table.v[(crc ^ *d++) & 0xff]);
     return crc;
 }
 

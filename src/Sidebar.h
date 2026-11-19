@@ -1,5 +1,6 @@
 #pragma once
 #include "UI.h"
+#include "modules/Core/ScrollDrag.h"
 #include <vector>
 #include <memory>
 #include <string>
@@ -109,6 +110,7 @@ public:
     std::vector<std::shared_ptr<Module>> modules;
     const sf::Font& font;
     sf::RectangleShape sbTrack, sbThumb;
+    ScrollDrag sb;   // the sidebar's scroll bar (draggable)
 
     Sidebar(float w, const sf::Font& f) : width(w), font(f) {
         sbTrack.setFillColor(sf::Color(19, 19, 21));
@@ -153,8 +155,10 @@ public:
             sbThumb.setSize({10, th});
             float ty = y + (scrollOffset / (totalContentHeight - height)) * (height - th);
             sbThumb.setPosition({x + width - 11, ty});
+            sb.layout({{x + width - 11, y}, {10.0f, height}}, th, scrollOffset, totalContentHeight - height);
         } else {
             scrollOffset = 0;
+            sb.hide();
         }
     }
 
@@ -189,6 +193,16 @@ public:
         }
 
         bool captured = false;
+
+        // the scroll bar: grab the thumb, or click the bar to jump there
+        {
+            float so = scrollOffset;
+            if (sb.handleEvent(ev, win, so)) {
+                scrollOffset = so;
+                recalculateLayout();
+                return true;
+            }
+        }
 
         // 2. Sidebar scrolling
         if (const auto* sc = ev.getIf<sf::Event::MouseWheelScrolled>()) {
@@ -245,7 +259,7 @@ public:
 
         if (totalContentHeight > height) {
             win.draw(sbTrack);
-            win.draw(sbThumb);
+            sb.draw(win, sf::Color(80, 80, 80));
         }
 
         for (auto& m : modules) {

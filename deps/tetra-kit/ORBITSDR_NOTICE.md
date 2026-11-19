@@ -26,3 +26,5 @@ in-process reporting sink that replaces the decoder's UDP/JSON `Report`.
 - `mac/mac.cc` SYSINFO + `common/tetracell.*`: keep the cell's air interface security
   (D-MLE-SYSINFO "Air interface encryption service" bit and the extended services
   broadcast Security information element, EN 300 392-7 A.8.77) for the UI.
+- `mac/mac.cc`: the file-scope `curBurstType` (only used in a debug log line) is
+  `thread_local`: OrbitSDR runs the decoders of several TETRA channels in parallel.

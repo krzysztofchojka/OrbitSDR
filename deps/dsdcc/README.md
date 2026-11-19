@@ -45,6 +45,10 @@ hands the voice frames to mbevocoder (`deps/mbevocoder`, its mbelib 1.x API).
 - `dsd_decoder.cpp`: dPMR with an inverted discriminator (inverted FS1, which is the
   FS4 pattern) is decoded too; upstream finds only the positive polarity, so receivers
   and recordings with the opposite FM sign gave no speech.
+- `mbefec.cpp`, `dmr_ext.cpp`: thread safety (OrbitSDR runs the channels' decoders in
+  parallel): `GolayMBE::mbe_checkGolayBlock` kept its working variables in `static`s shared
+  by every instance, and `fixHamming` built its syndrome table lazily without a guard; now
+  locals and a once-initialised `static const` table.
 
 Built by `scripts/dsdcc.sh` (sourced by the build scripts) into a static
 library in `.cache/`. Used by `src/modules/Digital/`.

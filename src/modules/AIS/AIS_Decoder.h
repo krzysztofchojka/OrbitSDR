@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../Core/SDRModule.h"
+#include "../Core/ScrollDrag.h"
 #include "AisCore.h"
 #include "../Core/PositionBus.h"
 #include <SFML/Graphics.hpp>
@@ -21,6 +22,7 @@
 // =====================================================================
 
 class AISDecoder : public SDRModule {
+    ScrollDrag sbTable;   // the table's scroll bar (draggable)
     static constexpr long long AIS1_HZ = 161975000;
     static constexpr long long AIS2_HZ = 162025000;
 
@@ -168,6 +170,7 @@ public:
 
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
         if (!enabled) return false;
+        if (sbTable.handleEvent(ev, win, scrollRows)) return true;   // the table's scroll bar
         if (btnClear && btnClear->handleEvent(ev, win)) return true;
         sf::Vector2f m = win.mapPixelToCoords(sf::Mouse::getPosition(win));
         if (const auto* sc = ev.getIf<sf::Event::MouseWheelScrolled>()) {
@@ -267,14 +270,13 @@ public:
                 px += cols[c].w;
             }
         }
+        sbTable.hide();   // laid out again below when there is a bar
         if ((int)list.size() > visibleRows) {
             float trackH = tableRect.size.y - rowH - 4.0f;
             float thumbH = std::max(16.0f, trackH * visibleRows / (float)list.size());
             float maxFirst = (float)(list.size() - visibleRows);
-            sf::RectangleShape thumb({4.0f, thumbH});
-            thumb.setPosition({tableRect.position.x + tableRect.size.x - 6.0f, bodyY + (trackH - thumbH) * (first / maxFirst)});
-            thumb.setFillColor(sf::Color(200, 200, 200, 140));
-            win.draw(thumb);
+            sbTable.layout({{tableRect.position.x + tableRect.size.x - 6.0f, bodyY}, {4.0f, trackH}}, thumbH, scrollRows, maxFirst);
+            sbTable.draw(win);
         }
 
         // --- side column: status and latest messages ---

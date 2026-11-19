@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../Core/SDRModule.h"
+#include "../Core/ScrollDrag.h"
 #include "../Core/PositionBus.h"
 #include "AdsbCore.h"
 #include <SFML/Graphics.hpp>
@@ -21,6 +22,7 @@
 // =====================================================================
 
 class ADSBDecoder : public SDRModule {
+    ScrollDrag sbTable;   // the table's scroll bar (draggable)
 public:
     static constexpr long long ADSB_HZ = 1090000000;
 
@@ -98,6 +100,7 @@ public:
 
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
         if (!enabled) return false;
+        if (sbTable.handleEvent(ev, win, scrollRows)) return true;   // the table's scroll bar
         if (btnClear && btnClear->handleEvent(ev, win)) return true;
         if (btnTune && btnTune->handleEvent(ev, win)) return true;
         if (btnMap && btnMap->handleEvent(ev, win)) return true;
@@ -211,14 +214,13 @@ public:
                 px += cols[k].w;
             }
         }
+        sbTable.hide();   // laid out again below when there is a bar
         if ((int)list.size() > visibleRows) {
             const float trackH = tableRect.size.y - rowH - 4.0f;
             const float thumbH = std::max(16.0f, trackH * visibleRows / (float)list.size());
             const float maxFirst = (float)(list.size() - visibleRows);
-            sf::RectangleShape thumb({4.0f, thumbH});
-            thumb.setPosition({tableRect.position.x + tableRect.size.x - 6.0f, bodyY + (trackH - thumbH) * (first / maxFirst)});
-            thumb.setFillColor(sf::Color(200, 200, 200, 140));
-            win.draw(thumb);
+            sbTable.layout({{tableRect.position.x + tableRect.size.x - 6.0f, bodyY}, {4.0f, trackH}}, thumbH, scrollRows, maxFirst);
+            sbTable.draw(win);
         }
 
         // --- side column ---
