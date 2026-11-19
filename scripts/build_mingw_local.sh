@@ -83,7 +83,7 @@ g++ -std=c++17 -O3 \
     -lcomdlg32 -lole32 -lws2_32 -lwininet \
     -lsfml-graphics -lsfml-window -lsfml-system -lsfml-audio \
     -lrtlsdr \
-    -lcomdlg32 -lole32
+    -lcomdlg32 -lole32 -lgdi32 -luser32
 
 if [ $? -ne 0 ]; then
     echo "------------------------------------------"
