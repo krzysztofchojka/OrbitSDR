@@ -99,7 +99,7 @@ const int GolayMBE::golayMatrix[2048] = {
 
 void GolayMBE::mbe_checkGolayBlock(long int *block)
 {
-    static int i, syndrome, eccexpected, eccbits, databits;
+    int i, syndrome, eccexpected, eccbits, databits;   // OrbitSDR: were static (shared by all decoder instances / threads)
     long int mask, block_l;
 
     block_l = *block;

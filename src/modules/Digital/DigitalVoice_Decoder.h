@@ -4,6 +4,8 @@
 #include "../Core/DetailsPopup.h"
 #include "../Core/ModuleLog.h"
 #include "../Core/NarrowChannel.h"
+#include "../Core/FastStage.h"
+#include "../Core/WorkPool.h"
 #include "DigitalVoice.h"
 #include "SignalClassifier.h"
 #include "Tetra/TetraPhy.h"
@@ -21,6 +23,7 @@
 #include <cmath>
 #include <cstdio>
 #include <algorithm>
+#include <functional>
 
 // =====================================================================
 //  Digital voice decoder module: DMR, dPMR, D-STAR, YSF, NXDN on several
@@ -62,6 +65,8 @@ class DigitalVoiceDecoder : public SDRModule {
         long long freqHz = 0;
         bool follow = false;
         double widthHz = 12500.0;
+        faststage::Stage pre;      // the channel's own first stage: group rate -> ~120..240 kHz,
+                                   // shared by nc / wide / tet (mixing + halfbands run once, not 3x)
         NarrowChannel nc;          // the channel -> 48 kHz
         NarrowChannel wide;        // 25 kHz around it, for the classifier
         std::vector<std::complex<float>> bb, bbw;
@@ -95,6 +100,12 @@ class DigitalVoiceDecoder : public SDRModule {
             dv::Call call;
         } tetTx;
         std::set<std::string> tetCalls;    // call ids already in the table (until D-RELEASE)
+
+        // Parallel processing (processIQ): the channels' DSP runs on the WorkPool; what the
+        // decoders report into the module's shared state (calls table, log) goes through ev.
+        DeferredCalls ev;
+        double cost = 0.0;                 // processing time per block (s, smoothed): biggest first
+        bool tetRan = false, tetStop = false;   // this block: the TETRA path ran / must shut down
     };
 
     // TETRA occupies only ~+-12 kHz (Rs*(1+roll-off)/2 = 12.15 kHz), so a 54 kHz baseband
@@ -102,6 +113,9 @@ class DigitalVoiceDecoder : public SDRModule {
     // up or down, so the demod runs even when the decoder is fed a narrow IQ stream.
     static constexpr double TETRA_RATE    = 54000.0;   // 3 x 18 ksym/s
     static constexpr double TETRA_MIN_SRC = 40000.0;   // need at least this at the group output
+    // span the per-channel first stage keeps: its output rate ends up in [1.25, 2.5) x this, which
+    // is what the NarrowChannels below would decimate to on their own anyway (no quality change)
+    static constexpr double PRE_SPAN = 96000.0;
 
     // what the UI draws of a channel
     struct CardView {
@@ -146,7 +160,7 @@ class DigitalVoiceDecoder : public SDRModule {
     std::map<int, std::unique_ptr<Rx>> rxs;          // by channel id (AUDIO_ID: the audio input)
     std::map<int, ChSettings> settings;
     ChannelSet channels;
-    GroupDecimator group;
+    faststage::Stage group;                          // shared first stage of the channels in band
     std::deque<dv::Call> calls;                      // newest first
     long long centerHz = 0;
     double lastRate = 0.0;
@@ -364,9 +378,10 @@ class DigitalVoiceDecoder : public SDRModule {
             slot = std::make_unique<Rx>();
             slot->id = id;
             Rx* raw = slot.get();
-            slot->core->onCall = [this, raw](const dv::Call& c) { onCall(raw, c); };
-            slot->core->onEvent = [this, raw](const std::string& e) {   // mtx is held: called from process
-                log.add((raw->id == AUDIO_ID ? std::string("audio  ") : mhz(raw->freqHz) + " MHz  ") + e);
+            // (from process, possibly on a pool thread: through post, see Rx::deferring)
+            slot->core->onCall = [this, raw](const dv::Call& c) { raw->ev.post([this, raw, c] { onCall(raw, c); }); };
+            slot->core->onEvent = [this, raw](const std::string& e) {
+                raw->ev.post([this, raw, e] { log.add((raw->id == AUDIO_ID ? std::string("audio  ") : mhz(raw->freqHz) + " MHz  ") + e); });
             };
             // TETRA front end: demod -> sync. Later (decoder port) tsync.onBit feeds
             // TetraDecoder::rxSymbol(); for now we only track burst lock / quality.
@@ -377,8 +392,8 @@ class DigitalVoiceDecoder : public SDRModule {
             };
             // resolved downlink bits -> ported tetra-kit decoder (network info, SDS, LIP)
             slot->tsync.onBit = [raw](uint8_t b) { raw->tcore->rxBit(b); };
-            // TETRA overs and SDS -> the calls table (mtx is held: called from process)
-            slot->tcore->onEvent = [this, raw](const tetra::Core::Event& e) { onTetraEvent(raw, e); };
+            // TETRA overs and SDS -> the calls table (from process, through post)
+            slot->tcore->onEvent = [this, raw](const tetra::Core::Event& e) { raw->ev.post([this, raw, e] { onTetraEvent(raw, e); }); };
         }
         return *slot;
     }
@@ -622,6 +637,64 @@ public:
         if (fresh) publishVoice();
     }
 
+    // The input of the channels' first stages: the radio's I/Q, or the shared stage's output
+    struct Src {
+        const C* dbl = nullptr;                 // complex<double> input, or
+        const float* re = nullptr;              // SoA float input
+        const float* im = nullptr;
+        size_t n = 0;
+        double rate = 0.0;
+    };
+
+    // One channel's DSP: first stage, FM discriminator + digital voice decoders, classifier,
+    // TETRA demod / decoder. Runs on a pool thread: it touches only this channel's state
+    // (the shared state is reached through Rx::ev). Read-only: settings, src.
+    void processChannel(Rx& r, const Src& src, double off) {
+        r.tetRan = r.tetStop = false;
+        // the channel's own first stage, once; the three narrow receivers work on its output
+        r.pre.configure(src.rate, off, PRE_SPAN);
+        if (src.dbl) r.pre.process(src.dbl, src.n);
+        else r.pre.process(src.re, src.im, src.n);
+        const size_t pn = r.pre.outN();
+        const C* pin = r.pre.outComplex();
+        const double prate = r.pre.outputRate();
+        r.nc.configure(prate, 0.0, 48000.0, std::max(2000.0, r.widthHz / 2.0), 1500.0);
+        r.bb.clear();
+        r.nc.process(pin, pn, r.bb);
+        r.disc.resize(r.bb.size());
+        double p = 0.0;
+        for (size_t i = 0; i < r.bb.size(); i++) {
+            const std::complex<float> v = r.bb[i];
+            r.disc[i] = discToShort(std::arg(v * std::conj(r.prev)));
+            r.prev = v;
+            p += std::norm(v);
+        }
+        if (!r.bb.empty()) r.levelDb = 10.0 * std::log10(p / r.bb.size() + 1e-20);
+        r.core->process(r.disc.data(), r.disc.size(), nullptr);
+        // what is it, when no decoder understands it
+        if (r.core->status().sinceSync > 1.0) {
+            r.wide.configure(prate, 0.0, 48000.0, 12500.0, 2500.0, 1.0);
+            r.bbw.clear();
+            r.wide.process(pin, pn, r.bbw);
+            r.cls.process(r.bbw.data(), r.bbw.size());
+        } else if (r.cls.windows) r.cls.reset();
+
+        // TETRA pi/4-DQPSK demod: only while the classifier calls it TETRA and the
+        // rate is high enough. Feeds the burst synchroniser -> tetra-kit decoder.
+        if (r.cls.windows && r.cls.tetra && prate >= TETRA_MIN_SRC) {
+            if (!r.tetReady) { r.tdemod.configure(TETRA_RATE); r.tsync.reset(); r.tetReady = true; }
+            r.tet.configure(prate, 0.0, TETRA_RATE, 12700.0, 3000.0, 1.0);
+            r.bbt.clear();
+            r.tet.process(pin, pn, r.bbt);
+            r.tdemod.process(r.bbt.data(), r.bbt.size());
+            r.tetCarrierHz = r.tdemod.carrierHz;
+            r.tetEvmDeg = r.tdemod.evmAcc * 180.0 / 3.14159265358979323846;
+            r.tetRan = true;
+        } else if (r.tetReady) {
+            r.tetStop = true;   // shut down on the decoder thread (closes the live row)
+        }
+    }
+
     void processIQ(const std::vector<std::complex<double>>& iq, double sampleRate, double tunedOffset) override {
         if (!enabled || iq.empty() || sampleRate <= 0.0) return;
         std::lock_guard<std::mutex> l(mtx);
@@ -646,19 +719,32 @@ public:
             if (!keep) { it = rxs.erase(it); changed = true; } else ++it;
         }
 
-        // one shared first stage for all channels in band (wide enough for the classifier)
+        // One shared first stage for all channels in band (wide enough for the classifier).
+        // When they are spread over the whole span it would not decimate at all: then the
+        // channels' own first stages take the radio's I/Q directly.
         double lo = 1e18, hi = -1e18;
         for (const auto& c : rc) if (c.inBand) { lo = std::min(lo, c.offsetHz - 16000.0); hi = std::max(hi, c.offsetHz + 16000.0); }
-        const C* gin = iq.data();
-        size_t gn = iq.size();
-        double grate = sampleRate, gcentre = 0.0;
+        Src src;
+        src.dbl = iq.data();
+        src.n = iq.size();
+        src.rate = sampleRate;
+        double gcentre = 0.0;
         if (hi > lo) {
             group.configure(sampleRate, (lo + hi) / 2.0, hi - lo);
-            gin = group.process(iq.data(), iq.size(), gn);
-            grate = group.outputRate();
-            gcentre = group.centreHz();
+            if (group.decimation() > 1) {
+                group.process(iq.data(), iq.size());
+                src.dbl = nullptr;
+                src.re = group.outR();
+                src.im = group.outI();
+                src.n = group.outN();
+                src.rate = group.outputRate();
+                gcentre = group.centreHz();
+            }
         }
 
+        // the channels: bookkeeping here, their DSP in parallel on the pool
+        struct Job { Rx* r; double off; };
+        std::vector<Job> jobs;
         int inBand = 0;
         for (const auto& c : rc) {
             if (!rxs.count(c.id)) changed = true;
@@ -669,42 +755,30 @@ public:
             if (!c.inBand) continue;
             inBand++;
             applySettings(r);
-            if (grate < 48000.0) continue;
-            const double off = c.offsetHz - gcentre;
-            r.nc.configure(grate, off, 48000.0, std::max(2000.0, r.widthHz / 2.0), 1500.0);
-            r.bb.clear();
-            r.nc.process(gin, gn, r.bb);
-            r.disc.resize(r.bb.size());
-            double p = 0.0;
-            for (size_t i = 0; i < r.bb.size(); i++) {
-                const std::complex<float> v = r.bb[i];
-                r.disc[i] = discToShort(std::arg(v * std::conj(r.prev)));
-                r.prev = v;
-                p += std::norm(v);
-            }
-            if (!r.bb.empty()) r.levelDb = 10.0 * std::log10(p / r.bb.size() + 1e-20);
-            r.core->process(r.disc.data(), r.disc.size(), nullptr);
-            // what is it, when no decoder understands it
-            if (r.core->status().sinceSync > 1.0) {
-                r.wide.configure(grate, off, 48000.0, 12500.0, 2500.0, 1.0);
-                r.bbw.clear();
-                r.wide.process(gin, gn, r.bbw);
-                r.cls.process(r.bbw.data(), r.bbw.size());
-            } else if (r.cls.windows) r.cls.reset();
+            if (src.rate < 48000.0) continue;
+            jobs.push_back({&r, c.offsetHz - gcentre});
+        }
+        // longest first: the pool hands out one channel at a time, so the expensive ones
+        // start early and the cheap ones fill the gaps
+        std::stable_sort(jobs.begin(), jobs.end(), [](const Job& x, const Job& y) { return x.r->cost > y.r->cost; });
+        WorkPool::instance().parallelFor(jobs.size(), [&](size_t k) {
+            Rx& r = *jobs[k].r;
+            const auto t0 = std::chrono::steady_clock::now();
+            r.ev.begin();
+            processChannel(r, src, jobs[k].off);
+            r.ev.end();
+            const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            r.cost += 0.2 * (dt - r.cost);
+        });
 
-            // TETRA pi/4-DQPSK demod: only while the classifier calls it TETRA and the
-            // group rate is high enough for 4 samples/symbol. Feeds the burst synchroniser.
-            if (r.cls.windows && r.cls.tetra && grate >= TETRA_MIN_SRC) {
-                if (!r.tetReady) { r.tdemod.configure(TETRA_RATE); r.tsync.reset(); r.tetReady = true; }
-                r.tet.configure(grate, off, TETRA_RATE, 12700.0, 3000.0, 1.0);
-                r.bbt.clear();
-                r.tet.process(gin, gn, r.bbt);
-                r.tdemod.process(r.bbt.data(), r.bbt.size());
-                r.tetCarrierHz = r.tdemod.carrierHz;
-                r.tetEvmDeg = r.tdemod.evmAcc * 180.0 / 3.14159265358979323846;
-                r.tetSrcRate = grate;
+        // back on the decoder thread: what the channels reported, channel by channel
+        for (const Job& j : jobs) {
+            Rx& r = *j.r;
+            r.ev.flush();
+            if (r.tetRan) {
+                r.tetSrcRate = src.rate;
                 tetraTick(r);
-            } else if (r.tetReady) {
+            } else if (r.tetStop) {
                 endTetraTx(&r);
                 r.tetCalls.clear();
                 r.tetReady = false; r.tsync.reset(); r.tet.reset(); r.tcore->reset();

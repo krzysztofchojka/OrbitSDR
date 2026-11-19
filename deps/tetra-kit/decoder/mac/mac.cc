@@ -20,7 +20,8 @@
 
 using namespace Tetra;
 
-static int curBurstType;
+// OrbitSDR: per thread (was one global for all decoder instances; only used in a log line)
+static thread_local int curBurstType;
 
 /**
  * @brief Constructor

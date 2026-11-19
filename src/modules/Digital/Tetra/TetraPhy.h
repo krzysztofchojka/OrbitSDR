@@ -270,7 +270,10 @@ class TetraSync {
 
     int  variant = -1;                // resolved convention, -1 = still searching
     std::vector<uint8_t> win;         // sliding 510-bit window of hard bits (resolved variant)
-    std::vector<int> qwin;            // sliding quadrant window for variant search
+    // variant search: the last BURST_BITS bits under each of the 4 mappings (ring buffers
+    // sharing one write position); every new bit completes exactly one new candidate window
+    uint8_t srch[4][BURST_BITS] = {};
+    int  srchPos = 0, srchFill = 0;
     int  sinceLock = 1 << 30;
     int  bursts = 0;
 
@@ -284,7 +287,7 @@ public:
     int    conventionVariant() const { return variant; }
     int    burstCount() const { return bursts; }
 
-    void reset() { variant = -1; win.clear(); qwin.clear(); sinceLock = 1 << 30; bursts = 0; }
+    void reset() { variant = -1; win.clear(); srchPos = 0; srchFill = 0; sinceLock = 1 << 30; bursts = 0; }
 
     void pushQuadrant(int q) {
         if (variant < 0) { searchVariant(q); return; }
@@ -315,27 +318,34 @@ private:
         }
     }
 
-    // Before lock, buffer quadrants and try every variant over a window;
-    // the one whose derived bits match the training sync wins.
-    void searchVariant(int q) {
-        qwin.push_back(q);
-        if ((int)qwin.size() > BURST_BITS) qwin.erase(qwin.begin());
-        if ((int)qwin.size() < BURST_BITS) return;
+    // Before lock: derive the bits under every variant and test, for each new bit, the one
+    // 510-bit window that ends there against the TS3 marks. Same alignments as a full
+    // re-scan of the window would find, but O(1) per bit instead of O(window) per symbol.
+    bool marksAt(const uint8_t* buf, int start) const {
+        int sB = 0, sE = 0;
+        for (size_t i = 0; i < TS3_BEGIN.size(); i++) {
+            int k = start + (int)i; if (k >= BURST_BITS) k -= BURST_BITS;
+            if (buf[k] != TS3_BEGIN[i]) return false;           // the begin mark must be exact
+        }
+        for (size_t i = 0; i < TS3_END.size(); i++) {
+            int k = start + 500 + (int)i; if (k >= BURST_BITS) k -= BURST_BITS;
+            sE += buf[k] ^ TS3_END[i];
+            if (sE >= 2) return false;
+        }
+        return sB == 0;
+    }
 
-        for (int v = 0; v < 4; v++) {
-            // derive bits for this variant across the quadrant window
-            // (window has BURST_BITS quadrants -> 2*BURST_BITS bits; we test the
-            //  first 510 bits as a candidate burst alignment)
-            static std::vector<uint8_t> bits;
-            bits.clear();
-            for (int qi : qwin) { const uint8_t* b = MAP[v][qi]; bits.push_back(b[0]); bits.push_back(b[1]); }
-            // slide a 510 window looking for the TS3 marks
-            for (int off = 0; off + BURST_BITS <= (int)bits.size(); off++) {
-                int sB = 0, sE = 0;
-                for (size_t i = 0; i < TS3_BEGIN.size(); i++) sB += bits[off + i] ^ TS3_BEGIN[i];
-                if (sB) continue;
-                for (size_t i = 0; i < TS3_END.size(); i++) sE += bits[off + 500 + i] ^ TS3_END[i];
-                if (sE < 2) { variant = v; sinceLock = 0; bursts = 1; qwin.clear(); return; }
+    void searchVariant(int q) {
+        for (int h = 0; h < 2; h++) {
+            for (int v = 0; v < 4; v++) srch[v][srchPos] = MAP[v][q][h];
+            if (++srchPos == BURST_BITS) srchPos = 0;
+            if (srchFill < BURST_BITS) { if (++srchFill < BURST_BITS) continue; }
+            // window: oldest bit at srchPos (the next to be overwritten)
+            for (int v = 0; v < 4; v++) {
+                if (marksAt(srch[v], srchPos)) {
+                    variant = v; sinceLock = 0; bursts = 1; srchFill = 0; srchPos = 0;
+                    return;
+                }
             }
         }
     }

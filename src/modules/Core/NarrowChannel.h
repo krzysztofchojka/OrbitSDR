@@ -95,28 +95,43 @@ public:
     // Appends the output samples to `out`
     void process(const C* in, size_t n, std::vector<std::complex<float>>& out) {
         if (fs <= 0.0 || n == 0) return;
-        mixed.resize(n);
-        for (size_t i = 0; i < n; i++) { mixed[i] = in[i] * nco; nco *= ncoStep; }
-        nco /= std::abs(nco);
+        const C* src = in;
+        if (offsetHz != 0.0) {   // a channel already at 0 Hz (e.g. behind a per-channel first stage) needs no mixing
+            mixed.resize(n);
+            for (size_t i = 0; i < n; i++) { mixed[i] = in[i] * nco; nco *= ncoStep; }
+            nco /= std::abs(nco);
+            src = mixed.data();
+        }
         size_t cnt = 0;
-        const C* d = decim.process(mixed.data(), n, cnt);
+        const C* d = decim.process(src, n, cnt);
         const size_t taps = fir.size();
+        auto filter = [&]() {
+            C y(0.0, 0.0);
+            const C* h = &hist[histPos];
+            for (size_t k = 0; k < taps; k++) y += h[k] * fir[k];
+            return y;
+        };
         for (size_t i = 0; i < cnt; i++) {
             hist[histPos] = d[i];
             hist[histPos + taps] = d[i];
             histPos = (histPos + 1) % taps;
-            C y(0.0, 0.0);
-            const C* h = &hist[histPos];
-            for (size_t k = 0; k < taps; k++) y += h[k] * fir[k];
-            if (!havePrev) { prev = y; havePrev = true; continue; }
-            // output samples that fall between prev (phase 0) and y (phase 1)
-            while (phase < 1.0) {
-                const C v = prev + (y - prev) * phase;
-                out.push_back(std::complex<float>((float)v.real(), (float)v.imag()));
-                phase += step;
+            if (!havePrev) { prev = filter(); havePrev = true; continue; }
+            // The resampler's phase does not depend on the signal: work out whether this
+            // interval (prev -> y) or the next one (y -> next) has an output sample. If
+            // neither, y is never used and the FIR is skipped (when decimating, most of them).
+            double p = phase;
+            while (p < 1.0) p += step;
+            if (phase < 1.0 || p - 1.0 < 1.0) {
+                const C y = filter();
+                // output samples that fall between prev (phase 0) and y (phase 1)
+                while (phase < 1.0) {
+                    const C v = prev + (y - prev) * phase;
+                    out.push_back(std::complex<float>((float)v.real(), (float)v.imag()));
+                    phase += step;
+                }
+                prev = y;
             }
-            phase -= 1.0;
-            prev = y;
+            phase = p - 1.0;
         }
     }
 };
