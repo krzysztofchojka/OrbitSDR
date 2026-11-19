@@ -117,6 +117,22 @@ void TetraCell::setLocationArea(uint32_t la)
 }
 
 /**
+ * @brief OrbitSDR: air interface security of the cell, from SYSINFO
+ *        securityInfo < 0 keeps the last one (not every SYSINFO carries it)
+ *
+ */
+
+void TetraCell::setSecurity(bool aieAvailable, int securityInfo)
+{
+    m_aieKnown     = true;
+    m_aieAvailable = aieAvailable;
+    if (securityInfo >= 0)
+    {
+        m_securityInfo = securityInfo;
+    }
+}
+
+/**
  * @brief Get downlink frequency [Hz]
  *
  */

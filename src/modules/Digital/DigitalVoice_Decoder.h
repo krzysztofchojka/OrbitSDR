@@ -289,7 +289,8 @@ class DigitalVoiceDecoder : public SDRModule {
             c.from = e.from;
             c.to = e.to;
             c.encrypted = e.encrypted;
-            if (e.encrypted) c.encText = "TEA, not decoded";
+            // end-to-end encryption (the radios' own cipher, independent of the cell's TEA)
+            if (e.encrypted) c.encText = "end-to-end (E2E), not decoded";
             c.extra = "voice" + (e.callId.empty() ? std::string() : "  call " + e.callId);
             c.open = true;
             onCall(r, c);
@@ -444,6 +445,12 @@ class DigitalVoiceDecoder : public SDRModule {
                 std::snprintf(tb, sizeof(tb), "colour code %u   location area %u", ts.net.colourCode, ts.net.locationArea);
                 rows.push_back({"Cell", tb});
             }
+            {
+                const std::string air = tetra::airSecurityText(ts.net, ts.ksg);
+                if (!air.empty()) rows.push_back({"Air encryption", air});
+                else if (ts.ksg >= 0) rows.push_back({"Air encryption", tetra::ksgName(ts.ksg)});
+                if (ts.encryptedPdus) rows.push_back({"Encrypted PDUs", std::to_string(ts.encryptedPdus) + " (TEA, not parsed)"});
+            }
             if (ts.reports) rows.push_back({"PDUs decoded", std::to_string(ts.reports)});
             const bool show = showTetraContent;
             if (!ts.sds.empty()) rows.push_back({"SDS received", std::to_string(ts.sds.size())});
@@ -480,7 +487,7 @@ class DigitalVoiceDecoder : public SDRModule {
             note += std::string("TETRA: ") + (tetra::available()
                         ? "the clear-text downlink is decoded: cell identity, call control, unencrypted SDS and LIP, "
                           "and - with the ETSI speech codec - speech of time slots sent without encryption. "
-                          "TEA-encrypted traffic stays opaque. Speech, SDS / LIP content and subscriber numbers "
+                          "TEA-encrypted (air interface) traffic and end-to-end encrypted calls stay opaque. Speech, SDS / LIP content and subscriber numbers "
                           "appear only with \"TETRA content: shown\".\n"
                         : "this build has no TETRA decoder library: only the pi/4-DQPSK lock is shown.\n");
         note += "Encrypted calls are never decrypted: OrbitSDR only shows the signalling that every radio "
@@ -1031,6 +1038,13 @@ private:
                     std::snprintf(tb, sizeof(tb), "Network  MCC %u  MNC %u  CC %u  LA %u",
                                   ts.net.mcc, ts.net.mnc, ts.net.colourCode, ts.net.locationArea);
                     line(tb, sf::Color(130, 210, 255));
+                }
+                {
+                    std::string air = tetra::airSecurityText(ts.net, ts.ksg);
+                    if (air.empty() && ts.ksg >= 0) air = tetra::ksgName(ts.ksg);
+                    if (ts.encryptedPdus) air += (air.empty() ? "" : "  ") + std::to_string(ts.encryptedPdus) + " encrypted PDUs";
+                    if (!air.empty())
+                        line("Air  " + air, ts.net.aieAvailable || ts.encryptedPdus ? sf::Color(255, 160, 120) : sf::Color(150, 200, 150));
                 }
                 const bool show = showTetraContent;
                 if (ts.voice || !ts.talker.empty()) {

@@ -23,3 +23,6 @@ in-process reporting sink that replaces the decoder's UDP/JSON `Report`.
   callback sink filling a `tetra::Status` struct (consumed by the Digital Voice panel).
 - Guard the few POSIX-only includes so the stack builds under MSVC/MinGW (Windows).
 - Build the `decoder/**/*.cc` into `.cache/` via `scripts/tetra.sh`, mirroring DSDcc.
+- `mac/mac.cc` SYSINFO + `common/tetracell.*`: keep the cell's air interface security
+  (D-MLE-SYSINFO "Air interface encryption service" bit and the extended services
+  broadcast Security information element, EN 300 392-7 A.8.77) for the UI.

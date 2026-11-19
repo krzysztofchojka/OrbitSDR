@@ -51,7 +51,43 @@ inline bool available() {
 struct NetInfo {
     bool     valid = false;
     uint32_t mcc = 0, mnc = 0, colourCode = 0, locationArea = 0;
+
+    // air interface security of the cell (SYSINFO, EN 300 392-7 A.8.77)
+    bool aieKnown = false;           // D-MLE-SYSINFO seen
+    bool aieAvailable = false;       // "Air interface encryption service" available
+    int  securityInfo = -1;          // 8-bit Security information element, -1 = not broadcast yet
 };
+
+// KSG number (EN 300 392-7 table 6.2): the air interface encryption algorithm.
+inline std::string ksgName(int ksg) {
+    if (ksg < 0) return std::string();
+    if (ksg <= 3) return "TEA" + std::to_string(ksg + 1);
+    if (ksg <= 7) return "reserved KSG " + std::to_string(ksg);
+    return "proprietary KSG " + std::to_string(ksg);
+}
+
+// One line on the cell's air interface encryption, "" while unknown.
+//   Security information bits (MSB first): authentication, security class 1 MS
+//   supported, class 2 (0) / class 3 (1); then SCKN (5) for class 2, or DCK / GCK
+//   flags for class 3. They mean something only when the BS offers encryption.
+inline std::string airSecurityText(const NetInfo& n, int ksg) {
+    if (!n.aieKnown) return std::string();
+    const int si = n.securityInfo;
+    const bool auth = si >= 0 && (si & 0x80);
+    std::string s;
+    if (!n.aieAvailable) {
+        s = "clear (security class 1)";
+    } else if (si < 0) {
+        s = "encrypted (class 2 or 3)";
+    } else {
+        const bool class3 = si & 0x20;
+        s = class3 ? "encrypted, security class 3" : "encrypted, security class 2, SCKN " + std::to_string(si & 0x1F);
+        if (si & 0x40) s += " (class 1 radios allowed)";
+    }
+    if (auth) s += ", authentication";
+    if (n.aieAvailable) s += ksg >= 0 ? ", " + ksgName(ksg) : ", algorithm not seen yet";
+    return s;
+}
 
 struct SdsMsg {
     enum class Kind { Text, Data, Status };
@@ -82,7 +118,9 @@ struct Status {
     bool     active = false;        // decoder is receiving synchronised bursts
     NetInfo  net;
     uint64_t reports = 0;
-    std::deque<SdsMsg> sds;         // newest first, bounded
+    uint64_t encryptedPdus = 0;     // signalling PDUs the MAC marks as air-interface encrypted (not parsed)
+    int      ksg = -1;              // KSG number from MM (location update / OTAR), -1 = not seen
+    std::deque<SdsMsg> sds;        // newest first, bounded
     std::deque<LipPos> lip;         // newest first, bounded
 
     // call control (D-SETUP / D-TX GRANTED / D-RELEASE)
@@ -109,8 +147,9 @@ public:
         Type        type = Type::TxStart;
         std::string callId;
         std::string from, to;       // TxStart: talker > group
-        bool        encrypted = false;
-        bool        setup = false;    // TxStart from D-SETUP: it names the CALLER, and is
+        bool        encrypted = false;    // end-to-end encrypted (CMCE "encryption control" /
+                                          // basic service "encryption flag"), not TEA
+        bool        setup = false;   // TxStart from D-SETUP: it names the CALLER, and is
                                       // repeated during the whole call, also while others talk
         bool        release = false;  // TxEnd from D-RELEASE: the whole call is over
         SdsMsg      sds;            // Sds
@@ -154,6 +193,9 @@ public:
             m_st.net.mnc = c->mnc();
             m_st.net.colourCode = c->colorCode();
             m_st.net.locationArea = c->locationArea();
+            m_st.net.aieKnown = c->aieKnown();
+            m_st.net.aieAvailable = c->aieAvailable();
+            m_st.net.securityInfo = c->securityInfo();
             m_st.active = m_dec->isSynchronized();
         }
 #else
@@ -296,8 +338,18 @@ private:
         }
 
         std::lock_guard<std::mutex> l(m_mtx);
-        m_st.reports++;
         m_st.active = true;
+
+        // Signalling the MAC marks as encrypted (EN 300 392-7 A.8.20: 10 / 11 = encrypted
+        // with SCK / CCK) is TEA ciphertext: tetra-kit would parse it as garbage, so it is
+        // only counted. The cell's SYSINFO tells which security class it runs.
+        const std::string encMode = r.get("encryption mode");
+        if (!encMode.empty() && encMode != "0") { m_st.encryptedPdus++; return; }
+        m_st.reports++;
+
+        // the air interface algorithm: the KSG number of the ciphering parameters
+        // (D-LOCATION UPDATE COMMAND / REJECT) or of an OTAR key delivery
+        if (r.has("KSG number")) m_st.ksg = std::atoi(r.get("KSG number").c_str()) & 0xF;
 
         // call control: who talks to whom
         if (r.pdu == "D-SETUP" || r.pdu == "D-CONNECT") {
@@ -309,6 +361,10 @@ private:
                 e.type = Event::Type::TxStart;
                 e.callId = m_st.callId; e.from = m_st.talker; e.to = m_st.group;
                 e.setup = true;
+                // basic service information (14.8.2): circuit mode type (3), encryption
+                // flag (1, end-to-end), communication type (2), slots / speech (2)
+                if (r.has("basic service information"))
+                    e.encrypted = (std::atoi(r.get("basic service information").c_str()) >> 4) & 1;
                 emit(e);
             }
         } else if (r.pdu == "D-TX GRANTED") {

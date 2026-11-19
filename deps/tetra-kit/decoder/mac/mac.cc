@@ -1095,12 +1095,21 @@ Pdu Mac::pduProcessSysinfo(Pdu pdu, int32_t * pduSizeInMac)
             pos += 16;                                                          // common cipherkey identifier or static cipher key version number
         }
 
-        pos += 2;                                                               // optional field flag
+        uint8_t optionalFieldFlag = pdu.getValue(pos, 2);                       // optional field flag
+        pos += 2;
+
+        // OrbitSDR: 0b11 = extended services broadcast, its first 8 bits are the
+        // Security information element (EN 300 392-7 A.8.77)
+        int securityInfo = optionalFieldFlag == 0b11 ? (int)pdu.getValue(pos, 8) : -1;
         pos += 20;                                                              // option value, always present
-        
+
         uint32_t locationArea = pdu.getValue(pos, 14);
-        
+
         m_tetraCell->setLocationArea(locationArea);
+
+        // OrbitSDR: D-MLE-SYSINFO = location area (14), subscriber class (16), BS service
+        // details (12); "Air interface encryption service" is bit 10 of the latter (18.5.2)
+        m_tetraCell->setSecurity(pdu.getValue(pos + 14 + 16 + 10, 1) != 0, securityInfo);
 
         // calculate cell frequencies
 
