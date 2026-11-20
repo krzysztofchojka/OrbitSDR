@@ -48,6 +48,7 @@
 #include "modules/CW/CW_Decoder.h"
 #include "modules/Maritime/NAVTEX_Decoder.h"
 #include "modules/Maritime/DSC_Decoder.h"
+#include "modules/Analyzer/Analyzer_Decoder.h"
 
 // Satellite map and tracking
 #include "orbit/MapWindow.h"
@@ -123,6 +124,7 @@ struct Receiver {
     NAVTEXDecoder* navtex = nullptr;
     DSCDecoder* dsc = nullptr;
     DigitalVoiceDecoder* dvoice = nullptr;
+    SignalAnalyzer* analyzer = nullptr;
 
     // a short name for the tab
     std::string title() const {
@@ -287,6 +289,15 @@ int main() {
     };
     sf::Clock trackClock;
 
+    // --- Signal pipeline workspace: a tab next to the receiver tabs (the pipeline of one
+    //     receiver's Analyzer channel), nearly the whole window while shown ---
+    Receiver* pipeRx = nullptr;      // whose pipeline the tab shows (nullptr: no tab)
+    bool pipeShown = false;          // the tab is the selected one
+    pl::hooks().storePath = []() { return getConfigFilePath("pipelines.json"); };
+    pl::hooks().saveJsonDialog = [](const std::string& name) { return saveJsonFileDialog(getDefaultExportPath(), name + ".json", "Export pipeline"); };
+    pl::hooks().openJsonDialog = []() { return openJsonFileDialog("Import pipeline"); };
+    pl::hooks().popup = [](const std::string& t, const std::string& m) { showPopup(t, m); };
+
     // --- Receivers: each gets a source (none yet), a DSP thread and its own decoders ---
     int nextRxId = 1;
     auto newReceiver = [&]() -> Receiver* {
@@ -335,8 +346,14 @@ int main() {
         rx->dvoice = add(new DigitalVoiceDecoder());
         rx->dvoice->log.setPath(getConfigFilePath("digitalvoice.log"));
         rx->dvoice->exportDir = getDefaultExportPath();
+        rx->analyzer = add(new SignalAnalyzer());
+        rx->analyzer->onOpenPipeline = [&, rx]() {
+            pipeRx = rx;
+            pipeShown = true;
+            rx->analyzer->pipelineEditor().open();
+        };
         // the order of the Decoders checkboxes
-        rx->decMods = { nullptr, rx->dvoice, rx->ais, rx->sstv, rx->wefax, rx->ism, rx->acars, rx->vdl2, rx->adsb, rx->wsjt, rx->cw, rx->navtex, rx->dsc };
+        rx->decMods = { nullptr, rx->dvoice, rx->ais, rx->sstv, rx->wefax, rx->ism, rx->acars, rx->vdl2, rx->adsb, rx->wsjt, rx->cw, rx->navtex, rx->dsc, rx->analyzer };
         rx->sd.visible = false;
         rx->sd.audioOut = true;          // its speaker button on the tab (on by default)
         rx->sd.audioStream = rx->id;     // its own stream in the speaker's mix
@@ -1372,6 +1389,7 @@ int main() {
     auto chkCW    = std::make_shared<Checkbox>("CW (Morse code)", font);
     auto chkNAVTEX = std::make_shared<Checkbox>("NAVTEX (518 / 490 kHz)", font);
     auto chkDSC   = std::make_shared<Checkbox>("DSC (VHF ch70 156.525, MF/HF)", font);
+    auto chkAnalyzer = std::make_shared<Checkbox>("Signal analyzer (what is this signal?)", font);
     auto chkDV    = std::make_shared<Checkbox>(DigitalVoiceDecoder::available() ? "Digital voice (DMR, dPMR, D-STAR, YSF...)"
                                                                                : "Digital voice (not in this build)", font);
     auto chkWSJT  = std::make_shared<Checkbox>(WSJTDecoder::ft8Available() ? "FT8 / FT4 / WSPR (HF digital)"
@@ -1380,7 +1398,8 @@ int main() {
     // The checkboxes; the modules are the shown receiver's (cur->decMods[i], nullptr = APRS)
     struct DecoderEntry { std::shared_ptr<Checkbox> chk; };
     std::vector<DecoderEntry> decoders = {
-        {chkAprs}, {chkDV}, {chkAIS}, {chkSSTV}, {chkWEFAX}, {chkISM}, {chkACARS}, {chkVDL2}, {chkADSB}, {chkWSJT}, {chkCW}, {chkNAVTEX}, {chkDSC} };
+        {chkAprs}, {chkDV}, {chkAIS}, {chkSSTV}, {chkWEFAX}, {chkISM}, {chkACARS}, {chkVDL2}, {chkADSB}, {chkWSJT}, {chkCW}, {chkNAVTEX}, {chkDSC},
+        {chkAnalyzer} };
 
     auto activateDecoderOn = [&](Receiver* r, size_t idx, bool on) {
         SDRModule* const mod = r->decMods[idx];
@@ -1771,7 +1790,9 @@ int main() {
             if (!m || !m->enabled) continue;
             size_t entry = 0;
             for (size_t i = 0; i < r->decMods.size(); i++) if (r->decMods[i] == m) entry = i;
-            t.push_back({m->name, m, m->channelSet(), decoderColor(entry), entry});
+            // the analyzer's channel is always orange (it is not a decoder of one signal)
+            const sf::Color c = m == r->analyzer ? SignalAnalyzer::color() : decoderColor(entry);
+            t.push_back({m->name, m, m->channelSet(), c, entry});
         }
         return t;
     };
@@ -1793,6 +1814,7 @@ int main() {
     struct RxTabHit { sf::FloatRect tab, close, speaker; Receiver* rx; };
     std::vector<RxTabHit> rxTabHits;
     sf::FloatRect rxAddHit;
+    sf::FloatRect pipeTabHit, pipeCloseHit;
 
     auto saveUi = [&](Receiver* r) {
         r->deviceOptions = ddDevice->options;
@@ -2041,6 +2063,26 @@ int main() {
             rxTabHits.push_back({sf::FloatRect({x, y}, {tw, h}), closeR, spkR, r});
             x += tw + 4.0f;
         }
+        // the pipeline workspace of one receiver's Analyzer channel
+        pipeTabHit = sf::FloatRect();
+        pipeCloseHit = sf::FloatRect();
+        if (pipeRx) {
+            const std::string title = "Pipeline  " + pipeRx->title().substr(0, pipeRx->title().find(' ')) + ": " +
+                                      pipeRx->analyzer->pipelineEditor().title();
+            sf::Text probe(font, sf::String::fromUtf8(title.begin(), title.end()), 22);
+            const float tw = probe.getGlobalBounds().size.x * 0.5f + 40.0f;
+            sf::RectangleShape bg({tw, h});
+            bg.setPosition({x, y});
+            bg.setFillColor(pipeShown ? sf::Color(19, 19, 21) : sf::Color(52, 42, 30));
+            bg.setOutlineThickness(1.0f);
+            bg.setOutlineColor(pipeShown ? SignalAnalyzer::color() : sf::Color(110, 80, 40));
+            window.draw(bg);
+            txt(title, x + 10.0f, y + 3.0f, pipeShown ? sf::Color(255, 190, 110) : sf::Color(210, 170, 120));
+            pipeCloseHit = sf::FloatRect({x + tw - 18.0f, y}, {18.0f, h});
+            txt("x", x + tw - 13.0f, y + 2.0f, pipeCloseHit.contains(mp) ? sf::Color(255, 120, 120) : sf::Color(150, 130, 110));
+            pipeTabHit = sf::FloatRect({x, y}, {tw, h});
+            x += tw + 4.0f;
+        }
         // "+": another receiver
         const float aw = 128.0f;
         rxAddHit = sf::FloatRect({x, y}, {aw, h});
@@ -2131,8 +2173,11 @@ int main() {
         if (rxAction.kind != 0) {
             const RxAction a = rxAction;
             rxAction = {};
-            if (a.kind == 1) addReceiver();
-            else if (a.kind == 2) closeReceiver(a.rx);
+            if (a.kind == 1) { pipeShown = false; addReceiver(); }
+            else if (a.kind == 2) {
+                if (a.rx == pipeRx) { pipeRx = nullptr; pipeShown = false; }   // its pipeline tab goes with it
+                closeReceiver(a.rx);
+            }
             else if (a.kind == 3) switchReceiver(a.rx);
         }
         syncMacWindowSize(window);   // macOS window tiling resizes without telling SFML
@@ -2589,6 +2634,8 @@ int main() {
                 if (m.y >= TOPBAR_DRAW_H && m.y < TOP_BAR_H) {
                     if (mbr->button == sf::Mouse::Button::Left) {
                         if (rxAddHit.contains(m)) rxAction = {1, nullptr};
+                        else if (pipeCloseHit.size.x > 0 && pipeCloseHit.contains(m)) { pipeRx = nullptr; pipeShown = false; }
+                        else if (pipeTabHit.size.x > 0 && pipeTabHit.contains(m)) { pipeShown = true; pipeRx->analyzer->pipelineEditor().open(); }
                         else for (const RxTabHit& h : rxTabHits) {
                             if (h.speaker.contains(m)) {   // this receiver's sound on / off (works in the background)
                                 const bool on = !h.rx->sd.audioOut;
@@ -2597,10 +2644,29 @@ int main() {
                                 break;
                             }
                             if (h.close.size.x > 0 && h.close.contains(m)) { rxAction = {2, h.rx}; break; }
-                            if (h.tab.contains(m)) { if (h.rx != cur) rxAction = {3, h.rx}; break; }
+                            if (h.tab.contains(m)) { pipeShown = false; if (h.rx != cur) rxAction = {3, h.rx}; break; }
                         }
                     }
                     continue;
+                }
+            }
+
+            // The pipeline workspace covers everything below the tabs: it gets the mouse there
+            // and the keyboard (the top bar above it still works)
+            if (pipeShown && pipeRx) {
+                bool mine = false;
+                if (const auto* mb = ev->getIf<sf::Event::MouseButtonPressed>())
+                    mine = window.mapPixelToCoords(mb->position).y >= TOP_BAR_H;
+                else if (const auto* sc = ev->getIf<sf::Event::MouseWheelScrolled>())
+                    mine = window.mapPixelToCoords(sc->position).y >= TOP_BAR_H;
+                else if (ev->is<sf::Event::MouseMoved>() || ev->is<sf::Event::MouseButtonReleased>() ||
+                         ev->is<sf::Event::KeyPressed>() || ev->is<sf::Event::KeyReleased>() || ev->is<sf::Event::TextEntered>())
+                    mine = true;
+                if (mine) {
+                    pipeRx->analyzer->pipelineEditor().handleEvent(*ev, window);
+                    // moves / releases also reach the rest (drags of the top bar end properly)
+                    if (!ev->is<sf::Event::MouseMoved>() && !ev->is<sf::Event::MouseButtonReleased>()) continue;
+                    if (window.mapPixelToCoords(sf::Mouse::getPosition(window)).y >= TOP_BAR_H) continue;
                 }
             }
 
@@ -3992,6 +4058,13 @@ int main() {
         }
         sidebar.draw(window);
 
+        // The pipeline workspace over everything below the tabs (the receivers keep running)
+        if (pipeShown && pipeRx) {
+            const std::string info = pipeRx->title() + "   " + pipeRx->analyzer->pipelineInfo() +
+                                     (pipeRx->analyzer->enabled ? "" : "   (Analyzer is off: no input)");
+            pipeRx->analyzer->pipelineEditor().draw(window, sf::FloatRect({0.0f, (float)TOP_BAR_H}, {layout.winW, layout.winH - TOP_BAR_H}), info);
+        }
+
         window.draw(topBar);
         drawRxTabs();
         freqVFO.draw(window);
@@ -4090,7 +4163,7 @@ int main() {
         }
 
 
-        if (modInspector->isOpen) {
+        if (modInspector->isOpen && !(pipeShown && pipeRx)) {
             float mx = modInspector->headerBg.getPosition().x + 10;
             float my = modInspector->headerBg.getPosition().y + 30;
 
