@@ -122,6 +122,14 @@ public:
         return it == route.end() ? 0 : it->second;
     }
 
+    // A stream that comes in uneven chunks (a pipeline on its own thread): it starts playing
+    // only with `seconds` buffered, and after running dry it waits for that much again (a short
+    // gap instead of crackling). Latency stays near it: far above, the oldest is dropped.
+    void setPrebuffer(int stream, double seconds) {
+        std::lock_guard<std::mutex> l(routeMtx);
+        preFor[stream] = (size_t)(seconds * 48000.0) * 2;
+    }
+
     void pushSamples(const std::vector<float>& audioData, int stream = 0) {
         std::lock_guard<std::mutex> l(routeMtx);
         Out* o = outFor(stream);
@@ -129,6 +137,14 @@ public:
         std::lock_guard<std::mutex> q(o->mtx);
         std::deque<float>& sampleQueue = o->streams[stream];
         sampleQueue.insert(sampleQueue.end(), audioData.begin(), audioData.end());
+        const auto pf = preFor.find(stream);
+        if (pf != preFor.end() && pf->second > 0) {
+            o->pre[stream] = pf->second;
+            if (sampleQueue.size() > pf->second * 4) {   // far behind: back to the target latency
+                const size_t drop = (sampleQueue.size() - pf->second * 2) & ~(size_t)1;
+                sampleQueue.erase(sampleQueue.begin(), sampleQueue.begin() + drop);
+            }
+        }
         // last-resort fallback (the DSP thread waits for the buffer to drain): drop the oldest
         if (sampleQueue.size() > MAX_BUFFER_SIZE) {
             size_t toRemove = sampleQueue.size() - MAX_BUFFER_SIZE;
@@ -187,6 +203,8 @@ private:
         bool ok = false;
         std::mutex mtx;
         std::map<int, std::deque<float>> streams;   // by stream id (the receiver's id)
+        std::map<int, size_t> pre;                   // streams with a start-up buffer (floats)
+        std::map<int, bool> started;                 // ... and whether they are playing
         std::atomic<bool>* mute = nullptr;
         std::atomic<long long> lastCallbackMs {0};   // steady clock, when the device last asked for samples
         ~Out() { if (ok) ma_device_uninit(&device); }
@@ -202,6 +220,7 @@ private:
     std::mutex routeMtx;                          // route, outs (the callbacks only lock Out::mtx)
     std::map<int, std::unique_ptr<Out>> outs;     // by device index
     std::map<int, int> route;                     // stream -> device index
+    std::map<int, size_t> preFor;                 // stream -> start-up buffer (floats), see setPrebuffer
 
     bool openOut(Out& o, int index) {
         if (!contextOk) return false;
@@ -248,6 +267,8 @@ private:
         if (it == outs.end()) return;
         std::lock_guard<std::mutex> q(it->second->mtx);
         it->second->streams.erase(stream);
+        it->second->pre.erase(stream);
+        it->second->started.erase(stream);
     }
     void closeUnused() {   // routeMtx held
         for (auto it = outs.begin(); it != outs.end();) {
@@ -266,6 +287,13 @@ private:
         std::lock_guard<std::mutex> lock(o->mtx);
         for (auto& kv : o->streams) {
             std::deque<float>& q = kv.second;
+            const auto pr = o->pre.find(kv.first);
+            if (pr != o->pre.end()) {
+                bool& on = o->started[kv.first];
+                if (!on && q.size() < pr->second + samplesNeeded) continue;   // still filling
+                on = true;
+                if (q.size() < samplesNeeded) on = false;                     // runs dry: fill again
+            }
             const size_t toRead = std::min(q.size(), samplesNeeded);
             for (size_t i = 0; i < toRead; ++i) { out[i] += q.front(); q.pop_front(); }
         }

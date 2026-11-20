@@ -3,12 +3,13 @@
 #include "../Core/SDRModule.h"
 #include "../Core/NarrowChannel.h"
 #include "AnalyzerCore.h"
-#include "PipelineEditor.h"
+#include "PipelineHub.h"
 #include <SFML/Graphics.hpp>
 #include <SFML/Window/Clipboard.hpp>
 #include <mutex>
 #include <atomic>
 #include <thread>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <string>
@@ -35,9 +36,11 @@
 //     transmissions (cheap, under `mtx`),
 //   - the analysis thread classifies them (an::Analyzer::analyzeCapture),
 //     at most two waiting - newer ones replace older ones,
-//   - the pipeline thread runs the pipeline; when it falls behind the
-//     oldest blocks are dropped (counted, shown in the workspace).
-//  The UI never waits for an analysis: reports come under `repMtx`.
+//   - the pipelines (tabs of their own, PipelineHub.h) that take this
+//     receiver get the channel through pl::Hub, each on its own thread.
+//  The channel is cut out only while someone looks: this panel is shown
+//  or a pipeline takes it. The UI never waits for an analysis: reports
+//  come under `repMtx`.
 // =====================================================================
 
 class SignalAnalyzer : public SDRModule {
@@ -69,14 +72,11 @@ private:
     std::deque<std::pair<unsigned, an::Capture>> aQ;
     unsigned workGen = 0;                    // the generation being analysed (analysis thread)
 
-    // ---- pipeline thread ----
-    struct Chunk { std::vector<std::complex<float>> x; double rate; };
-    std::mutex pMtx;
-    std::condition_variable pCv;
-    std::deque<Chunk> pQ;
-    size_t pQueued = 0;
-    std::atomic<long long> pDropped {0};
-    bool stopping = false;                   // aMtx / pMtx
+    bool stopping = false;                   // aMtx
+    std::atomic<long long> shownMs {0};      // when the panel was last drawn (steady clock, ms)
+    static long long nowMs() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
 
     void blankReport() {                     // a new channel: nothing to show yet
         gen++;
@@ -101,25 +101,6 @@ private:
         }
     }
 
-    void pipelineLoop() {
-        for (;;) {
-            Chunk c;
-            {
-                std::unique_lock<std::mutex> l(pMtx);
-                pCv.wait(l, [this] { return stopping || !pQ.empty(); });
-                if (stopping) return;
-                c = std::move(pQ.front());
-                pQ.pop_front();
-                pQueued -= c.x.size();
-            }
-            std::string info;
-            { std::lock_guard<std::mutex> l(mtx); info = inputInfo; }
-            const long long dr = pDropped.load();
-            if (dr > 0) info += "   (CPU: " + std::to_string(dr) + " blocks skipped)";
-            pipe.process(c.x.data(), c.x.size(), c.rate, info);
-        }
-    }
-
     // UI state (UI thread)
     an::Report shown;
     int shownReports = -1;
@@ -139,10 +120,11 @@ private:
     void applyTrigger() {          // mtx held
         core.triggerDb = trigDb;
         core.steadyWindows = trigMode == 0;
+        core.live = trigMode == 3;
     }
     void setTrigMode(int m) {
         trigMode = m;
-        static const char* names[] = {"Trigger: Auto", "Trigger: Normal", "Trigger: Single"};
+        static const char* names[] = {"Trigger: Auto", "Trigger: Normal", "Trigger: Single", "Live (continuous)"};
         btnTrig->setText(names[m]);
         btnArm->setEnabled(m == 2);
         { std::lock_guard<std::mutex> l(mtx); applyTrigger(); }
@@ -155,11 +137,8 @@ private:
         btnFreeze->setActive(false);
     }
 
-    // the signal pipeline fed with this channel (its editor is a workspace tab)
-    pl::Pipeline pipe;
-    pl::PipelineEditor editor {pipe};
-    std::string inputInfo;
-    std::thread aTh, pTh;            // analysis, pipeline (started in the constructor)
+    std::string inputInfo;           // frequency, width, rate of the channel (mtx)
+    std::thread aTh;                 // analysis (started in the constructor)
 
     sf::Text label(const std::string& s, unsigned size, sf::Color c) const {
         sf::Text t(*font, sf::String::fromUtf8(s.begin(), s.end()), size);
@@ -168,7 +147,8 @@ private:
         return t;
     }
 
-    static double outRate(double width) { return std::max(4000.0, width * 2.0); }
+    // the channel's rate: twice its width, but never above the input's (no up-sampling of a wide channel)
+    static double outRate(double width, double inRate) { return std::max(4000.0, std::min(width * 2.0, inRate)); }
 
     // Draws s word-wrapped to maxW; returns the y below it (stops at maxY)
     float drawWrapped(sf::RenderWindow& win, const std::string& s, float x, float y, float maxW, float maxY,
@@ -238,15 +218,12 @@ public:
             repCount++;
         };
         aTh = std::thread([this] { analysisLoop(); });
-        pTh = std::thread([this] { pipelineLoop(); });
     }
 
     ~SignalAnalyzer() override {
-        { std::lock_guard<std::mutex> a(aMtx); std::lock_guard<std::mutex> p(pMtx); stopping = true; }
+        { std::lock_guard<std::mutex> a(aMtx); stopping = true; }
         aCv.notify_all();
-        pCv.notify_all();
         if (aTh.joinable()) aTh.join();
-        if (pTh.joinable()) pTh.join();
     }
 
     void init(const ModuleContext& ctx) override {
@@ -275,7 +252,7 @@ public:
             { std::lock_guard<std::mutex> r(repMtx); shownReports = repCount; armedAt = repCount; }
         };
         btnTrig = std::make_shared<SdrButton>(112.0f, 22.0f, "Trigger: Auto", *font);
-        btnTrig->onClick = [this]() { setTrigMode((trigMode + 1) % 3); };
+        btnTrig->onClick = [this]() { setTrigMode((trigMode + 1) % 4); };
         btnArm = std::make_shared<SdrButton>(46.0f, 22.0f, "Arm", *font);
         btnArm->onClick = [this]() { arm(); };
         btnArm->setEnabled(false);
@@ -285,33 +262,19 @@ public:
         btnLvlUp->onClick = [this]() { std::lock_guard<std::mutex> l(mtx); trigDb = std::min(50.0, trigDb + 1.0); applyTrigger(); };
         btnPipe = std::make_shared<SdrButton>(92.0f, 22.0f, "Pipeline  >", *font);
         btnPipe->onClick = [this]() { if (onOpenPipeline) onOpenPipeline(); };
-        editor.setFont(font);
         sf::Text probe(*font, "0123456789", 22);
         probe.setScale({0.5f, 0.5f});
         charW = probe.getGlobalBounds().size.x / 10.0f;
     }
 
-    // main.cpp: show this receiver's pipeline workspace tab
+    // main.cpp: the receiver's number (its channel goes to the pipelines as "RX<n>") and
+    // "Pipeline >": a pipeline tab taking this receiver
+    int rxId = 0;
     std::function<void()> onOpenPipeline;
-    pl::PipelineEditor& pipelineEditor() { return editor; }
-    std::string pipelineInfo() {
-        std::string s;
-        { std::lock_guard<std::mutex> l(mtx); s = inputInfo; }
-        const long long dr = pDropped.load();
-        if (dr > 0) s += "   (too slow: " + std::to_string(dr) + " blocks skipped)";
-        return s;
-    }
-
-    // The pipeline's Audio block plays through the receiver's speaker
-    bool mixVoice(float* out, size_t n, bool& duckMain) override {
-        duckMain = false;
-        return enabled && pipe.audio.mix(out, n);
-    }
 
     void reset() override {
         { std::lock_guard<std::mutex> l(mtx); ch.reset(); core.reset(); }
         blankReport();
-        { std::lock_guard<std::mutex> l(pMtx); pQ.clear(); pQueued = 0; }
     }
     float panelHeight(float windowHeight) const override { return std::clamp(windowHeight * 0.32f, 230.0f, 380.0f); }
     void setRadioFrequency(long long hz) override { std::lock_guard<std::mutex> l(mtx); centerHz = hz; }
@@ -321,6 +284,10 @@ public:
 
     void processIQ(const std::vector<std::complex<double>>& iq, double sampleRate, double tunedOffset) override {
         if (!enabled || iq.empty() || sampleRate <= 0.0 || audioInput) return;
+        // nobody looking (panel hidden, no pipeline takes this receiver): nothing to do
+        const bool look = nowMs() - shownMs.load() < 1000;
+        const bool feed = pl::Hub::get().wants(rxId);
+        if (!look && !feed) return;
         std::lock_guard<std::mutex> l(mtx);
         const auto rc = channels.update(centerHz, sampleRate, tunedOffset, tunerBw);
         if (rc.empty() || !rc[0].inBand) return;
@@ -328,7 +295,7 @@ public:
         // another signal (moved, resized, other sample rate): start over
         if (sampleRate != lastRate || std::fabs(w - chanWidth) > 1.0 || std::llabs(rc[0].freqHz - chanHz) > 100) {
             ch.reset();
-            core.configure(outRate(w));
+            core.configure(outRate(w, sampleRate));
             core.reset();
             applyTrigger();
             blankReport();   // (lock order everywhere: mtx before repMtx)
@@ -336,26 +303,15 @@ public:
             chanWidth = w;
             chanHz = rc[0].freqHz;
             char b[96];
-            if (chanHz > 1000000) std::snprintf(b, sizeof(b), "%.4f MHz, %.1f kHz wide, %.0f kS/s", chanHz / 1e6, w / 1000.0, outRate(w) / 1000.0);
-            else std::snprintf(b, sizeof(b), "%+.1f kHz, %.1f kHz wide, %.0f kS/s", chanHz / 1000.0, w / 1000.0, outRate(w) / 1000.0);
+            if (chanHz > 1000000) std::snprintf(b, sizeof(b), "%.4f MHz, %.1f kHz wide, %.0f kS/s", chanHz / 1e6, w / 1000.0, outRate(w, sampleRate) / 1000.0);
+            else std::snprintf(b, sizeof(b), "%+.1f kHz, %.1f kHz wide, %.0f kS/s", chanHz / 1000.0, w / 1000.0, outRate(w, sampleRate) / 1000.0);
             inputInfo = b;
         }
-        ch.configure(sampleRate, rc[0].offsetHz, outRate(w), w / 2.0, std::max(200.0, w * 0.08), 2.0);
+        ch.configure(sampleRate, rc[0].offsetHz, outRate(w, sampleRate), w / 2.0, std::max(200.0, w * 0.08), 2.0);
         tmp.clear();
         ch.process(iq.data(), iq.size(), tmp);
-        core.push(tmp.data(), tmp.size());   // captures go to the analysis thread
-        // the pipeline runs on its own thread; more than a second behind: drop the oldest
-        {
-            std::lock_guard<std::mutex> p(pMtx);
-            pQ.push_back({tmp, outRate(w)});
-            pQueued += tmp.size();
-            while (pQ.size() > 1 && (double)pQueued > outRate(w)) {
-                pQueued -= pQ.front().x.size();
-                pQ.pop_front();
-                pDropped++;
-            }
-        }
-        pCv.notify_one();
+        if (look) core.push(tmp.data(), tmp.size());   // captures go to the analysis thread
+        if (feed) pl::Hub::get().publish(rxId, tmp.data(), tmp.size(), outRate(w, sampleRate), inputInfo);
     }
 
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) override {
@@ -544,6 +500,7 @@ private:
 public:
     void draw(sf::RenderWindow& win, float x, float y, float w, float h) override {
         if (!enabled || !font) return;
+        shownMs = nowMs();
         panelRect = sf::FloatRect({x, y}, {w, h});
         std::vector<an::BurstMark> marks;
         double now, floorDb, levelDb, period = 0.0;
@@ -625,7 +582,7 @@ public:
             win.draw(v);
             sy += 22.0f;
             char b[128];
-            std::snprintf(b, sizeof(b), "%s %.0f ms%s%s", rep.continuous ? "Steady signal, window" : "Transmission", rep.durMs,
+            std::snprintf(b, sizeof(b), "%s %.0f ms%s%s", trigMode == 3 ? "Live, last" : rep.continuous ? "Steady signal, window" : "Transmission", rep.durMs,
                           rep.truncated ? " (part of a longer one)" : "", frozen ? "   [frozen]" : "");
             sf::Text d = label(b, 20, sf::Color(150, 150, 160));
             d.setPosition({sx, sy}); win.draw(d);

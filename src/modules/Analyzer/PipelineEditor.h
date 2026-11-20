@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 #include <cmath>
+#include <set>
+#include <unordered_map>
 
 // =====================================================================
 //  The pipeline editor: a full-window workspace (a tab next to the
@@ -27,14 +29,6 @@
 
 namespace pl {
 
-// Set once by main.cpp (native dialogs, settings folder)
-struct EditorHooks {
-    std::function<std::string()> storePath;                                            // pipelines.json
-    std::function<std::string(const std::string& name)> saveJsonDialog;                // empty = cancelled
-    std::function<std::string()> openJsonDialog;
-    std::function<void(const std::string& title, const std::string& msg)> popup;
-};
-inline EditorHooks& hooks() { static EditorHooks h; return h; }
 
 class PipelineEditor {
     Pipeline& pipe;
@@ -44,7 +38,8 @@ class PipelineEditor {
     sf::Vector2f pan {0.0f, 0.0f};
     int selected = -1;
 
-    enum class Drag { None, Node, Pan, Link, Value };
+    enum class Drag { None, Node, Pan, Link, Value, Palette };
+    std::string dragType;             // Palette: the block being dragged in
     Drag drag = Drag::None;
     int dragNode = -1, dragOut = 0, dragParam = -1;
     sf::Vector2f dragStart, dragOffset, mouse;
@@ -62,6 +57,25 @@ class PipelineEditor {
     std::vector<std::pair<sf::FloatRect, std::string>> paletteHits;
     struct Btn { sf::FloatRect r; std::string id; };
     std::vector<Btn> toolHits;
+
+    // zoom of the canvas, the mouse in the canvas' coordinates
+    float zoom = 1.0f;
+    sf::Vector2f mouseC;
+    // the palette: search, folded categories, scroll
+    std::string search;
+    bool searchFocus = false;
+    int searchSel = 0;            // the highlighted match (arrow keys, Enter adds it)
+    std::string tipType;          // the palette block under the mouse (its keywords are shown beside it)
+    sf::Vector2f tipAt;
+    float paletteScroll = 0.0f;
+    std::set<std::string> collapsed;
+    std::vector<std::pair<sf::FloatRect, std::string>> catHits;
+    sf::FloatRect searchBox;
+    // the list of a choice parameter (menu 3)
+    int menuNode = -1, menuParam = -1;
+    sf::Vector2f menuAt;
+    bool showHelp = false;
+    sf::Clock lastDraw, choicesClock;
 
     // saving
     bool dirty = false;
@@ -89,9 +103,16 @@ class PipelineEditor {
         const sf::Vector2f o = origin();
         const float x = o.x + b.x, y = o.y + b.y;
         float cy = y + HEAD;
-        g.hasStatus = !b.status().empty() || b.type == "input";
+        g.hasStatus = !b.status().empty() || b.isInput;
         if (g.hasStatus) cy += STATUS;
-        for (size_t i = 0; i < b.params.size(); i++) { g.params.push_back(sf::FloatRect({x + 8, cy}, {w - 16, ROW})); cy += ROW; }
+        if (!b.warning.empty()) cy += STATUS;
+        if (!b.note.empty()) cy += STATUS;
+        for (size_t i = 0; i < b.params.size(); i++) {
+            // a parameter that does not apply now (e.g. Kaiser beta with a Hamming window): no row
+            if (!b.shown(b.params[i])) { g.params.push_back(sf::FloatRect({x, cy}, {0, 0})); continue; }
+            g.params.push_back(sf::FloatRect({x + 8, cy}, {w - 16, ROW}));
+            cy += ROW;
+        }
         const auto bt = b.buttons();
         if (!bt.empty()) {
             cy += 3;
@@ -113,10 +134,16 @@ class PipelineEditor {
         return g;
     }
 
+    mutable std::unordered_map<std::string, float> widths;   // measure(): text width by (size, text)
     float measure(const std::string& s, unsigned size) const {
         if (!font) return 0.0f;
+        std::string k(1, (char)size);
+        k += s;
+        const auto it = widths.find(k);
+        if (it != widths.end()) return it->second;
+        if (widths.size() > 20000) widths.clear();
         sf::Text t(*font, sf::String::fromUtf8(s.begin(), s.end()), size * 2);
-        return t.getGlobalBounds().size.x * 0.5f;
+        return widths[k] = t.getGlobalBounds().size.x * 0.5f;
     }
 
     void markDirty() { dirty = true; dirtyClock.restart(); }
@@ -169,6 +196,7 @@ class PipelineEditor {
     void loadNamed(const std::string& name) {
         const int i = store().indexOf(name);
         if (i < 0) return;
+        if (name != currentName() && chainInUse && chainInUse(name)) { say("\"" + name + "\" is open in another tab"); return; }
         if (dirty) saveNow();
         if (!loadJson(store().items[i].json, name)) say("\"" + name + "\" could not be read");
     }
@@ -178,6 +206,7 @@ class PipelineEditor {
     void toolbarAction(const std::string& id) {
         auto& st = store();
         if (id == "chains") { menu = menu == 1 ? 0 : 1; return; }
+        if (id == "help") { showHelp = !showHelp; return; }
         if (id == "presets") { menu = menu == 2 ? 0 : 2; return; }
         menu = 0;
         if (id == "new") {
@@ -198,11 +227,14 @@ class PipelineEditor {
         } else if (id == "delete") {
             const std::string n = currentName();
             st.erase(n);
-            if (st.items.empty()) {
-                { std::lock_guard<std::mutex> l(pipe.mtx); pipe.clear(); pipe.name = "New chain"; }
+            int next = -1;
+            for (size_t k = 0; k < st.items.size() && next < 0; k++) if (!chainInUse || !chainInUse(st.items[k].name)) next = (int)k;
+            if (next < 0) {
+                const std::string nn = st.uniqueName("New chain");
+                { std::lock_guard<std::mutex> l(pipe.mtx); pipe.clear(); pipe.name = nn; }
                 saveNow();
             } else {
-                loadJson(st.items[0].json, st.items[0].name);
+                loadJson(st.items[next].json, st.items[next].name);
                 st.save();
             }
             dirty = false;
@@ -251,6 +283,13 @@ class PipelineEditor {
         const float x = -pan.x + 260.0f + addCascade, y = -pan.y + 40.0f + addCascade;
         addCascade = std::fmod(addCascade + 26.0f, 182.0f);
         if (Block* b = pipe.add(type, x, y)) selected = b->id;
+        markDirty();
+    }
+    // dropped from the palette: the title bar under the mouse
+    void addBlockAt(const std::string& type, sf::Vector2f m) {
+        std::lock_guard<std::mutex> l(pipe.mtx);
+        const sf::Vector2f o = origin();
+        if (Block* b = pipe.add(type, m.x - o.x - 30.0f, m.y - o.y - 10.0f)) selected = b->id;
         markDirty();
     }
 
@@ -342,11 +381,11 @@ class PipelineEditor {
         w.draw(va);
     }
 
-    void port(sf::RenderTarget& w, sf::Vector2f p, PT t, bool hot) const {
+    void port(sf::RenderTarget& w, sf::Vector2f p, PT t, bool hot, const sf::Color* own = nullptr) const {
         sf::CircleShape c(hot ? 6.0f : 5.0f);
         c.setOrigin({c.getRadius(), c.getRadius()});
         c.setPosition(p);
-        c.setFillColor(ptColor(t));
+        c.setFillColor(own ? *own : ptColor(t));
         c.setOutlineColor(sf::Color(20, 20, 24));
         c.setOutlineThickness(1.5f);
         w.draw(c);
@@ -358,20 +397,179 @@ class PipelineEditor {
     }
 
 public:
+    // put a query into the palette's search box (as if typed)
+    void findBlocks(const std::string& q) { search = q; searchFocus = !q.empty(); searchSel = 0; paletteScroll = 0; }
     explicit PipelineEditor(Pipeline& p) : pipe(p) {}
     void setFont(const sf::Font* f) { font = f; }
     std::string title() { return currentName(); }
+
+    // set by the workspaces: true when another tab has the chain `name` open
+    std::function<bool(const std::string& name)> chainInUse;
+    // Opens the saved chain `name` (false: there is none)
+    bool openChain(const std::string& name) {
+        ensureStore();
+        const int i = store().indexOf(name);
+        if (i < 0) return false;
+        if (dirty) saveNow();
+        return loadJson(store().items[i].json, name);
+    }
+    // A new empty chain (only the input), saved as base, base (2) ...
+    void newChain(const std::string& base) {
+        ensureStore();
+        if (dirty) saveNow();
+        const std::string n = store().uniqueName(base);
+        { std::lock_guard<std::mutex> l(pipe.mtx); pipe.clear(); pipe.name = n; }
+        selected = -1; pan = {0, 0};
+        saveNow();
+    }
+    // The main Channel input takes this receiver ("RX2 ..." or just "RX2"; "" = none)
+    void setSource(const std::string& rx) {
+        {
+            std::lock_guard<std::mutex> l(pipe.mtx);
+            Block* in = pipe.input();
+            if (!in) return;
+            in->refreshChoices();
+            for (auto& p : in->params) {
+                if (p.key != "src") continue;
+                const std::string key = rx.substr(0, rx.find(' '));
+                int idx = 0;
+                for (size_t c = 0; c < p.choices.size(); c++) if (!key.empty() && p.choices[c].substr(0, p.choices[c].find(' ')) == key) idx = (int)c;
+                p.v = idx;
+                in->paramVersion++;
+            }
+        }
+        markDirty();
+    }
+    void saveIfChanged() { if (dirty) saveNow(); }
 
     // Called when the tab is shown (loads the saved chains on first use)
     void open() { ensureStore(); }
 
     // ---------------- events (window coordinates) ----------------
+    // The canvas can be zoomed: its "world" coordinates (the blocks' geometry) relate to the
+    // window by canvas.position + (world - canvas.position) * zoom.
+    sf::Vector2f toCanvas(sf::Vector2f m) const { return canvas.position + (m - canvas.position) / zoom; }
+    sf::Vector2f toScreen(sf::Vector2f c) const { return canvas.position + (c - canvas.position) * zoom; }
+
+    // lower-case words of a text (letters and digits; everything else separates)
+    static std::vector<std::string> words(const std::string& s) {
+        std::vector<std::string> w;
+        std::string cur;
+        for (char ch : s) {
+            const unsigned char c = (unsigned char)ch;
+            if (std::isalnum(c)) cur += (char)std::tolower(c);
+            else if (!cur.empty()) { w.push_back(cur); cur.clear(); }
+        }
+        if (!cur.empty()) w.push_back(cur);
+        return w;
+    }
+    // edit distance, stopping early above the limit
+    static int editDistance(const std::string& a, const std::string& b, int limit) {
+        if (std::abs((int)a.size() - (int)b.size()) > limit) return limit + 1;
+        std::vector<int> prev(b.size() + 1), cur(b.size() + 1);
+        for (size_t j = 0; j <= b.size(); j++) prev[j] = (int)j;
+        for (size_t i = 1; i <= a.size(); i++) {
+            cur[0] = (int)i;
+            int best = cur[0];
+            for (size_t j = 1; j <= b.size(); j++) {
+                cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] != b[j - 1])});
+                best = std::min(best, cur[j]);
+            }
+            if (best > limit) return limit + 1;
+            std::swap(prev, cur);
+        }
+        return prev[b.size()];
+    }
+
+    // A palette row: the block, and while searching, the keyword that found it
+    struct PalItem { const BlockInfo* bi; std::string hint; int score = 0; bool guess = false; };
+
+    // All blocks (no search), or the matches ranked best first. Every word of the query has
+    // to match the title, the category, the type or one of the block's hidden tags; a word
+    // that matches nothing exactly may be one typo away from a tag (4+ letters).
+    std::vector<PalItem> paletteItems() const {
+        std::vector<PalItem> v;
+        const auto q = words(search);
+        for (const auto& bi : blockList()) {
+            if (q.empty()) { v.push_back({&bi, "", 0}); continue; }
+            const auto tw = words(bi.title), tg = words(blockTags(bi.type));
+            std::string titleLow = bi.title, catLow = bi.category;
+            for (auto& c : titleLow) c = (char)std::tolower((unsigned char)c);
+            for (auto& c : catLow) c = (char)std::tolower((unsigned char)c);
+            std::string titleCompact;   // "I/Q swap" -> "iqswap", so "iq" finds it
+            for (char c : titleLow) if (std::isalnum((unsigned char)c)) titleCompact += c;
+            int total = 0;
+            std::string hint;
+            bool all = true, guess = false;
+            for (const auto& w : q) {
+                int s = 0;
+                std::string why;
+                for (const auto& t : tw) if (t.rfind(w, 0) == 0) s = std::max(s, t == w ? 12 : 10);
+                if (!s && (titleLow.find(w) != std::string::npos || titleCompact.find(w) != std::string::npos)) s = 7;
+                if (w == bi.type) s = std::max(s, 12);
+                if (!s && catLow.rfind(w, 0) == 0) s = 5;
+                if (!s) for (const auto& t : tg) if (t.rfind(w, 0) == 0) { s = t == w ? 6 : 5; why = t; break; }
+                if (!s) for (const auto& t : tg) if (w.size() >= 3 && t.find(w) != std::string::npos) { s = 3; why = t; break; }
+                if (s < 8 && w.size() >= 4) {
+                    // one typo (two in long words) from a title word counts more than a keyword
+                    // ("filtr" -> "filter"); one from a keyword only when nothing else matched
+                    const int lim = w.size() >= 7 ? 2 : 1;
+                    for (const auto& t : tw) if (t.size() >= 4 && editDistance(w, t, lim) <= lim) { s = 8; why.clear(); break; }
+                    if (!s) for (const auto& t : tg) if (editDistance(w, t, lim) <= lim) { s = 1; why = t; break; }
+                }
+                if (!s) { all = false; break; }
+                total += s;
+                guess |= s == 1;
+                if (hint.empty() && !why.empty()) hint = why;
+            }
+            if (!all) continue;
+            v.push_back({&bi, hint, total, guess});
+        }
+        if (!q.empty()) {
+            // typo-matched keywords only when nothing matched properly
+            if (std::any_of(v.begin(), v.end(), [](const PalItem& p) { return !p.guess; }))
+                v.erase(std::remove_if(v.begin(), v.end(), [](const PalItem& p) { return p.guess; }), v.end());
+            // best score first; ties keep the palette's order
+            std::vector<size_t> idx(v.size());
+            for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
+            std::stable_sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return v[a].score > v[b].score; });
+            std::vector<PalItem> r;
+            for (size_t i : idx) r.push_back(v[i]);
+            v.swap(r);
+        }
+        return v;
+    }
+
     bool handleEvent(const sf::Event& ev, const sf::RenderWindow& win) {
         if (!font) return false;
         ensureStore();
         auto toWin = [&](sf::Vector2i p) { return win.mapPixelToCoords(p); };
 
-        // typing
+        // typing into the palette's search box
+        if (searchFocus) {
+            if (const auto* te = ev.getIf<sf::Event::TextEntered>()) {
+                const char32_t c = te->unicode;
+                if (c == 8) { if (!search.empty()) search.pop_back(); }
+                else if (c == 27) { search.clear(); searchFocus = false; }
+                else if (c >= 32 && c < 127) search += (char)c;
+                paletteScroll = 0;
+                searchSel = 0;
+                return true;
+            }
+            if (const auto* kp = ev.getIf<sf::Event::KeyPressed>()) {
+                const auto items = paletteItems();
+                if (kp->code == sf::Keyboard::Key::Escape) { search.clear(); searchFocus = false; searchSel = 0; }
+                // arrows pick a match, Enter adds it
+                if (kp->code == sf::Keyboard::Key::Down) searchSel = std::min(searchSel + 1, std::max(0, (int)items.size() - 1));
+                if (kp->code == sf::Keyboard::Key::Up) searchSel = std::max(searchSel - 1, 0);
+                if (kp->code == sf::Keyboard::Key::Enter && !items.empty())
+                    addBlock(items[std::clamp(searchSel, 0, (int)items.size() - 1)].bi->type);
+                return true;
+            }
+            if (ev.is<sf::Event::MouseButtonPressed>()) searchFocus = false;   // and go on with the click
+        }
+
+        // typing into a parameter or the chain's name
         if (editName || editNode >= 0) {
             if (const auto* te = ev.getIf<sf::Event::TextEntered>()) {
                 const char32_t c = te->unicode;
@@ -394,11 +592,14 @@ public:
 
         if (const auto* mm = ev.getIf<sf::Event::MouseMoved>()) {
             mouse = toWin(mm->position);
+            mouseC = toCanvas(mouse);
             std::lock_guard<std::mutex> l(pipe.mtx);
             if (drag == Drag::Node) {
-                if (Block* b = pipe.find(dragNode)) { b->x = mouse.x - origin().x - dragOffset.x; b->y = mouse.y - origin().y - dragOffset.y; markDirty(); }
+                if (Block* b = pipe.find(dragNode)) { b->x = mouseC.x - origin().x - dragOffset.x; b->y = mouseC.y - origin().y - dragOffset.y; markDirty(); }
             } else if (drag == Drag::Pan) {
-                pan += mouse - dragStart; dragStart = mouse;
+                pan += (mouse - dragStart) / zoom; dragStart = mouse;
+            } else if (drag == Drag::Palette) {
+                if (std::hypot(mouse.x - dragStart.x, mouse.y - dragStart.y) > 4) dragMoved = true;
             } else if (drag == Drag::Value) {
                 if (Block* b = pipe.find(dragNode)) {
                     Param& p = b->params[dragParam];
@@ -415,9 +616,14 @@ public:
 
         if (const auto* mr = ev.getIf<sf::Event::MouseButtonReleased>()) {
             mouse = toWin(mr->position);
-            if (drag == Drag::Link) {
+            mouseC = toCanvas(mouse);
+            if (drag == Drag::Palette) {
+                // dragged onto the canvas: it appears under the mouse; a plain click: next to the last
+                if (dragMoved && canvas.contains(mouse)) addBlockAt(dragType, mouseC);
+                else if (!dragMoved) addBlock(dragType);
+            } else if (drag == Drag::Link) {
                 std::lock_guard<std::mutex> l(pipe.mtx);
-                const Hit h = hitTest(mouse);
+                const Hit h = hitTest(mouseC);
                 if (h.kind == 2) {
                     const std::string err = pipe.connect(dragNode, dragOut, h.node, h.idx);
                     if (!err.empty()) say(err); else markDirty();
@@ -442,17 +648,24 @@ public:
         if (const auto* sc = ev.getIf<sf::Event::MouseWheelScrolled>()) {
             const sf::Vector2f m = toWin(sc->position);
             if (!area.contains(m)) return false;
+            if (palette.contains(m)) { paletteScroll = std::max(0.0f, paletteScroll - sc->delta * 48.0f); return true; }
             if (canvas.contains(m)) {
+                const bool ctrl = sf::Keyboard::isKeyPressed(sf::Keyboard::Key::LControl) || sf::Keyboard::isKeyPressed(sf::Keyboard::Key::RControl);
                 std::lock_guard<std::mutex> l(pipe.mtx);
-                const Hit h = hitTest(m);
-                if (h.kind == 4) {
+                const sf::Vector2f mc = toCanvas(m);
+                const Hit h = hitTest(mc);
+                if (h.kind == 4 && !ctrl) {
                     if (Block* b = pipe.find(h.node)) {
                         const bool fine = sf::Keyboard::isKeyPressed(sf::Keyboard::Key::LShift);
-                        const bool coarse = sf::Keyboard::isKeyPressed(sf::Keyboard::Key::LControl);
-                        stepParam(b, h.idx, (sc->delta > 0 ? 1.0 : -1.0) * (coarse ? 10.0 : fine ? 0.1 : 1.0));
+                        stepParam(b, h.idx, (sc->delta > 0 ? 1.0 : -1.0) * (fine ? 0.1 : 1.0));
                     }
+                } else if (ctrl) {
+                    // zoom about the mouse: the point under it stays
+                    const float nz = std::clamp(zoom * (sc->delta > 0 ? 1.12f : 1.0f / 1.12f), 0.3f, 2.0f);
+                    pan += (mc - canvas.position) * (zoom / nz - 1.0f);
+                    zoom = nz;
                 } else {
-                    pan.y += sc->delta * 40.0f;   // scroll the canvas
+                    pan.y += sc->delta * 40.0f / zoom;   // scroll the canvas
                 }
             }
             return true;
@@ -461,6 +674,7 @@ public:
         if (const auto* mb = ev.getIf<sf::Event::MouseButtonPressed>()) {
             const sf::Vector2f m = toWin(mb->position);
             mouse = m;
+            mouseC = toCanvas(m);
             if (!area.contains(m)) { menu = 0; return false; }
             const bool left = mb->button == sf::Mouse::Button::Left;
             const bool right = mb->button == sf::Mouse::Button::Right;
@@ -477,9 +691,17 @@ public:
                         orbit::JsonValue v;
                         if (orbit::parseJson(pr.json, v)) {
                             const std::string n = store().uniqueName(pr.name);
+                            std::string src;
+                            { std::lock_guard<std::mutex> l(pipe.mtx); if (Block* in = pipe.input()) if (const Param* sp = in->param("src")) src = sp->show(); }
                             loadJson(pr.json, n);
+                            if (!src.empty()) setSource(src);
                             saveNow();
                             say("Preset loaded as \"" + n + "\"");
+                        }
+                    } else if (menu == 3) {
+                        std::lock_guard<std::mutex> l(pipe.mtx);
+                        if (Block* b = pipe.find(menuNode)) if (menuParam < (int)b->params.size()) {
+                            b->params[menuParam].v = mh.second; b->paramVersion++; markDirty();
                         }
                     }
                     menu = 0;
@@ -493,12 +715,19 @@ public:
                 return true;
             }
             if (palette.contains(m)) {
-                for (const auto& p : paletteHits) if (p.first.contains(m) && left) { addBlock(p.second); return true; }
+                if (searchBox.contains(m)) { searchFocus = true; return true; }
+                for (const auto& c : catHits) if (c.first.contains(m) && left) {
+                    if (collapsed.count(c.second)) collapsed.erase(c.second); else collapsed.insert(c.second);
+                    return true;
+                }
+                for (const auto& p : paletteHits)
+                    if (p.first.contains(m) && left) { drag = Drag::Palette; dragType = p.second; dragStart = m; dragMoved = false; return true; }
                 return true;
             }
             if (!canvas.contains(m)) return true;
             std::lock_guard<std::mutex> l(pipe.mtx);
-            const Hit h = hitTest(m);
+            const sf::Vector2f mc = mouseC;
+            const Hit h = hitTest(mc);
             if (h.node < 0) {
                 if (left || mb->button == sf::Mouse::Button::Middle) { drag = Drag::Pan; dragStart = m; }
                 selected = -1;
@@ -519,8 +748,8 @@ public:
             case 1:
                 if (left) {
                     // the x in the title bar
-                    if (b->removable && m.x > g.head.position.x + g.head.size.x - 20) { pipe.remove(b->id); selected = -1; markDirty(); return true; }
-                    drag = Drag::Node; dragNode = b->id; dragOffset = {m.x - g.box.position.x, m.y - g.box.position.y};
+                    if (b->removable && mc.x > g.head.position.x + g.head.size.x - 20) { pipe.remove(b->id); selected = -1; markDirty(); return true; }
+                    drag = Drag::Node; dragNode = b->id; dragOffset = {mc.x - g.box.position.x, mc.y - g.box.position.y};
                 }
                 return true;
             case 2:
@@ -538,7 +767,12 @@ public:
                 return true;
             case 4: {
                 Param& p = b->params[h.idx];
-                if (p.kind == Param::Choice) { stepParam(b, h.idx, right ? -1 : 1); return true; }
+                if (p.kind == Param::Choice) {
+                    // a list to pick from (right-click: the previous one)
+                    if (right) stepParam(b, h.idx, -1);
+                    else { menu = 3; menuNode = b->id; menuParam = h.idx; menuAt = toScreen({g.params[h.idx].position.x, g.params[h.idx].position.y + ROW}); }
+                    return true;
+                }
                 if (p.kind == Param::Text) { if (left) { editNode = b->id; editParam = h.idx; editBuf = p.text; } return true; }
                 if (left) { drag = Drag::Value; dragNode = b->id; dragParam = h.idx; dragStart = m; dragValue = p.v; dragMoved = false; }
                 return true;
@@ -547,7 +781,7 @@ public:
                 if (left) b->onButton(h.idx);
                 return true;
             default:
-                if (left) { drag = Drag::Node; dragNode = b->id; dragOffset = {m.x - g.box.position.x, m.y - g.box.position.y}; }
+                if (left) { drag = Drag::Node; dragNode = b->id; dragOffset = {mc.x - g.box.position.x, mc.y - g.box.position.y}; }
                 return true;
             }
         }
@@ -558,6 +792,9 @@ public:
                 Block* b = pipe.find(selected);
                 if (b && b->removable) { pipe.remove(selected); selected = -1; markDirty(); }
             }
+            // Ctrl+F: search the blocks; Ctrl+0: zoom 100 %
+            if (kp->control && kp->code == sf::Keyboard::Key::F) { searchFocus = true; search.clear(); }
+            if (kp->control && (kp->code == sf::Keyboard::Key::Num0 || kp->code == sf::Keyboard::Key::Numpad0)) zoom = 1.0f;
             return true;   // the workspace has the keyboard while it is shown
         }
         if (ev.is<sf::Event::TextEntered>()) return true;
@@ -568,64 +805,77 @@ public:
     void draw(sf::RenderTarget& w, const sf::FloatRect& r, const std::string& rxInfo) {
         if (!font) return;
         ensureStore();
+        lastDraw.restart();
         if (dirty && dirtyClock.getElapsedTime().asSeconds() > 0.8f) saveNow();
+        if (choicesClock.getElapsedTime().asSeconds() > 0.5f) {
+            choicesClock.restart();
+            std::lock_guard<std::mutex> l(pipe.mtx);
+            pipe.refreshChoices();
+        }
         area = r;
         const Draw d = dr(w);
-        const float TB = 34.0f, PW = 190.0f;
+        const float TB = 34.0f, PW = 210.0f;
         toolbar = sf::FloatRect(r.position, {r.size.x, TB});
         palette = sf::FloatRect({r.position.x, r.position.y + TB}, {PW, r.size.y - TB});
         canvas = sf::FloatRect({r.position.x + PW, r.position.y + TB}, {r.size.x - PW, r.size.y - TB});
+        mouseC = toCanvas(mouse);
         d.rect(r, sf::Color(17, 18, 22));
 
-        // ---- canvas: grid, wires, blocks ----
+        // ---- canvas: grid, wires, blocks (a view: clipped to the canvas, zoomed) ----
         {
             const sf::View old = w.getView();
-            // clip to the canvas (a view on its part of the window)
             const sf::Vector2f ws = old.getSize();
-            sf::View v(sf::FloatRect(canvas.position - (old.getCenter() - ws / 2.0f), canvas.size));
-            v.setCenter(canvas.position + canvas.size / 2.0f);
-            v.setSize(canvas.size);
+            sf::View v;
+            v.setSize(canvas.size / zoom);
+            v.setCenter(canvas.position + canvas.size / zoom / 2.0f);
             v.setViewport(sf::FloatRect({(canvas.position.x - (old.getCenter().x - ws.x / 2)) / ws.x, (canvas.position.y - (old.getCenter().y - ws.y / 2)) / ws.y},
                                         {canvas.size.x / ws.x, canvas.size.y / ws.y}));
             w.setView(v);
+            const sf::FloatRect visible(canvas.position, canvas.size / zoom);
             // grid
             {
                 sf::VertexArray dots(sf::PrimitiveType::Points);
                 const float gs = 24.0f;
                 const float ox = std::fmod(pan.x, gs), oy = std::fmod(pan.y, gs);
-                for (float x = canvas.position.x + ox; x < canvas.position.x + canvas.size.x; x += gs)
-                    for (float y = canvas.position.y + oy; y < canvas.position.y + canvas.size.y; y += gs)
+                for (float x = canvas.position.x + ox; x < visible.position.x + visible.size.x; x += gs)
+                    for (float y = canvas.position.y + oy; y < visible.position.y + visible.size.y; y += gs)
                         dots.append({{x, y}, sf::Color(48, 50, 58)});
                 w.draw(dots);
             }
             std::lock_guard<std::mutex> l(pipe.mtx);
-            // wires
+            // wires: the colour of what flows (an output "like its input" shows the real kind)
             for (const Link& lk : pipe.links) {
                 Block* a = pipe.find(lk.from); Block* b = pipe.find(lk.to);
                 if (!a || !b) continue;
                 const Geom ga = geom(*a), gb = geom(*b);
                 if (lk.out >= (int)ga.outs.size() || lk.in >= (int)gb.ins.size()) continue;
-                bezier(w, ga.outs[lk.out], gb.ins[lk.in], ptColor(a->outs[lk.out].type));
+                PT t = a->outs[lk.out].type;
+                if (t == PT::Any && lk.out < (int)a->out.size() && a->out[lk.out].rate > 0) t = a->out[lk.out].type;
+                bezier(w, ga.outs[lk.out], gb.ins[lk.in], ptColor(t));
             }
             if (drag == Drag::Link) {
                 if (Block* a = pipe.find(dragNode)) {
                     const Geom ga = geom(*a);
-                    if (dragOut < (int)ga.outs.size()) bezier(w, ga.outs[dragOut], mouse, sf::Color(255, 255, 255, 160));
+                    if (dragOut < (int)ga.outs.size()) bezier(w, ga.outs[dragOut], mouseC, sf::Color(255, 255, 255, 160));
                 }
             }
-            const Hit hover = hitTest(mouse);
+            const Hit hover = hitTest(mouseC);
             for (auto& bp : pipe.nodes) {
                 Block& b = *bp;
                 const Geom g = geom(b);
-                if (!g.box.findIntersection(canvas)) continue;
+                if (!g.box.findIntersection(visible)) continue;
                 const bool sel = b.id == selected;
-                d.rect(g.box, sf::Color(30, 32, 38, 245), sel ? sf::Color(255, 160, 40) : sf::Color(64, 66, 76));
+                d.rect(g.box, sf::Color(30, 32, 38, 245), !b.warning.empty() ? sf::Color(230, 70, 70) : sel ? sf::Color(255, 160, 40) : sf::Color(64, 66, 76));
                 const sf::Color cc = categoryColor(b.category);
                 d.rect(g.head, sf::Color(cc.r / 2, cc.g / 2, cc.b / 2), sf::Color::Transparent);
                 d.rect(sf::FloatRect(g.head.position, {4, HEAD}), cc);
-                d.text(b.title, g.head.position.x + 10, g.head.position.y + 4, 12, sf::Color::White);
+                {
+                    std::string t = b.title;
+                    while (t.size() > 3 && measure(t, 12) > g.head.size.x - 34) t.pop_back();
+                    d.text(t, g.head.position.x + 10, g.head.position.y + 4, 12, sf::Color::White);
+                }
                 if (b.removable) {
-                    const bool hot = hover.node == b.id && hover.kind == 1 && mouse.x > g.head.position.x + g.head.size.x - 20;
+                    const bool hot = hover.node == b.id && hover.kind == 1 && mouseC.x > g.head.position.x + g.head.size.x - 20;
                     d.text("x", g.head.position.x + g.head.size.x - 14, g.head.position.y + 3, 12, hot ? sf::Color(255, 120, 120) : sf::Color(170, 170, 180));
                 }
                 float y = g.head.position.y + HEAD;
@@ -633,17 +883,33 @@ public:
                     std::string s = b.status();
                     while (!s.empty() && measure(s, 10) > g.box.size.x - 16) s.pop_back();
                     d.text(s, g.box.position.x + 8, y + 1, 10, sf::Color(150, 150, 162));
+                    y += STATUS;
+                }
+                if (!b.warning.empty()) {
+                    std::string s = "! " + b.warning;
+                    while (!s.empty() && measure(s, 10) > g.box.size.x - 16) s.pop_back();
+                    d.text(s, g.box.position.x + 8, y + 1, 10, sf::Color(255, 110, 110));
+                    y += STATUS;
+                }
+                if (!b.note.empty()) {
+                    std::string s = b.note;
+                    while (!s.empty() && measure(s, 10) > g.box.size.x - 16) s.pop_back();
+                    d.text(s, g.box.position.x + 8, y + 1, 10, sf::Color(240, 190, 90));
                 }
                 for (size_t i = 0; i < b.params.size(); i++) {
                     const Param& p = b.params[i];
                     const sf::FloatRect& pr = g.params[i];
+                    if (pr.size.x <= 0) continue;   // hidden
                     const bool hot = hover.node == b.id && hover.kind == 4 && hover.idx == (int)i;
                     if (hot) d.rect(pr, sf::Color(50, 54, 66));
-                    d.text(p.label, pr.position.x + 2, pr.position.y + 1, 11, sf::Color(170, 170, 182));
+                    std::string lab = p.label;
+                    const float labMax = pr.size.x * 0.55f;
+                    while (lab.size() > 3 && measure(lab, 11) > labMax) lab.pop_back();
+                    d.text(lab, pr.position.x + 2, pr.position.y + 1, 11, sf::Color(170, 170, 182));
                     std::string val = (editNode == b.id && editParam == (int)i) ? editBuf + "_" : p.show();
                     const sf::Color vc = (editNode == b.id && editParam == (int)i) ? sf::Color(255, 220, 120)
                                        : p.kind == Param::Choice ? sf::Color(255, 190, 110) : sf::Color(235, 235, 240);
-                    const float maxW = pr.size.x * 0.55f;
+                    const float maxW = pr.size.x - measure(lab, 11) - 12;
                     while (val.size() > 2 && measure(val, 11) > maxW) val.erase(val.size() - 2, 1);
                     d.text(val, pr.position.x + pr.size.x - measure(val, 11) - 2, pr.position.y + 1, 11, vc);
                 }
@@ -652,45 +918,112 @@ public:
                     button(d, g.buttons[i], bt[i], hover.node == b.id && hover.kind == 5 && hover.idx == (int)i);
                 if (g.view.size.x > 0) b.drawView(d, g.view);
                 for (size_t i = 0; i < g.ins.size(); i++) {
-                    port(w, g.ins[i], b.ins[i].type, hover.node == b.id && hover.kind == 2 && hover.idx == (int)i);
-                    if (hover.node == b.id && hover.kind == 2 && hover.idx == (int)i)
-                        d.text(b.ins[i].name + " (" + ptName(b.ins[i].type) + ")", g.ins[i].x - measure(b.ins[i].name + " (" + ptName(b.ins[i].type) + ")", 10) - 10, g.ins[i].y - 7, 10, sf::Color(220, 220, 230));
+                    // growing inputs (Scope): each input dot in its trace's colour
+                    const sf::Color cc = channelColor((int)i);
+                    const bool chans = b.maxIns > 1 && b.ins.size() > 1 && pipe.linkInto(b.id, (int)i);
+                    port(w, g.ins[i], b.ins[i].type, hover.node == b.id && hover.kind == 2 && hover.idx == (int)i, chans ? &cc : nullptr);
+                    if (hover.node == b.id && hover.kind == 2 && hover.idx == (int)i) {
+                        const std::string s = b.ins[i].name + " (" + ptName(b.ins[i].type) + ")";
+                        d.rect(sf::FloatRect({g.ins[i].x - measure(s, 10) - 14, g.ins[i].y - 8}, {measure(s, 10) + 6, 15}), sf::Color(20, 20, 24, 230));
+                        d.text(s, g.ins[i].x - measure(s, 10) - 11, g.ins[i].y - 7, 10, sf::Color(220, 220, 230));
+                    }
                 }
                 for (size_t i = 0; i < g.outs.size(); i++) {
                     port(w, g.outs[i], b.outs[i].type, hover.node == b.id && hover.kind == 3 && hover.idx == (int)i);
-                    if (hover.node == b.id && hover.kind == 3 && hover.idx == (int)i)
-                        d.text(b.outs[i].name + " (" + ptName(b.outs[i].type) + ")", g.outs[i].x + 10, g.outs[i].y - 7, 10, sf::Color(220, 220, 230));
+                    if (hover.node == b.id && hover.kind == 3 && hover.idx == (int)i) {
+                        const std::string s = b.outs[i].name + " (" + (b.outs[i].type == PT::Any ? std::string("same as the input") : ptName(b.outs[i].type)) + ")";
+                        d.rect(sf::FloatRect({g.outs[i].x + 8, g.outs[i].y - 8}, {measure(s, 10) + 6, 15}), sf::Color(20, 20, 24, 230));
+                        d.text(s, g.outs[i].x + 11, g.outs[i].y - 7, 10, sf::Color(220, 220, 230));
+                    }
                 }
             }
             w.setView(old);
+            if (zoom != 1.0f) {
+                char zb[32]; std::snprintf(zb, sizeof(zb), "%.0f %%", zoom * 100);
+                d.text(zb, canvas.position.x + canvas.size.x - measure(zb, 11) - 10, canvas.position.y + 6, 11, sf::Color(140, 140, 150));
+            }
         }
 
-        // ---- palette ----
+        // ---- palette: search, categories (click to fold), blocks (click or drag) ----
         d.rect(palette, sf::Color(24, 25, 30), sf::Color(50, 52, 60));
         paletteHits.clear();
+        catHits.clear();
         {
-            float y = palette.position.y + 8;
             const float x = palette.position.x + 10;
-            d.text("Blocks (click to add)", x, y, 12, sf::Color(255, 160, 40)); y += 20;
-            std::string cat;
-            for (const auto& bi : blockList()) {
-                if (bi.category != cat) {
-                    cat = bi.category;
-                    y += 4;
-                    d.text(cat, x, y, 10, categoryColor(cat)); y += 14;
+            searchBox = sf::FloatRect({palette.position.x + 6, palette.position.y + 6}, {PW - 12, 22});
+            d.rect(searchBox, searchFocus ? sf::Color(50, 44, 30) : sf::Color(34, 36, 44), searchFocus ? sf::Color(255, 160, 40) : sf::Color(70, 72, 84));
+            if (search.empty() && !searchFocus) d.text("search blocks (Ctrl+F)", x, searchBox.position.y + 4, 11, sf::Color(110, 110, 122));
+            else d.text(search + (searchFocus ? "_" : ""), x, searchBox.position.y + 4, 11, sf::Color(240, 240, 245));
+            const auto items = paletteItems();
+            const float top = palette.position.y + 34, bottom = palette.position.y + palette.size.y - 4;
+            float y = top - paletteScroll;
+            tipType.clear();
+            if (!search.empty()) {
+                // ranked matches: the title, then the category and the keyword that found it
+                searchSel = std::clamp(searchSel, 0, std::max(0, (int)items.size() - 1));
+                if (!items.empty()) d.text(std::to_string(items.size()) + (items.size() == 1 ? " match" : " matches") + "   (arrows + Enter)",
+                                           x - 4, y, 10, sf::Color(130, 130, 142));
+                y += 15;
+                for (size_t i = 0; i < items.size(); i++) {
+                    const BlockInfo* bi = items[i].bi;
+                    const sf::FloatRect hr({palette.position.x + 4, y - 1}, {PW - 8, 28});
+                    if (y >= top - 2 && y < bottom - 24) {
+                        const bool sel = (int)i == searchSel;
+                        if (sel || hr.contains(mouse)) d.rect(hr, sel ? sf::Color(58, 52, 36) : sf::Color(48, 52, 64));
+                        d.rect(sf::FloatRect({hr.position.x, hr.position.y + 2}, {3, 24}), categoryColor(bi->category));
+                        std::string t = bi->title;
+                        while (t.size() > 3 && measure(t, 11) > PW - 22) t.pop_back();
+                        d.text(t, x, y, 11, sf::Color(225, 225, 232));
+                        std::string sub = bi->category;
+                        if (!items[i].hint.empty()) sub += "  ~ " + items[i].hint;
+                        while (sub.size() > 3 && measure(sub, 10) > PW - 22) sub.pop_back();
+                        d.text(sub, x, y + 13, 10, sf::Color(140, 140, 152));
+                        paletteHits.push_back({hr, bi->type});
+                        if (hr.contains(mouse)) { tipType = bi->type; tipAt = {hr.position.x + hr.size.x + 8, hr.position.y}; }
+                    }
+                    y += 30;
                 }
+                const float content = y + paletteScroll - top;
+                paletteScroll = std::clamp(paletteScroll, 0.0f, std::max(0.0f, content - (bottom - top) + 20));
+                if (items.empty()) {
+                    d.text("no block matches", x, top + 4, 11, sf::Color(150, 110, 110));
+                    d.text("try a function: filter, clock,", x, top + 22, 10, sf::Color(120, 120, 132));
+                    d.text("splot, szum, decymacja, crc ...", x, top + 36, 10, sf::Color(120, 120, 132));
+                }
+            }
+            std::string cat;
+            if (search.empty()) for (const auto& it : items) {
+                const BlockInfo* bi = it.bi;
+                if (bi->category != cat) {
+                    cat = bi->category;
+                    y += 3;
+                    const bool fold = collapsed.count(cat) && search.empty();
+                    const sf::FloatRect cr({palette.position.x + 4, y - 1}, {PW - 8, 16});
+                    if (y >= top - 2 && y < bottom - 12) {
+                        if (cr.contains(mouse)) d.rect(cr, sf::Color(40, 42, 52));
+                        int n = 0; for (const auto& b2 : items) if (cat == b2.bi->category) n++;
+                        d.text(std::string(fold ? "+ " : "- ") + cat + "  (" + std::to_string(n) + ")", x - 4, y, 11, categoryColor(cat));
+                        catHits.push_back({cr, cat});
+                    }
+                    y += 16;
+                }
+                if (collapsed.count(cat) && search.empty()) continue;
                 const sf::FloatRect hr({palette.position.x + 4, y - 1}, {PW - 8, 16});
-                if (hr.contains(mouse)) d.rect(hr, sf::Color(48, 52, 64));
-                d.text(bi.title, x + 8, y, 11, sf::Color(220, 220, 228));
-                paletteHits.push_back({hr, bi.type});
+                if (y >= top - 2 && y < bottom - 12) {
+                    if (hr.contains(mouse)) d.rect(hr, sf::Color(48, 52, 64));
+                    std::string t = bi->title;
+                    while (t.size() > 3 && measure(t, 11) > PW - 30) t.pop_back();
+                    d.text(t, x + 8, y, 11, sf::Color(220, 220, 228));
+                    paletteHits.push_back({hr, bi->type});
+                    if (hr.contains(mouse)) { tipType = bi->type; tipAt = {hr.position.x + hr.size.x + 8, hr.position.y}; }
+                }
                 y += 16;
             }
-            y += 12;
-            const char* help[] = {"Wire: drag from an output (right)", "  to an input (left).", "Pull a wire off: drag its input.",
-                                  "Right-click an input: disconnect.", "Numbers: drag sideways, wheel", "  (Shift fine, Ctrl x10), or click",
-                                  "  and type. Choices: click.", "Del: remove the selected block.", "Drag the empty canvas: move.",
-                                  "", "The channel input is the orange", "Analyzer channel of this receiver."};
-            for (const char* hl : help) { if (y > palette.position.y + palette.size.y - 14) break; d.text(hl, x, y, 10, sf::Color(130, 130, 142)); y += 13; }
+            // how far it may scroll
+            if (search.empty()) {
+                const float content = y + paletteScroll - top;
+                paletteScroll = std::clamp(paletteScroll, 0.0f, std::max(0.0f, content - (bottom - top) + 20));
+            }
         }
 
         // ---- toolbar ----
@@ -708,48 +1041,124 @@ public:
             toolHits.push_back({nr, "chains"});
             x += nw + 10;
             const std::pair<const char*, const char*> bts[] = {{"new", "New"}, {"dup", "Duplicate"}, {"rename", "Rename"}, {"delete", "Delete"},
-                                                               {"presets", "Presets v"}, {"import", "Import JSON"}, {"export", "Export JSON"}, {"exportall", "Export all"}};
+                                                               {"presets", "Presets v"}, {"import", "Import JSON"}, {"export", "Export JSON"}, {"exportall", "Export all"},
+                                                               {"help", "?"}};
             for (const auto& b : bts) {
                 const float bw = measure(b.second, 11) + 18;
                 const sf::FloatRect br({x, y}, {bw, h});
-                button(d, br, b.second, br.contains(mouse), (menu == 2 && std::string(b.first) == "presets"));
+                button(d, br, b.second, br.contains(mouse), (menu == 2 && std::string(b.first) == "presets") || (showHelp && std::string(b.first) == "help"));
                 toolHits.push_back({br, b.first});
                 x += bw + 6;
             }
             std::string right = rxInfo;
             if (msgClock.getElapsedTime().asSeconds() < 6.0f && !msg.empty()) right = msg;
             else if (dirty) right += "   (saving...)";
+            const float maxRight = toolbar.position.x + toolbar.size.x - x - 20;
+            while (right.size() > 3 && measure(right, 11) > maxRight) right.erase(0, 1);
             d.text(right, toolbar.position.x + toolbar.size.x - measure(right, 11) - 12, y + 4, 11,
                    msgClock.getElapsedTime().asSeconds() < 6.0f && !msg.empty() ? sf::Color(255, 200, 120) : sf::Color(150, 150, 162));
+        }
+
+        // ---- help ----
+        if (showHelp) {
+            const char* help[] = {
+                "Blocks: drag from the list onto the canvas (or click: next to the last one). Search (Ctrl+F): name or function, arrows + Enter.",
+                "Wires: drag from an output (right side) to an input (left side). Drag a connected input to pull its wire off;",
+                "       right-click an input to disconnect. Colours: I/Q blue, real green, symbols/bits orange, frames pink, image white.",
+                "       An output marked 'same as the input' carries what comes in (I/Q or real).",
+                "       Scope: every wire opens one more input (up to 8), each channel in its own colour.",
+                "       Feedback: a wire may go back to an earlier block if the loop passes a Delay (z^-n); n samples per step.",
+                "Numbers: drag sideways, mouse wheel (Shift: finer), or click and type. Choices: click for the list, right-click: previous.",
+                "Canvas: drag the empty space to move, wheel to scroll, Ctrl+wheel to zoom (Ctrl+0: 100 %). Del: remove the selected block.",
+                "Signal: the Channel input takes a receiver (its orange Analyzer channel; the Analyzer goes on by itself). More inputs:",
+                "       Sources > Channel input. Sources (generators) run on their own, so a chain works without a radio.",
+                "       Add / Multiply / Real to complex line up their inputs; one at another rate is converted (amber note on the block).",
+                "Tabs: '+ Pipeline' opens another chain (each runs on its own thread); drag a tab sideways to reorder.",
+                "Saved: every change, a moment later (pipelines.json). Export / Import JSON to share chains.",
+            };
+            float hh = 12.0f + 16.0f * (sizeof(help) / sizeof(help[0]));
+            const sf::FloatRect hr({canvas.position.x + 20, canvas.position.y + 14}, {std::min(canvas.size.x - 40, 820.0f), hh});
+            d.rect(hr, sf::Color(26, 28, 36, 245), sf::Color(255, 150, 40));
+            float yy = hr.position.y + 6;
+            for (const char* hl : help) { d.text(hl, hr.position.x + 10, yy, 11, sf::Color(215, 215, 225)); yy += 16; }
+        }
+
+        // ---- keywords of the palette block under the mouse ----
+        if (!tipType.empty() && drag == Drag::None && menu == 0) {
+            const std::string tags = blockTags(tipType);
+            std::vector<std::string> lines;
+            std::string line;
+            const float maxW = 300.0f;
+            std::istringstream ts(tags);
+            for (std::string w; ts >> w;) {
+                const std::string next = line.empty() ? w : line + ", " + w;
+                if (!line.empty() && measure(next, 11) > maxW) { lines.push_back(line + ","); line = w; }
+                else line = next;
+            }
+            if (!line.empty()) lines.push_back(line);
+            if (!lines.empty()) {
+                float w = measure("keywords:", 10);
+                for (const auto& l : lines) w = std::max(w, measure(l, 11));
+                sf::FloatRect tr({tipAt.x, tipAt.y}, {w + 16, 22.0f + 15.0f * lines.size()});
+                tr.position.y = std::min(tr.position.y, r.position.y + r.size.y - tr.size.y - 4);
+                d.rect(tr, sf::Color(26, 28, 36, 240), sf::Color(90, 92, 106));
+                d.text("keywords:", tr.position.x + 8, tr.position.y + 4, 10, sf::Color(140, 140, 152));
+                float yy = tr.position.y + 18;
+                for (const auto& l : lines) { d.text(l, tr.position.x + 8, yy, 11, sf::Color(205, 205, 215)); yy += 15; }
+            }
+        }
+
+        // ---- a block being dragged in from the palette ----
+        if (drag == Drag::Palette && dragMoved) {
+            std::string t = dragType, cat;
+            for (const auto& bi : blockList()) if (dragType == bi.type) { t = bi.title; cat = bi.category; }
+            const sf::FloatRect gr({mouse.x - 30.0f * zoom, mouse.y - 10.0f * zoom}, {210.0f * zoom, HEAD * zoom});
+            const sf::Color cc = categoryColor(cat);
+            d.rect(gr, sf::Color(cc.r / 2, cc.g / 2, cc.b / 2, 220), canvas.contains(mouse) ? sf::Color(255, 160, 40) : sf::Color(120, 120, 130));
+            d.text(t, gr.position.x + 10, gr.position.y + 4, 12, sf::Color::White);
         }
 
         // ---- menus ----
         menuHits.clear();
         if (menu) {
             std::vector<std::pair<std::string, int>> items;
+            std::string current;
+            float x = toolbar.position.x + 8, y0 = toolbar.position.y + toolbar.size.y;
             if (menu == 1) {
                 for (size_t i = 0; i < store().items.size(); i++) items.push_back({store().items[i].name, (int)i});
                 items.push_back({"+ New chain", -1});
-            } else {
+                current = currentName();
+            } else if (menu == 2) {
                 for (size_t i = 0; i < presets().size(); i++) items.push_back({presets()[i].name, (int)i});
+                for (const auto& b : toolHits) if (b.id == "presets") x = b.r.position.x;
+            } else {
+                std::lock_guard<std::mutex> l(pipe.mtx);
+                if (Block* b = pipe.find(menuNode)) if (menuParam < (int)b->params.size()) {
+                    const Param& p = b->params[menuParam];
+                    for (size_t i = 0; i < p.choices.size(); i++) items.push_back({p.choices[i], (int)i});
+                    current = p.show();
+                }
+                x = menuAt.x; y0 = menuAt.y;
             }
-            float x = toolbar.position.x + 8;
-            if (menu == 2) for (const auto& b : toolHits) if (b.id == "presets") x = b.r.position.x;
-            const float y0 = toolbar.position.y + toolbar.size.y;
             float mw = 220;
             for (const auto& it : items) mw = std::max(mw, measure(it.first, 12) + 30);
-            d.rect(sf::FloatRect({x, y0}, {mw, items.size() * 20.0f + 6}), sf::Color(36, 38, 46), sf::Color(255, 150, 40));
+            const float mh = items.size() * 20.0f + 6;
+            if (y0 + mh > area.position.y + area.size.y) y0 = std::max(area.position.y, area.position.y + area.size.y - mh);
+            if (x + mw > area.position.x + area.size.x) x = area.position.x + area.size.x - mw;
+            d.rect(sf::FloatRect({x, y0}, {mw, mh}), sf::Color(36, 38, 46), sf::Color(255, 150, 40));
             float y = y0 + 3;
-            const std::string cur = currentName();
             for (const auto& it : items) {
                 const sf::FloatRect ir({x + 2, y}, {mw - 4, 20});
                 if (ir.contains(mouse)) d.rect(ir, sf::Color(70, 60, 40));
-                d.text(it.first, x + 12, y + 3, 12, menu == 1 && it.first == cur ? sf::Color(255, 190, 110) : sf::Color(225, 225, 232));
+                d.text(it.first, x + 12, y + 3, 12, it.first == current ? sf::Color(255, 190, 110) : sf::Color(225, 225, 232));
                 menuHits.push_back({ir, it.second});
                 y += 20;
             }
         }
     }
+
+    // True when the workspace was drawn lately (its tab is shown)
+    bool visible() const { return lastDraw.getElapsedTime().asSeconds() < 1.0f; }
 };
 
 } // namespace pl

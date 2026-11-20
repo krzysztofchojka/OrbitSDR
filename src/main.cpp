@@ -289,14 +289,39 @@ int main() {
     };
     sf::Clock trackClock;
 
-    // --- Signal pipeline workspace: a tab next to the receiver tabs (the pipeline of one
-    //     receiver's Analyzer channel), nearly the whole window while shown ---
-    Receiver* pipeRx = nullptr;      // whose pipeline the tab shows (nullptr: no tab)
-    bool pipeShown = false;          // the tab is the selected one
+    // --- Signal pipelines: tabs of their own after the receiver tabs (pl::Hub, PipelineHub.h),
+    //     nearly the whole window while shown. Their Channel inputs take the orange Analyzer
+    //     channel of a receiver (the Analyzer is switched on there by itself). ---
+    int pipeUid = 0;                 // the pipeline tab shown (0: none)
+    bool pipeShown = false;          // a pipeline tab is the selected one
+    auto shownWs = [&]() -> pl::Workspace* { return pipeShown ? pl::Hub::get().byUid(pipeUid) : nullptr; };
     pl::hooks().storePath = []() { return getConfigFilePath("pipelines.json"); };
     pl::hooks().saveJsonDialog = [](const std::string& name) { return saveJsonFileDialog(getDefaultExportPath(), name + ".json", "Export pipeline"); };
     pl::hooks().openJsonDialog = []() { return openJsonFileDialog("Import pipeline"); };
     pl::hooks().popup = [](const std::string& t, const std::string& m) { showPopup(t, m); };
+    pl::hooks().imageDir = [&]() { return pictureDir(); };   // Image view "Save PNG": the pictures folder
+    // WAV / byte files of the pipeline: the recordings folder (Recording in the sidebar)
+    pl::hooks().recordDir = [&]() {
+        std::string p;
+        if (cur) { std::lock_guard<std::mutex> l(cur->sd.mtx); p = cur->sd.recPath; }
+        return p.empty() ? getDefaultExportPath() : p;
+    };
+    // Audio out blocks on a sound card of their own: a stream of the speaker mixer each
+    pl::hooks().audioDevices = [&]() {
+        std::vector<std::string> v;
+        for (const auto& d : audio.availableDevices) v.push_back(d.name);
+        return v;
+    };
+    // (a pipeline comes in uneven chunks from its own thread: 150 ms start-up buffer)
+    pl::hooks().audioRoute = [&](int stream, int device) { audio.setPrebuffer(stream, 0.15); audio.setDevice(stream, device); };
+    pl::hooks().audioPush = [&](int stream, const std::vector<float>& lr) { audio.pushSamples(lr, stream); };
+    pl::hooks().audioClose = [&](int stream) { audio.removeStream(stream); };
+    // the receivers a Channel input can take ("RX2  RTL-SDR  101.700"; the first word is the key)
+    pl::hooks().receivers = [&]() {
+        std::vector<std::string> v;
+        for (auto& r : receivers) v.push_back(r->title());
+        return v;
+    };
 
     // --- Receivers: each gets a source (none yet), a DSP thread and its own decoders ---
     int nextRxId = 1;
@@ -347,10 +372,13 @@ int main() {
         rx->dvoice->log.setPath(getConfigFilePath("digitalvoice.log"));
         rx->dvoice->exportDir = getDefaultExportPath();
         rx->analyzer = add(new SignalAnalyzer());
+        rx->analyzer->rxId = rx->id;
+        // "Pipeline >": the tab that takes this receiver, or a new one taking it
         rx->analyzer->onOpenPipeline = [&, rx]() {
-            pipeRx = rx;
+            pl::Workspace* w = pl::Hub::get().taking(rx->id);
+            if (!w) w = pl::Hub::get().add("", "RX" + std::to_string(rx->id), &font);
+            pipeUid = w->uid;
             pipeShown = true;
-            rx->analyzer->pipelineEditor().open();
         };
         // the order of the Decoders checkboxes
         rx->decMods = { nullptr, rx->dvoice, rx->ais, rx->sstv, rx->wefax, rx->ism, rx->acars, rx->vdl2, rx->adsb, rx->wsjt, rx->cw, rx->navtex, rx->dsc, rx->analyzer };
@@ -1113,6 +1141,10 @@ int main() {
             slBW->setLimits(4000, 25000); slBW->setValueSilent(12500);
             cur->sd.bandwidth = 12500; slBW->setText("Bandwidth: 12.5 kHz");
         } else if (m == Mode::OFF) {
+            // no demodulator: the tuner's width only feeds the decoders (e.g. a wide Analyzer
+            // channel for LRPT); the previous mode's limit (NFM 40 kHz) must not hold it back
+            slBW->setLimits(1000, 2000000);
+            slBW->setValueSilent((float)cur->sd.bandwidth);
         } else {
             slBW->setLimits(1000, 10000); slBW->setValueSilent(3000);
             cur->sd.bandwidth = 3000; slBW->setText("Bandwidth: 3 kHz");
@@ -1814,7 +1846,12 @@ int main() {
     struct RxTabHit { sf::FloatRect tab, close, speaker; Receiver* rx; };
     std::vector<RxTabHit> rxTabHits;
     sf::FloatRect rxAddHit;
-    sf::FloatRect pipeTabHit, pipeCloseHit;
+    struct PipeTabHit { sf::FloatRect tab, close; int uid; };
+    std::vector<PipeTabHit> pipeTabHits;
+    sf::FloatRect pipeAddHit;
+    int pipeDragUid = 0;             // a pipeline tab being dragged (to another place)
+    float pipeDragX = 0.0f;
+    bool pipeDragMoved = false;
 
     auto saveUi = [&](Receiver* r) {
         r->deviceOptions = ddDevice->options;
@@ -2063,24 +2100,33 @@ int main() {
             rxTabHits.push_back({sf::FloatRect({x, y}, {tw, h}), closeR, spkR, r});
             x += tw + 4.0f;
         }
-        // the pipeline workspace of one receiver's Analyzer channel
-        pipeTabHit = sf::FloatRect();
-        pipeCloseHit = sf::FloatRect();
-        if (pipeRx) {
-            const std::string title = "Pipeline  " + pipeRx->title().substr(0, pipeRx->title().find(' ')) + ": " +
-                                      pipeRx->analyzer->pipelineEditor().title();
+        // the pipeline tabs (drag one sideways to put it elsewhere)
+        pipeTabHits.clear();
+        for (pl::Workspace* w : pl::Hub::get().list()) {
+            const bool sel = pipeShown && w->uid == pipeUid;
+            std::string title = "Pipeline: " + w->editor.title();
+            if (title.size() > 42) title = title.substr(0, 40) + "..";
             sf::Text probe(font, sf::String::fromUtf8(title.begin(), title.end()), 22);
             const float tw = probe.getGlobalBounds().size.x * 0.5f + 40.0f;
+            const bool dragged = pipeDragMoved && w->uid == pipeDragUid;
             sf::RectangleShape bg({tw, h});
             bg.setPosition({x, y});
-            bg.setFillColor(pipeShown ? sf::Color(19, 19, 21) : sf::Color(52, 42, 30));
+            bg.setFillColor(dragged ? sf::Color(80, 60, 30) : sel ? sf::Color(19, 19, 21) : sf::Color(52, 42, 30));
             bg.setOutlineThickness(1.0f);
-            bg.setOutlineColor(pipeShown ? SignalAnalyzer::color() : sf::Color(110, 80, 40));
+            bg.setOutlineColor(sel || dragged ? SignalAnalyzer::color() : sf::Color(110, 80, 40));
             window.draw(bg);
-            txt(title, x + 10.0f, y + 3.0f, pipeShown ? sf::Color(255, 190, 110) : sf::Color(210, 170, 120));
-            pipeCloseHit = sf::FloatRect({x + tw - 18.0f, y}, {18.0f, h});
-            txt("x", x + tw - 13.0f, y + 2.0f, pipeCloseHit.contains(mp) ? sf::Color(255, 120, 120) : sf::Color(150, 130, 110));
-            pipeTabHit = sf::FloatRect({x, y}, {tw, h});
+            // busy: the share of real time its thread needs (red when it cannot keep up)
+            const double ld = w->load();
+            if (ld > 0.5) {
+                sf::RectangleShape bar({(tw - 8.0f) * (float)std::min(1.0, ld), 2.0f});
+                bar.setPosition({x + 4.0f, y + h - 3.0f});
+                bar.setFillColor(ld > 0.9 ? sf::Color(240, 80, 80) : sf::Color(240, 190, 60));
+                window.draw(bar);
+            }
+            txt(title, x + 10.0f, y + 3.0f, sel ? sf::Color(255, 190, 110) : sf::Color(210, 170, 120));
+            const sf::FloatRect closeR({x + tw - 18.0f, y}, {18.0f, h});
+            txt("x", x + tw - 13.0f, y + 2.0f, closeR.contains(mp) ? sf::Color(255, 120, 120) : sf::Color(150, 130, 110));
+            pipeTabHits.push_back({sf::FloatRect({x, y}, {tw, h}), closeR, w->uid});
             x += tw + 4.0f;
         }
         // "+": another receiver
@@ -2093,6 +2139,17 @@ int main() {
         add.setOutlineColor(sf::Color(62, 62, 70));
         window.draw(add);
         txt("+  Add receiver", x + 14.0f, y + 3.0f, Theme::Accent);
+        x += aw + 4.0f;
+        // "+ Pipeline": an empty pipeline tab (pick its receiver in the Channel input)
+        const float pw = 104.0f;
+        pipeAddHit = sf::FloatRect({x, y}, {pw, h});
+        sf::RectangleShape padd({pw, h});
+        padd.setPosition({x, y});
+        padd.setFillColor(pipeAddHit.contains(mp) ? sf::Color(66, 52, 32) : sf::Color(40, 34, 28));
+        padd.setOutlineThickness(1.0f);
+        padd.setOutlineColor(sf::Color(110, 80, 40));
+        window.draw(padd);
+        txt("+  Pipeline", x + 14.0f, y + 3.0f, SignalAnalyzer::color());
     };
 
     // Smoothed values of the signal meter in the status bar
@@ -2167,6 +2224,18 @@ int main() {
         ddAudio->setSelection(audio.deviceOf(cur->sd.audioStream));
     }
 
+    // --- The pipeline tabs of the last session (by chain name), and the one shown ---
+    {
+        const int n = std::clamp(settingsMgr.getInt("pipe_tabs", 0), 0, 32);
+        for (int i = 0; i < n; i++) {
+            const std::string name = fromHex(settingsMgr.getString("pipe_tab" + std::to_string(i), ""));
+            if (!name.empty() && !pl::Hub::get().openIn(name, nullptr)) pl::Hub::get().add(name, "", &font);
+        }
+        const auto tabsNow = pl::Hub::get().list();
+        const int sh = settingsMgr.getInt("pipe_shown", -1);
+        if (sh >= 0 && sh < (int)tabsNow.size()) { pipeUid = tabsNow[sh]->uid; pipeShown = true; }
+    }
+
     while (window.isOpen()) {
         // receiver tab actions from the last frame's clicks (done here, before anything of
         // this frame looks at `cur`)
@@ -2175,10 +2244,27 @@ int main() {
             rxAction = {};
             if (a.kind == 1) { pipeShown = false; addReceiver(); }
             else if (a.kind == 2) {
-                if (a.rx == pipeRx) { pipeRx = nullptr; pipeShown = false; }   // its pipeline tab goes with it
-                closeReceiver(a.rx);
+                closeReceiver(a.rx);   // (a pipeline taking it shows "not available" on its input)
             }
             else if (a.kind == 3) switchReceiver(a.rx);
+        }
+        // A pipeline's Channel input took a receiver: its Analyzer (the orange channel) goes on
+        {
+            static sf::Clock wantClock;
+            if (wantClock.getElapsedTime().asSeconds() > 0.3f) {
+                wantClock.restart();
+                for (int id : pl::Hub::get().wanted()) {
+                    for (auto& rxp : receivers) {
+                        Receiver* r = rxp.get();
+                        if (r->id != id || !r->analyzer || r->analyzer->enabled) continue;
+                        for (size_t i = 0; i < r->decMods.size(); i++) {
+                            if (r->decMods[i] != r->analyzer) continue;
+                            activateDecoderOn(r, i, true);
+                            if (r == cur) decoders[i].chk->checked = true;
+                        }
+                    }
+                }
+            }
         }
         syncMacWindowSize(window);   // macOS window tiling resizes without telling SFML
         sf::Vector2u currSize = window.getSize();
@@ -2633,10 +2719,34 @@ int main() {
                 const sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window));
                 if (m.y >= TOPBAR_DRAW_H && m.y < TOP_BAR_H) {
                     if (mbr->button == sf::Mouse::Button::Left) {
-                        if (rxAddHit.contains(m)) rxAction = {1, nullptr};
-                        else if (pipeCloseHit.size.x > 0 && pipeCloseHit.contains(m)) { pipeRx = nullptr; pipeShown = false; }
-                        else if (pipeTabHit.size.x > 0 && pipeTabHit.contains(m)) { pipeShown = true; pipeRx->analyzer->pipelineEditor().open(); }
-                        else for (const RxTabHit& h : rxTabHits) {
+                        bool done = false;
+                        if (rxAddHit.contains(m)) { rxAction = {1, nullptr}; done = true; }
+                        else if (pipeAddHit.contains(m)) {
+                            pipeUid = pl::Hub::get().add("", "", &font)->uid;
+                            pipeShown = true;
+                            done = true;
+                        }
+                        for (const PipeTabHit& h : pipeTabHits) {
+                            if (done) break;
+                            if (h.close.contains(m)) {
+                                // the neighbour is shown when the shown one closes
+                                if (pipeShown && pipeUid == h.uid) {
+                                    int next = 0;
+                                    for (size_t k = 0; k < pipeTabHits.size(); k++)
+                                        if (pipeTabHits[k].uid == h.uid) next = k + 1 < pipeTabHits.size() ? pipeTabHits[k + 1].uid : k > 0 ? pipeTabHits[k - 1].uid : 0;
+                                    pipeUid = next;
+                                    pipeShown = next != 0;
+                                }
+                                pl::Hub::get().close(pl::Hub::get().byUid(h.uid));
+                                done = true;
+                            } else if (h.tab.contains(m)) {
+                                pipeUid = h.uid;
+                                pipeShown = true;
+                                pipeDragUid = h.uid; pipeDragX = m.x; pipeDragMoved = false;
+                                done = true;
+                            }
+                        }
+                        if (!done) for (const RxTabHit& h : rxTabHits) {
                             if (h.speaker.contains(m)) {   // this receiver's sound on / off (works in the background)
                                 const bool on = !h.rx->sd.audioOut;
                                 h.rx->sd.audioOut = on;
@@ -2651,9 +2761,28 @@ int main() {
                 }
             }
 
+            // A pipeline tab dragged sideways: it moves past its neighbours
+            if (pipeDragUid) {
+                if (ev->is<sf::Event::MouseMoved>()) {
+                    const sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window));
+                    if (std::fabs(m.x - pipeDragX) > 6.0f) pipeDragMoved = true;
+                    if (pipeDragMoved) {
+                        int from = -1, to = -1;
+                        for (size_t k = 0; k < pipeTabHits.size(); k++) {
+                            if (pipeTabHits[k].uid == pipeDragUid) from = (int)k;
+                            const sf::FloatRect& t = pipeTabHits[k].tab;
+                            if (m.x >= t.position.x && m.x < t.position.x + t.size.x) to = (int)k;
+                        }
+                        if (from >= 0 && to >= 0 && from != to) pl::Hub::get().move(from, to);
+                    }
+                    continue;
+                }
+                if (ev->is<sf::Event::MouseButtonReleased>()) { pipeDragUid = 0; pipeDragMoved = false; continue; }
+            }
+
             // The pipeline workspace covers everything below the tabs: it gets the mouse there
             // and the keyboard (the top bar above it still works)
-            if (pipeShown && pipeRx) {
+            if (pl::Workspace* ws = shownWs()) {
                 bool mine = false;
                 if (const auto* mb = ev->getIf<sf::Event::MouseButtonPressed>())
                     mine = window.mapPixelToCoords(mb->position).y >= TOP_BAR_H;
@@ -2663,7 +2792,7 @@ int main() {
                          ev->is<sf::Event::KeyPressed>() || ev->is<sf::Event::KeyReleased>() || ev->is<sf::Event::TextEntered>())
                     mine = true;
                 if (mine) {
-                    pipeRx->analyzer->pipelineEditor().handleEvent(*ev, window);
+                    ws->editor.handleEvent(*ev, window);
                     // moves / releases also reach the rest (drags of the top bar end properly)
                     if (!ev->is<sf::Event::MouseMoved>() && !ev->is<sf::Event::MouseButtonReleased>()) continue;
                     if (window.mapPixelToCoords(sf::Mouse::getPosition(window)).y >= TOP_BAR_H) continue;
@@ -3265,7 +3394,10 @@ int main() {
         }
 
         window.clear(sf::Color::Black);
+        pl::Workspace* const wsShown = shownWs();
+        if (pipeShown && !wsShown) pipeShown = false;   // (closed meanwhile)
 
+        if (!wsShown) {   // (the receiver's view: not drawn at all while a pipeline tab covers it)
         long long cf = 0;
         if (cur->sd.source) cf = cur->centerFreq;
 
@@ -4057,12 +4189,13 @@ int main() {
             timeSlider.draw(window);
         }
         sidebar.draw(window);
+        }   // receiver's view
 
         // The pipeline workspace over everything below the tabs (the receivers keep running)
-        if (pipeShown && pipeRx) {
-            const std::string info = pipeRx->title() + "   " + pipeRx->analyzer->pipelineInfo() +
-                                     (pipeRx->analyzer->enabled ? "" : "   (Analyzer is off: no input)");
-            pipeRx->analyzer->pipelineEditor().draw(window, sf::FloatRect({0.0f, (float)TOP_BAR_H}, {layout.winW, layout.winH - TOP_BAR_H}), info);
+        if (wsShown) {
+            char ld[48];
+            std::snprintf(ld, sizeof(ld), "load %.0f %%", wsShown->load() * 100.0);
+            wsShown->editor.draw(window, sf::FloatRect({0.0f, (float)TOP_BAR_H}, {layout.winW, layout.winH - TOP_BAR_H}), ld);
         }
 
         window.draw(topBar);
@@ -4163,7 +4296,7 @@ int main() {
         }
 
 
-        if (modInspector->isOpen && !(pipeShown && pipeRx)) {
+        if (modInspector->isOpen && !wsShown) {
             float mx = modInspector->headerBg.getPosition().x + 10;
             float my = modInspector->headerBg.getPosition().y + 30;
 
@@ -4199,6 +4332,19 @@ int main() {
     if (!receivers.empty() && cur != receivers[0].get()) switchReceiver(receivers[0].get());
     SettingsManager saveMgr;
     saveMgr.set("rx_count", (int)receivers.size());
+    // the pipeline tabs (their chains are saved in pipelines.json); then their threads stop,
+    // before the speaker (AudioSink) and the receivers go
+    {
+        const auto tabsNow = pl::Hub::get().list();
+        saveMgr.set("pipe_tabs", (int)tabsNow.size());
+        int shownIdx = -1;
+        for (size_t i = 0; i < tabsNow.size(); i++) {
+            saveMgr.set("pipe_tab" + std::to_string(i), toHex(tabsNow[i]->editor.title()));
+            if (pipeShown && tabsNow[i]->uid == pipeUid) shownIdx = (int)i;
+        }
+        saveMgr.set("pipe_shown", shownIdx);
+        for (pl::Workspace* w : tabsNow) pl::Hub::get().close(w);
+    }
     for (size_t i = 0; i < receivers.size(); i++) {
         saveMgr.set("rx" + std::to_string(i + 1) + "_speaker", receivers[i]->sd.audioOut.load());
         saveMgr.set("rx" + std::to_string(i + 1) + "_audio_dev", toHex(receivers[i]->audioDevice));

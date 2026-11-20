@@ -154,6 +154,7 @@ class Analyzer {
     bool captureIsContinuation = false;
     uint64_t total = 0;             // samples since reset
     double lastReportT = 0.0;
+    double lastLiveT = 0.0;
     int seq = 0;
     // earlier bursts (symbols) for the repeated part
     struct Past { int levels; double rate; std::vector<uint8_t> sym; };
@@ -176,6 +177,10 @@ public:
     double triggerDb = 8.0;
     // also analyse signals that never stop (0.5 s windows every 3 s); off = bursts only
     bool steadyWindows = true;
+    // Live: the latest LIVE_N samples analysed every 0.25 s, whatever comes and goes
+    // (constellation / eye / histogram follow the signal); bursts are still timed
+    bool live = false;
+    static constexpr size_t LIVE_N = (size_t)1 << 15;
     // Where the captures go: empty = analysed right here (the caller's thread), else handed
     // over (the module analyses them on its own thread with analyzeCapture()).
     std::function<void(Capture&&)> onCapture;
@@ -200,7 +205,7 @@ public:
         capture.clear();
         preRoll.assign(blockLen * 3, CF(0, 0)); preRollPos = 0;
         recent.assign(std::min(MAX_STEADY, (size_t)std::max(1.0, fs * 0.5)), CF(0, 0)); recentPos = 0; recentFull = false;
-        total = 0; lastReportT = 0.0;
+        total = 0; lastReportT = 0.0; lastLiveT = 0.0;
         past.clear();
         marks.clear();
         latest = Report();
@@ -264,6 +269,13 @@ private:
         }
         if (!haveFloor) return;
         const double t = now();
+        if (live && recentFull && t - lastLiveT >= 0.25) {
+            lastLiveT = t;
+            const size_t n = std::min(LIVE_N, recent.size());
+            std::vector<CF> w(n);
+            for (size_t k = 0; k < n; k++) w[k] = recent[(recentPos + recent.size() - n + k) % recent.size()];
+            emit(std::move(w), t - (double)n / fs, true, false, false);
+        }
         if (!on) {
             if (db > floorDb_ + triggerDb) {
                 on = true; hang = 0;
@@ -307,6 +319,7 @@ private:
 
     // A capture is ready: hand it over, or analyse it here
     void emit(std::vector<CF>&& s, double t0, bool continuous, bool continuation, bool truncated) {
+        if (live && !continuous) return;   // Live: only the windows (the burst was marked already)
         lastReportT = now();
         Capture c;
         if (s.size() > MAX_ANALYSIS) { s.resize(MAX_ANALYSIS); truncated = true; }

@@ -177,6 +177,7 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
     auto paceStart = std::chrono::steady_clock::now();
     std::vector<float> fftMags(FFT_SIZE), fftSorted(FFT_SIZE);
     std::vector<float> decVoice;   // speech of the digital voice decoders (mono)
+    std::vector<float> decLeft, decRight;   // stereo audio of the modules (signal pipeline)
     DecoderRunner decoders(shared);   // the decoders' thread (stops when dspWorker returns)
     bool decodersReset = false;
 
@@ -503,18 +504,21 @@ inline void dspWorker(std::atomic<bool>& running, SharedData& shared, AudioSink&
                 {
                     const size_t frames = audioData.size() / 2;
                     bool any = false, duck = false;
+                    decVoice.assign(frames, 0.0f);
+                    decLeft.assign(frames, 0.0f);
+                    decRight.assign(frames, 0.0f);
                     for (SDRModule* m : voiceMods) {
                         if (!m || !m->enabled) continue;
-                        if (decVoice.size() != frames) decVoice.assign(frames, 0.0f);
-                        if (!any) std::fill(decVoice.begin(), decVoice.end(), 0.0f);
                         bool d = false;
-                        if (m->mixVoice(decVoice.data(), frames, d)) { any = true; duck = duck || d; }
+                        // stereo first (the pipeline's audio), else mono to both sides
+                        if (m->mixStereo(decLeft.data(), decRight.data(), frames, d)) { any = true; duck = duck || d; }
+                        else if (m->mixVoice(decVoice.data(), frames, d)) { any = true; duck = duck || d; }
                     }
                     if (any) {
                         if (duck) std::fill(audioData.begin(), audioData.end(), 0.0f);
                         for (size_t i = 0; i < frames; i++) {
-                            audioData[2 * i] += decVoice[i];
-                            audioData[2 * i + 1] += decVoice[i];
+                            audioData[2 * i] += decVoice[i] + decLeft[i];
+                            audioData[2 * i + 1] += decVoice[i] + decRight[i];
                         }
                     }
                 }

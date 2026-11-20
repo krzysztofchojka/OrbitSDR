@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <map>
+#include <set>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -16,6 +17,10 @@
 #include <algorithm>
 #include <fstream>
 #include <sstream>
+#include <random>
+#include <array>
+#include <ctime>
+#include <cstring>
 #include "../../DSP.h"
 #include "../../orbit/Json.h"
 #include "AnalyzerCore.h"
@@ -43,10 +48,15 @@ namespace pl {
 using CF = std::complex<float>;
 constexpr double PI_D = 3.14159265358979323846;
 
-enum class PT { IQ, Real, Sym, Any };   // Any: an input that takes I/Q or real
-inline const char* ptName(PT t) { return t == PT::IQ ? "I/Q" : t == PT::Real ? "real" : t == PT::Sym ? "symbols" : "I/Q or real"; }
+enum class PT { IQ, Real, Sym, Frames, Lines, Any };   // Any: an input that takes I/Q or real
+// Frames: whole frames / packets of bytes. Lines: rows of an image (8-bit grey)
+inline const char* ptName(PT t) {
+    return t == PT::IQ ? "I/Q" : t == PT::Real ? "real" : t == PT::Sym ? "symbols / bits" : t == PT::Frames ? "frames (bytes)"
+         : t == PT::Lines ? "image lines" : "I/Q or real";
+}
 inline sf::Color ptColor(PT t) {
-    return t == PT::IQ ? sf::Color(90, 200, 255) : t == PT::Real ? sf::Color(120, 230, 120) : t == PT::Sym ? sf::Color(255, 190, 80) : sf::Color(200, 200, 210);
+    return t == PT::IQ ? sf::Color(90, 200, 255) : t == PT::Real ? sf::Color(120, 230, 120) : t == PT::Sym ? sf::Color(255, 190, 80)
+         : t == PT::Frames ? sf::Color(240, 110, 200) : t == PT::Lines ? sf::Color(250, 250, 250) : sf::Color(200, 200, 210);
 }
 
 constexpr uint8_t FRAME = 0xFF;   // in a symbol stream: a frame starts here
@@ -59,9 +69,31 @@ struct Stream {
     std::vector<CF> iq;
     std::vector<float> re;
     std::vector<uint8_t> sym;
-    void clear() { iq.clear(); re.clear(); sym.clear(); newBurst = false; }
-    size_t size() const { return type == PT::IQ ? iq.size() : type == PT::Real ? re.size() : sym.size(); }
+    std::vector<std::vector<uint8_t>> frames;   // Frames: one entry per frame / packet
+    std::vector<std::vector<uint8_t>> lines;    // Lines: one entry per image row
+    void clear() { iq.clear(); re.clear(); sym.clear(); frames.clear(); lines.clear(); newBurst = false; }
+    size_t size() const {
+        return type == PT::IQ ? iq.size() : type == PT::Real ? re.size() : type == PT::Sym ? sym.size()
+             : type == PT::Frames ? frames.size() : lines.size();
+    }
 };
+
+// Set once by main.cpp (native dialogs, folders)
+struct EditorHooks {
+    std::function<std::string()> storePath;                                            // pipelines.json
+    std::function<std::string(const std::string& name)> saveJsonDialog;                // empty = cancelled
+    std::function<std::string()> openJsonDialog;
+    std::function<void(const std::string& title, const std::string& msg)> popup;
+    std::function<std::string()> imageDir;                                             // where pictures are saved
+    std::function<std::string()> recordDir;                                            // where files are written (WAV, bytes)
+    std::function<std::vector<std::string>()> audioDevices;                            // sound cards ([0] = system default)
+    std::function<void(int stream, int device)> audioRoute;                            // a stream to a sound card
+    std::function<void(int stream, const std::vector<float>& lr)> audioPush;          // 48 kHz stereo interleaved
+    std::function<void(int stream)> audioClose;
+    // the receivers a Channel input can take: "RX1  RTL-SDR  101.700" ... (the first word is the key)
+    std::function<std::vector<std::string>()> receivers;
+};
+inline EditorHooks& hooks() { static EditorHooks h; return h; }
 
 struct Param {
     enum Kind { Num, Choice, Text } kind = Num;
@@ -69,32 +101,55 @@ struct Param {
     double v = 0.0, lo = 0.0, hi = 1.0, step = 1.0;
     int decimals = 0;
     std::vector<std::string> choices;
+    bool dynamic = false;           // choices from the system (sound cards): saved by name too
+    // where a dynamic list comes from (refreshed by the editor); fixed[] stay in front of it
+    std::function<std::vector<std::string>()> source;
+    std::vector<std::string> fixed;
+    bool keyFirstWord = false;      // the same entry when the first word matches ("RX1  ..." stays RX1)
+    // shown only while the choice parameter `showKey` has one of the values in showWhen
+    std::string showKey;
+    std::vector<int> showWhen;
     std::string text;
     std::string show() const {
         if (kind == Choice) return choices.empty() ? "" : choices[std::clamp((int)v, 0, (int)choices.size() - 1)];
         if (kind == Text) return text.empty() ? "(empty)" : text;
         char b[48];
-        std::snprintf(b, sizeof(b), "%.*f", decimals, v);
+        // a value finer than the shown decimals (0.1 Hz with 0 decimals): its own digits
+        const double q = std::pow(10.0, decimals);
+        if (v != 0.0 && std::fabs(v * q - std::round(v * q)) > 1e-6 * std::max(1.0, std::fabs(v * q))) std::snprintf(b, sizeof(b), "%.4g", v);
+        else std::snprintf(b, sizeof(b), "%.*f", decimals, v);
         return unit.empty() ? std::string(b) : std::string(b) + " " + unit;
     }
 };
 
 struct Port { std::string name; PT type; };
 
+// The colours of a multi-input view's channels (the Scope's traces and its input numbers)
+inline sf::Color channelColor(int k) {
+    static const sf::Color pal[] = {{120, 230, 120}, {255, 200, 70}, {240, 110, 200}, {90, 200, 255},
+                                    {255, 140, 60}, {180, 140, 255}, {230, 230, 230}, {255, 90, 90}};
+    return pal[((k % 8) + 8) % 8];
+}
+
 // Speaker output of the pipeline (48 kHz mono), filled by the Audio block
+// 48 kHz stereo (left, right interleaved), at most a second
 struct AudioRing {
     std::mutex m;
     std::deque<float> q;
-    void push(const std::vector<float>& x) {
+    void push(const std::vector<float>& lr) {
         std::lock_guard<std::mutex> l(m);
-        q.insert(q.end(), x.begin(), x.end());
-        while (q.size() > 48000) q.pop_front();
+        q.insert(q.end(), lr.begin(), lr.end());
+        while (q.size() > 2 * 48000) { q.pop_front(); q.pop_front(); }
     }
-    bool mix(float* out, size_t n) {
+    size_t mix(float* left, float* right, size_t n) {   // frames added (0: nothing waiting)
         std::lock_guard<std::mutex> l(m);
-        if (q.empty()) return false;
-        for (size_t i = 0; i < n && !q.empty(); i++) { out[i] += q.front(); q.pop_front(); }
-        return true;
+        if (q.size() < 2) return 0;
+        size_t i = 0;
+        for (; i < n && q.size() >= 2; i++) {
+            left[i] += q.front(); q.pop_front();
+            right[i] += q.front(); q.pop_front();
+        }
+        return i;
     }
 };
 
@@ -137,6 +192,41 @@ public:
     AudioRing* audio = nullptr;
     bool removable = true;
     int paramVersion = 0;          // bumped by the editor on every change
+    double tick = 0.0;             // seconds this process() call stands for (generators)
+    std::string warning;           // set by the pipeline: an input of the wrong kind (shown red)
+    int maxIns = 0;                // > 1: a free input appears for every wire connected (up to this many)
+    bool isDelay = false;          // a Delay: a feedback loop may pass through it (see Pipeline::runLoop)
+    // In a feedback loop: the delay hands out `n` samples it has (of kind t) before it gets its
+    // input, then takes as many in. loopDelay(): how many it holds (the loop's step).
+    virtual size_t loopDelay() const { return 1; }
+    virtual void loopEmit(size_t /*n*/, PT /*t*/, double /*rate*/) {}
+    virtual void loopAbsorb(const Stream* /*in*/, size_t /*n*/) {}
+    bool isInput = false;          // a Channel input (filled by the workspace, not processed)
+    bool syncInputs = false;       // its sample inputs are lined up (same length, same rate) before process()
+    std::string note;              // set by the pipeline: e.g. an input converted to another rate (shown amber)
+
+    // A dynamic choice list (receivers, sound cards) read again; the chosen entry stays chosen
+    // by name, and one that went away stays in the list marked "(not available)"
+    static constexpr const char* GONE = "  (not available)";
+    void refreshChoices() {
+        for (auto& p : params) {
+            if (p.kind != Param::Choice || !p.source) continue;
+            std::vector<std::string> fresh = p.fixed;
+            for (auto& c : p.source()) fresh.push_back(c);
+            if (fresh == p.choices) continue;
+            std::string cur = p.show();
+            if (cur.size() > std::strlen(GONE) && cur.compare(cur.size() - std::strlen(GONE), std::string::npos, GONE) == 0) cur.erase(cur.size() - std::strlen(GONE));
+            auto key = [&](const std::string& s) { return p.keyFirstWord ? s.substr(0, s.find(' ')) : s; };
+            int idx = -1;
+            for (size_t i = 0; i < fresh.size() && idx < 0; i++) if (fresh[i] == cur) idx = (int)i;
+            for (size_t i = 0; i < fresh.size() && idx < 0; i++) if (key(fresh[i]) == key(cur)) idx = (int)i;
+            if (idx < 0 && (int)p.v >= (int)p.fixed.size()) { fresh.push_back(cur + GONE); idx = (int)fresh.size() - 1; }
+            p.choices = fresh;
+            p.hi = (double)fresh.size() - 1;
+            p.v = std::max(0, idx);
+            paramVersion++;
+        }
+    }
 
     virtual ~Block() {}
     virtual void reset() {}
@@ -166,6 +256,15 @@ public:
     double num(const std::string& k) const { const Param* p = param(k); return p ? p->v : 0.0; }
     int choice(const std::string& k) const { const Param* p = param(k); return p ? (int)p->v : 0; }
     std::string text(const std::string& k) const { const Param* p = param(k); return p ? p->text : std::string(); }
+    // Show parameter `key` only while choice `on` is one of `values` (the others stay hidden)
+    void showOnly(const std::string& key, const std::string& on, std::vector<int> values) {
+        for (auto& p : params) if (p.key == key) { p.showKey = on; p.showWhen = std::move(values); }
+    }
+    bool shown(const Param& p) const {
+        if (p.showKey.empty()) return true;
+        const int c = choice(p.showKey);
+        return std::find(p.showWhen.begin(), p.showWhen.end(), c) != p.showWhen.end();
+    }
 
     void setOuts(std::vector<Port> o) {
         outs = std::move(o);
@@ -234,10 +333,27 @@ inline void passOn(const Stream* in, Stream& o, PT type, double rate) {
 //  Blocks
 // =====================================================================
 
+// The signal of a receiver: the baseband of its orange Analyzer channel (the Analyzer is
+// switched on by itself on the receiver chosen here). "none": generators only.
 class InputBlock : public Block {
 public:
-    std::string info;   // set by the analyzer: frequency, width, rate
-    InputBlock() { type = "input"; title = "Channel input"; category = "Source"; removable = false; setOuts({{"I/Q", PT::IQ}}); }
+    std::string info;   // set by the workspace: frequency, width, rate (or why there is nothing)
+    explicit InputBlock(bool first = true) {
+        type = first ? "input" : "rxin"; title = "Channel input"; category = "Source"; removable = !first; isInput = true;
+        setOuts({{"I/Q", PT::IQ}});
+        Param& p = addChoice("src", "Receiver", {"none (sources only)"});
+        p.dynamic = true;
+        p.fixed = {"none (sources only)"};
+        p.keyFirstWord = true;
+        p.source = []() { return hooks().receivers ? hooks().receivers() : std::vector<std::string>(); };
+        refreshChoices();
+    }
+    // the receiver's number (RX1 -> 1), -1: none
+    int rxId() const {
+        const std::string s = param("src") ? param("src")->show() : std::string();
+        if (s.size() > 2 && s[0] == 'R' && s[1] == 'X') return std::atoi(s.c_str() + 2);
+        return -1;
+    }
     void process(const std::vector<const Stream*>&) override {}
     std::string status() const override { return info; }
 };
@@ -466,8 +582,13 @@ class SlicerBlock : public Block {
     double lastMid = 0.0;
     size_t symbolsOut = 0;
     void levels() {
+        // 2 levels: 5th / 95th percentile (a preamble may hold one level only 1/8 of the time, AX.25
+        // flags); 4 levels: 15th / 85th (each level ~25 %, more robust against noise spikes)
+        const size_t pc = choice("lv") == 1 ? 15 : 5;
         tmp.assign(vals.begin(), vals.end());
-        const size_t a = tmp.size() * 15 / 100, b = std::min(tmp.size() - 1, tmp.size() * 85 / 100);
+        const size_t a = tmp.size() * pc / 100, b = std::min(tmp.size() - 1, tmp.size() * (100 - pc) / 100);
+
+
         std::nth_element(tmp.begin(), tmp.begin() + a, tmp.end());
         const float lo = tmp[a];
         std::nth_element(tmp.begin(), tmp.begin() + b, tmp.end());
@@ -572,6 +693,15 @@ private:
             prevSample = y;
             const double tPrev = t;
             t += 1.0;
+            // Clock tracking on the crossings of the centre (robust when transitions are rare,
+            // e.g. AX.25 flags; Gardner drifted there): a crossing belongs half-way between two
+            // strobes. Later than that -> the strobes come early -> hold them back.
+            if (track && haveSym > 8 && (yPrev - center) * (y - center) < 0.0 && std::fabs(y - yPrev) > amp * 0.3) {
+                const double tc = tPrev + (center - yPrev) / (y - yPrev);
+                double e = tc - sps * 0.5;
+                if (e > sps * 0.5) e -= sps;
+                t -= std::clamp(0.12 * e, -0.2 * sps, 0.2 * sps);
+            }
             if (tPrev < sps * 0.5 && t >= sps * 0.5) lastMid = y - (t - sps * 0.5) * (y - yPrev);
             if (t < sps) return;
             t -= sps;
@@ -587,7 +717,7 @@ private:
             const double a = amp;
             // Gardner: e = mid x (this - previous). The integrator makes y lag the signal, so
             // e > 0 means the strobe comes early: hold the next one back (t smaller).
-            if (track && haveSym) {
+            if (false && track && haveSym) {   // (Gardner, kept for reference: see the crossings above)
                 const double e = (lastMid - center) * (y - prevSym) / (a * a + 1e-12);
                 t -= std::clamp(0.03 * e, -0.15, 0.15) * sps;
             }
@@ -739,91 +869,190 @@ public:
 // ---------------------------------------------------------------------
 
 // Time plot with a trigger: Auto (free running), Normal (only on trigger), Single (once, then hold)
+// An oscilloscope with as many channels as wires: every wire connected to it opens another
+// input (up to 8). Each channel is real or I/Q (I and Q drawn as two traces), at its own rate;
+// one of them triggers, and all show the same moment and the same time span.
 class ScopeBlock : public Block {
-    std::deque<float> a, b;          // real, or I and Q
-    std::vector<float> showA, showB;
-    bool isIQ = false;
-    bool waiting = true;             // armed, looking for the trigger
+    struct Ch {
+        std::deque<float> a, b;            // real, or I and Q
+        std::vector<float> showA, showB;   // the shown capture
+        bool iq = false, live = false;
+        double rate = 0.0;
+        size_t need = 0;
+    };
+    std::vector<Ch> ch;
     long long sinceTrig = 0, sinceShow = 0;
-    size_t need = 0, preN = 0;
     int capturing = -1;              // samples still to collect after the trigger (-1: not)
     float prevV = 0.0f;
-    double rate = 0.0;
+    double rate = 0.0;               // of the triggering channel
+    int trigCh = 0;
     bool singleDone = false;
-    void snapshot() {
-        const size_t n = std::min(need, a.size());
-        showA.assign(a.end() - n, a.end());
-        showB.clear();
-        if (isIQ) showB.assign(b.end() - std::min(n, b.size()), b.end());
+
+    // Shows the last `need` samples of every channel, ending at sample i (of nT) of the
+    // triggering channel's block; the other channels end at the same moment of theirs
+    void snapshot(const std::vector<const Stream*>& in, size_t i, size_t nT) {
+        for (size_t k = 0; k < ch.size(); k++) {
+            Ch& c = ch[k];
+            c.showA.clear(); c.showB.clear();
+            if (!c.live) continue;
+            size_t drop = 0;
+            if ((int)k != trigCh && k < in.size() && in[k] && nT) {
+                const size_t nk = in[k]->size();
+                const size_t upto = (size_t)std::llround((double)(i + 1) / nT * nk);
+                drop = nk - std::min(nk, upto);
+            }
+            const size_t end = c.a.size() - std::min(drop, c.a.size());
+            const size_t n = std::min(c.need, end);
+            c.showA.assign(c.a.begin() + (end - n), c.a.begin() + end);
+            if (c.iq && c.b.size() == c.a.size()) c.showB.assign(c.b.begin() + (end - n), c.b.begin() + end);
+        }
         sinceShow = 0;
     }
+    int liveCount() const { int n = 0; for (const auto& c : ch) n += c.live; return n; }
+    static sf::Color chColor(int k) { return channelColor(k); }
 public:
-    ScopeBlock() { type = "scope"; title = "Scope"; category = "View"; ins = {{"in", PT::Any}};
-                   addNum("ms", "Time span", 50, 0.1, 5000, 5, "ms", 1);
+    ScopeBlock() { type = "scope"; title = "Scope"; category = "View"; ins = {{"in", PT::Any}}; maxIns = 8;
+                   addNum("ms", "Time span", 50, 0.1, 120000, 5, "ms", 1);
                    addChoice("mode", "Trigger", {"Auto", "Normal", "Single"});
                    addChoice("src", "Trigger on", {"Level (rising)", "Start of a burst"});
-                   addNum("lvl", "Level", 0, -1e6, 1e6, 100, "", 1); }
-    sf::Vector2f viewSize() const override { return {380.0f, 170.0f}; }
+                   addNum("lvl", "Level", 0, -1e6, 1e6, 100, "", 1);
+                   addNum("tch", "Trigger channel", 1, 1, 8, 1, "");
+                   addChoice("scale", "Vertical", {"Common scale", "Stacked (each own scale)"});
+                   showOnly("lvl", "src", {0}); }
+    sf::Vector2f viewSize() const override {
+        const int n = liveCount();
+        return {380.0f, 170.0f + (choice("scale") == 1 && n > 1 ? 55.0f * (n - 1) : 0.0f)};
+    }
     std::vector<std::string> buttons() const override { return {"Arm (Single)"}; }
-    void onButton(int) override { singleDone = false; waiting = true; capturing = -1; }
+    void onButton(int) override { singleDone = false; capturing = -1; }
+    const std::vector<float>& trace(size_t k) const { static const std::vector<float> none; return k < ch.size() ? ch[k].showA : none; }
+    void reset() override { ch.clear(); capturing = -1; sinceTrig = sinceShow = 0; }
     std::string status() const override {
         const int m = choice("mode");
-        if (m == 2) return singleDone ? "Single: captured (Arm for the next)" : "Single: armed, waiting";
-        return m == 1 ? "Normal: shows the last trigger" : "Auto";
+        std::string s = m == 2 ? (singleDone ? "Single: captured (Arm for the next)" : "Single: armed, waiting")
+                               : m == 1 ? "Normal: shows the last trigger" : "Auto";
+        if (ch.size() > 1) s += "   trigger: ch " + std::to_string(trigCh + 1);
+        return s;
     }
     void process(const std::vector<const Stream*>& in) override {
-        if (!in[0] || in[0]->rate <= 0) return;
-        isIQ = in[0]->type == PT::IQ;
-        rate = in[0]->rate;
-        need = std::max<size_t>(16, (size_t)(num("ms") * 0.001 * rate));
-        preN = need / 10;
+        ch.resize(in.size());
+        // the triggering channel: the chosen one, else the first with a signal
+        trigCh = -1;
+        const int want = (int)num("tch") - 1;
+        if (want >= 0 && want < (int)in.size() && in[want] && in[want]->rate > 0) trigCh = want;
+        for (size_t k = 0; k < in.size() && trigCh < 0; k++) if (in[k] && in[k]->rate > 0) trigCh = (int)k;
+        if (trigCh < 0) { for (auto& c : ch) c.live = false; return; }
+        const double ms = num("ms") * 0.001;
+        // every other channel: its whole block (snapshot() goes back to the trigger's moment)
+        for (size_t k = 0; k < in.size(); k++) {
+            Ch& c = ch[k];
+            if (!in[k] || in[k]->rate <= 0) { c.live = false; c.a.clear(); c.b.clear(); continue; }
+            const bool iq = in[k]->type == PT::IQ;
+            if (iq != c.iq || !c.live) { c.a.clear(); c.b.clear(); }
+            c.iq = iq; c.live = true; c.rate = in[k]->rate;
+            c.need = std::max<size_t>(16, (size_t)(ms * c.rate));
+            if ((int)k == trigCh) continue;
+            const size_t n = in[k]->size();
+            for (size_t i = 0; i < n; i++) {
+                if (iq) { c.a.push_back(in[k]->iq[i].real()); c.b.push_back(in[k]->iq[i].imag()); }
+                else c.a.push_back(in[k]->re[i]);
+            }
+            while (c.a.size() > c.need * 2 + n) c.a.pop_front();
+            while (c.b.size() > c.need * 2 + n) c.b.pop_front();
+        }
+        // the triggering channel, sample by sample
+        const Stream* t = in[trigCh];
+        Ch& T = ch[trigCh];
+        rate = t->rate;
+        const size_t need = T.need, preN = need / 10;
         const int mode = choice("mode");
         const bool burstTrig = choice("src") == 1;
-        const size_t n = in[0]->size();
+        const float lvl = (float)num("lvl");
+        const size_t n = t->size();
         for (size_t i = 0; i < n; i++) {
             float va, vb = 0.0f;
-            if (isIQ) { va = in[0]->iq[i].real(); vb = in[0]->iq[i].imag(); } else va = in[0]->re[i];
-            a.push_back(va); if (isIQ) b.push_back(vb);
-            while (a.size() > need * 2) a.pop_front();
-            while (b.size() > need * 2) b.pop_front();
+            if (T.iq) { va = t->iq[i].real(); vb = t->iq[i].imag(); } else va = t->re[i];
+            T.a.push_back(va); if (T.iq) T.b.push_back(vb);
+            while (T.a.size() > need * 2) T.a.pop_front();
+            while (T.b.size() > need * 2) T.b.pop_front();
             sinceTrig++; sinceShow++;
-            const float lv = isIQ ? std::sqrt(va * va + vb * vb) : va;
-            const bool trig = burstTrig ? (i == 0 && in[0]->newBurst) : (prevV < num("lvl") && lv >= num("lvl"));
+            const float lv = T.iq ? std::sqrt(va * va + vb * vb) : va;
+            const bool trig = burstTrig ? (i == 0 && t->newBurst) : (prevV < lvl && lv >= lvl);
             prevV = lv;
             if (capturing >= 0) {
-                if (--capturing <= 0) { snapshot(); capturing = -1; if (mode == 2) singleDone = true; }
+                if (--capturing <= 0) { snapshot(in, i, n); capturing = -1; if (mode == 2) singleDone = true; }
                 continue;
             }
             if (trig && !(mode == 2 && singleDone)) { capturing = (int)(need - preN); sinceTrig = 0; continue; }
-            if (mode == 0 && sinceShow > (long long)need * 2 && sinceTrig > (long long)need * 2) snapshot();
+            if (mode == 0 && sinceShow > (long long)need * 2 && sinceTrig > (long long)need * 2) snapshot(in, i, n);
         }
     }
     void drawView(const Draw& d, const sf::FloatRect& r) override {
         d.rect(r, sf::Color(8, 10, 12), sf::Color(50, 50, 58));
-        if (showA.size() < 2) { d.text(rate > 0 ? "waiting for the trigger" : "no input", r.position.x + 6, r.position.y + 4, 11, sf::Color(110, 110, 120)); return; }
-        float lo = 1e30f, hi = -1e30f;
-        for (float v : showA) { lo = std::min(lo, v); hi = std::max(hi, v); }
-        for (float v : showB) { lo = std::min(lo, v); hi = std::max(hi, v); }
-        if (hi - lo < 1e-9f) { hi += 1; lo -= 1; }
-        const float pad = (hi - lo) * 0.08f; lo -= pad; hi += pad;
-        auto plot = [&](const std::vector<float>& v, sf::Color c) {
+        std::vector<int> shown;
+        for (size_t k = 0; k < ch.size(); k++) if (ch[k].showA.size() >= 2) shown.push_back((int)k);
+        if (shown.empty()) { d.text(rate > 0 ? "waiting for the trigger" : "no input", r.position.x + 6, r.position.y + 4, 11, sf::Color(110, 110, 120)); return; }
+        const bool single = liveCount() <= 1;
+        const bool stacked = choice("scale") == 1 && shown.size() > 1;
+        auto range = [&](const std::vector<int>& ks, float& lo, float& hi) {
+            lo = 1e30f; hi = -1e30f;
+            for (int k : ks) {
+                for (float v : ch[k].showA) { lo = std::min(lo, v); hi = std::max(hi, v); }
+                for (float v : ch[k].showB) { lo = std::min(lo, v); hi = std::max(hi, v); }
+            }
+            if (hi - lo < 1e-9f) { hi += 1; lo -= 1; }
+            const float pad = (hi - lo) * 0.08f; lo -= pad; hi += pad;
+        };
+        auto plot = [&](const std::vector<float>& v, sf::Color c, const sf::FloatRect& lane, float lo, float hi) {
             sf::VertexArray va(sf::PrimitiveType::LineStrip);
             const size_t n = v.size();
             const size_t step = std::max<size_t>(1, n / 1500);
             for (size_t i = 0; i < n; i += step)
-                va.append({{r.position.x + r.size.x * i / (n - 1), r.position.y + r.size.y * (1.0f - (v[i] - lo) / (hi - lo))}, c});
+                va.append({{lane.position.x + lane.size.x * i / (n - 1), lane.position.y + lane.size.y * (1.0f - (v[i] - lo) / (hi - lo))}, c});
             d.win->draw(va);
         };
-        if (!burstTrigLine()) {
-            const float ly = r.position.y + r.size.y * (1.0f - ((float)num("lvl") - lo) / (hi - lo));
-            if (ly > r.position.y && ly < r.position.y + r.size.y) d.rect(sf::FloatRect({r.position.x, ly}, {r.size.x, 1}), sf::Color(255, 140, 0, 90));
-        }
+        auto colors = [&](int k, sf::Color& ci, sf::Color& cq) {
+            if (single) { ci = sf::Color(120, 230, 120); cq = sf::Color(90, 200, 255); return; }   // one channel: I green, Q blue
+            ci = chColor(k);
+            cq = sf::Color((uint8_t)(ci.r * 0.55f), (uint8_t)(ci.g * 0.55f), (uint8_t)(ci.b * 0.55f));
+        };
         d.rect(sf::FloatRect({r.position.x + r.size.x * 0.1f, r.position.y}, {1, r.size.y}), sf::Color(255, 255, 255, 40));
-        plot(showA, sf::Color(120, 230, 120));
-        if (!showB.empty()) plot(showB, sf::Color(90, 200, 255));
         char b[64];
-        std::snprintf(b, sizeof(b), "%.4g .. %.4g", lo, hi);
-        d.text(b, r.position.x + 4, r.position.y + 2, 10, sf::Color(140, 140, 150));
+        const int lanes = stacked ? (int)shown.size() : 1;
+        for (int li = 0; li < lanes; li++) {
+            const sf::FloatRect lane({r.position.x, r.position.y + r.size.y * li / lanes}, {r.size.x, r.size.y / lanes});
+            const std::vector<int> ks = stacked ? std::vector<int>{shown[li]} : shown;
+            float lo, hi;
+            range(ks, lo, hi);
+            if (stacked && li > 0) d.rect(sf::FloatRect({lane.position.x, lane.position.y}, {lane.size.x, 1}), sf::Color(50, 50, 58));
+            // the trigger level, in the triggering channel's lane
+            if (!burstTrigLine() && std::find(ks.begin(), ks.end(), trigCh) != ks.end()) {
+                const float ly = lane.position.y + lane.size.y * (1.0f - ((float)num("lvl") - lo) / (hi - lo));
+                if (ly > lane.position.y && ly < lane.position.y + lane.size.y) d.rect(sf::FloatRect({lane.position.x, ly}, {lane.size.x, 1}), sf::Color(255, 140, 0, 90));
+            }
+            for (int k : ks) {
+                sf::Color ci, cq;
+                colors(k, ci, cq);
+                if (!ch[k].showB.empty()) plot(ch[k].showB, cq, lane, lo, hi);
+                plot(ch[k].showA, ci, lane, lo, hi);
+            }
+            std::snprintf(b, sizeof(b), "%.4g .. %.4g", lo, hi);
+            const int k0 = stacked ? shown[li] : 0;
+            const std::string lab = stacked ? std::to_string(k0 + 1) + (ch[k0].iq ? " I/Q" : " real") + (k0 == trigCh ? " (trigger)" : "") + "   " + b : std::string(b);
+            d.rect(sf::FloatRect({lane.position.x + 1, lane.position.y + 1}, {d.width(lab, 10) + 8, 14}), sf::Color(8, 10, 12, 200));
+            d.text(lab, lane.position.x + 4, lane.position.y + 2, 10, stacked ? chColor(k0) : sf::Color(140, 140, 150));
+        }
+        // legend: channel and kind; * marks the triggering one
+        if (!single && !stacked) {
+            float x = r.position.x + r.size.x - 4;
+            for (auto it = shown.rbegin(); it != shown.rend(); ++it) {
+                const int k = *it;
+                const std::string t = std::to_string(k + 1) + (ch[k].iq ? " I/Q" : " real") + (k == trigCh ? "*" : "");
+                x -= d.width(t, 10) + 8;
+                d.rect(sf::FloatRect({x - 3, r.position.y + 1}, {d.width(t, 10) + 6, 14}), sf::Color(8, 10, 12, 200));
+                d.text(t, x, r.position.y + 2, 10, chColor(k));
+            }
+        }
         std::snprintf(b, sizeof(b), "%.1f ms", num("ms"));
         d.text(b, r.position.x + r.size.x - d.width(b, 10) - 4, r.position.y + r.size.y - 14, 10, sf::Color(140, 140, 150));
     }
@@ -984,32 +1213,60 @@ public:
     }
 };
 
+// The speaker: "left / mono" alone plays on both sides; with "right" connected it is stereo
 class AudioOut : public Block {
     double pos = 0.0, rate = 0.0;
-    float prev = 0.0f, peak = 1e-3f;
+    float prevL = 0.0f, prevR = 0.0f, peak = 1e-3f;
     std::vector<float> o48;
+    int stream = 0, routedTo = -1;   // own stream when a sound card is chosen
 public:
-    AudioOut() { type = "audio"; title = "Audio out (speaker)"; category = "View"; ins = {{"in", PT::Real}};
-                 addNum("vol", "Volume", 0, -60, 30, 1, "dB");
-                 addChoice("agc", "Level", {"Automatic", "Fixed"}); }
+    AudioOut() {
+        type = "audio"; title = "Audio out (speaker)"; category = "Sinks"; ins = {{"left / mono", PT::Real}, {"right", PT::Real}};
+        o48.reserve(8192);
+        addNum("vol", "Volume", 0, -60, 30, 1, "dB");
+        addChoice("agc", "Level", {"Automatic", "Fixed"});
+        // which sound card ([0] the system's default output); its own stream in the speaker mixer
+        Param& p = addChoice("dev", "Output", {"System Default Output"});
+        p.dynamic = true;
+        p.source = []() { return hooks().audioDevices ? hooks().audioDevices() : std::vector<std::string>{"System Default Output"}; };
+        refreshChoices();
+        syncInputs = true;   // left and right line up
+        static int nextStream = 100000;
+        stream = nextStream++;
+    }
+    ~AudioOut() override { if (routedTo >= 0 && hooks().audioClose) hooks().audioClose(stream); }
+    std::string status() const override { return rate > 0 ? std::string(stereo ? "stereo" : "mono") + ", from " + std::to_string((int)rate) + " S/s" : ""; }
+    bool stereo = false;
     void process(const std::vector<const Stream*>& in) override {
-        if (!in[0] || in[0]->rate <= 0 || !audio) return;
+        const int dev = choice("dev");
+        const bool own = hooks().audioPush && hooks().audioRoute;   // the app: a stream of its own; tests: the ring
+        if (own && dev != routedTo) { hooks().audioRoute(stream, dev); routedTo = dev; }
+        if (!in[0] || in[0]->rate <= 0 || (!own && !audio)) return;
         rate = in[0]->rate;
+        stereo = in[1] && in[1]->re.size() == in[0]->re.size();
         const double step = rate / 48000.0;
         const bool agc = choice("agc") == 0;
         const float g = (float)std::pow(10.0, num("vol") / 20.0);
+        // the automatic level follows the loudest side, falling back over ~3 s
+        const float decay = (float)std::exp(-1.0 / (rate * 3.0));
         o48.clear();
-        for (float x : in[0]->re) {
-            if (agc) { peak = std::max(std::fabs(x), peak * 0.9999f); }
+        const auto& L = in[0]->re;
+        o48.reserve((size_t)(L.size() / step) * 2 + 8);
+        for (size_t i = 0; i < L.size(); i++) {
+            const float xl = L[i], xr = stereo ? in[1]->re[i] : xl;
+            if (agc) peak = std::max({std::fabs(xl), std::fabs(xr), peak * decay});
+            const float k = (agc ? 0.3f / std::max(peak, 1e-9f) : 1.0f) * g;
             while (pos <= 1.0) {
-                const float v = prev + (x - prev) * (float)pos;
-                o48.push_back(std::clamp((agc ? v / std::max(peak, 1e-9f) * 0.3f : v) * g, -1.0f, 1.0f));
+                const float vl = prevL + (xl - prevL) * (float)pos, vr = prevR + (xr - prevR) * (float)pos;
+                o48.push_back(std::clamp(vl * k, -1.0f, 1.0f));
+                o48.push_back(std::clamp(vr * k, -1.0f, 1.0f));
                 pos += step;
             }
             pos -= 1.0;
-            prev = x;
+            prevL = xl; prevR = xr;
         }
-        audio->push(o48);
+        if (own) hooks().audioPush(stream, o48);
+        else audio->push(o48);
     }
 };
 
@@ -1044,26 +1301,191 @@ public:
     }
 };
 
+// (inside namespace pl)
+#include "PipelineBlocks.h"   // the decoder building blocks (AGC, RRC, Costas, Viterbi, RS, ...)
+
+#include "PipelineLib.h"      // the general library (sources, math, filters, modulators, displays, sinks)
+
+#include "PipelineControl.h"  // convolution of two signals; control: G(s), PID, closed loop, step metrics
+
 // ---------------------------------------------------------------------
-//  Registry
+//  Registry: the palette lists the blocks in this order, grouped by category
 // ---------------------------------------------------------------------
 struct BlockInfo { const char* type; const char* title; const char* category; };
 inline const std::vector<BlockInfo>& blockList() {
     static const std::vector<BlockInfo> l = {
-        {"shift", "Frequency shift", "I/Q"}, {"lowpass", "Low-pass (I/Q)", "I/Q"}, {"decim", "Decimate", "I/Q"},
-        {"gate", "Burst gate (trigger)", "I/Q"},
+        // signal sources
+        {"rxin", "Channel input (another receiver)", "Sources"},
+        {"srciq", "Signal source (I/Q)", "Sources"}, {"srcreal", "Signal source (real)", "Sources"},
+        {"noiseiq", "Noise source (I/Q)", "Sources"}, {"noisereal", "Noise source (real)", "Sources"},
+        {"bitsrc", "Bit source (random / PRBS)", "Sources"}, {"patsrc", "Pattern source", "Sources"}, {"msgsrc", "Message source", "Sources"},
+        // arithmetic and types
+        {"add", "Add  (a + b)", "Math"}, {"sub", "Subtract  (a - b)", "Math"}, {"mul", "Multiply  (a x b)", "Math"},
+        {"mulconj", "Multiply conjugate  (a x b*)", "Math"}, {"affine", "Multiply / add constant", "Math"}, {"gain", "Gain (dB)", "Math"},
+        {"mag", "Magnitude / power / dB", "Math"}, {"c2r", "Complex to real parts", "Math"}, {"r2c", "Real to complex", "Math"},
+        {"iqswap", "I/Q swap / invert", "Math"}, {"delay", "Delay  (z^-n, feedback)", "Math"}, {"movavg", "Moving average", "Math"},
+        {"intdump", "Integrate and dump", "Math"}, {"diffr", "Differentiate", "Math"}, {"accum", "Accumulate", "Math"}, {"clip", "Clip / limiter", "Math"},
+        // filters
+        {"fir", "FIR filter (own taps) / convolution", "Filters"}, {"conv", "Convolution / correlation (a * b)", "Filters"}, {"firdesign", "FIR filter design", "Filters"}, {"iir", "IIR filter", "Filters"},
+        {"hilbert", "Hilbert (real -> analytic I/Q)", "Filters"}, {"lowpass", "Low-pass (I/Q)", "Filters"}, {"rlowpass", "Low-pass (real)", "Filters"},
+        {"rrc", "RRC filter", "Filters"}, {"dc", "DC removal", "Filters"}, {"deemph", "De-emphasis", "Filters"},
+        // rates
+        {"upsample", "Upsample (x N)", "Resampling"}, {"downsample", "Downsample (keep 1 in N)", "Resampling"},
+        {"decim", "Decimate (average N, I/Q)", "Resampling"}, {"resample", "Resample (real, any rate)", "Resampling"},
+        // the channel
+        {"shift", "Frequency shift", "Channel"}, {"agc", "AGC", "Channel"}, {"gate", "Burst gate (trigger)", "Channel"},
+        // demodulators
         {"fm", "FM demodulator", "Demodulate"}, {"am", "AM demodulator", "Demodulate"}, {"ssb", "SSB / real part", "Demodulate"},
-        {"rlowpass", "Low-pass (real)", "Real"}, {"dc", "DC removal", "Real"}, {"gain", "Gain", "Real"},
-        {"slicer", "Clock recovery + slicer", "Symbols"}, {"map", "Symbols to bits", "Symbols"},
-        {"nrzi", "NRZI decode", "Bits"}, {"manch", "Manchester decode", "Bits"}, {"sync", "Frame sync", "Bits"},
-        {"scope", "Scope", "View"}, {"spectrum", "Spectrum", "View"}, {"constel", "Constellation / XY", "View"},
-        {"bits", "Bits / symbols view", "View"}, {"analyzer", "Analyzer", "View"}, {"audio", "Audio out (speaker)", "View"},
+        {"phase", "Phase demodulator", "Demodulate"}, {"fsktones", "FSK tone detector", "Demodulate"}, {"matrix", "Stereo matrix", "Demodulate"},
+        // synchronisation and decisions
+        {"symsync", "Symbol sync (real)", "Sync"}, {"clockiq", "Clock recovery (I/Q)", "Sync"}, {"decide", "Slicer (decision)", "Sync"},
+        {"threshold", "Threshold (with hysteresis)", "Sync"}, {"slicer", "Clock recovery + slicer", "Sync"}, {"costas", "Costas loop", "Sync"},
+        {"pilot", "Pilot PLL", "Sync"}, {"oqpsk", "OQPSK -> QPSK (half-symbol delay)", "Sync"}, {"softbits", "Soft bits (I, Q)", "Sync"},
+        // the transmitter's side
+        {"levels", "Bits to levels (NRZ, 4-level ...)", "Modulate"}, {"psk", "Bits to PSK / QAM symbols", "Modulate"},
+        {"fmmod", "FM modulator", "Modulate"}, {"ammod", "AM modulator", "Modulate"},
+        {"convenc", "Convolutional encoder (K=7, 1/2)", "Modulate"}, {"hdlcframer", "HDLC framer", "Modulate"},
+        // bits
+        {"map", "Symbols to bits", "Bits"}, {"invbits", "Invert bits", "Bits"}, {"nrzi", "NRZI decode", "Bits"}, {"manch", "Manchester decode", "Bits"},
+        {"diffbits", "Differential (bits)", "Bits"}, {"diff", "Differential decode (soft)", "Bits"}, {"lfsr", "Scrambler / descrambler (LFSR)", "Bits"},
+        {"g3ruh", "G3RUH descrambler", "Bits"}, {"derand", "Derandomize (CCSDS)", "Bits"}, {"sync", "Frame sync", "Bits"},
+        {"codedsync", "Coded sync + QPSK phase", "Bits"}, {"viterbi", "Viterbi decoder (K=7, 1/2)", "Bits"},
+        {"pack", "Bits to bytes (frames)", "Bits"}, {"unpack", "Bytes to bits (frames)", "Bits"}, {"hdlc", "HDLC deframer", "Bits"},
+        // frames and packets
+        {"crc", "CRC check / append", "Frames"}, {"slice", "Bytes of a frame (from, count)", "Frames"}, {"rs", "Reed-Solomon (255,223)", "Frames"},
+        {"ccsds", "CCSDS packets (from VCDU)", "Frames"}, {"msumr", "Meteor MSU-MR image", "Frames"},
+        // pictures
+        {"raster", "Raster lines", "Image"},
+        // control engineering
+        {"tf", "Transfer function G(s)", "Control"}, {"pid", "PID controller", "Control"},
+        {"loop", "Closed loop (PID + G(s))", "Control"}, {"stepinfo", "Step response (metrics)", "Control"},
+        // displays
+        {"scope", "Scope", "Displays"}, {"spectrum", "Spectrum", "Displays"}, {"waterfall", "Waterfall", "Displays"},
+        {"constel", "Constellation / XY", "Displays"}, {"histogram", "Histogram", "Displays"}, {"eye", "Eye diagram", "Displays"},
+        {"probe", "Number display (probe)", "Displays"}, {"text", "Text display", "Displays"}, {"bits", "Bits / symbols view", "Displays"},
+        {"framesview", "Frames view (hex)", "Displays"}, {"ax25", "AX.25 packets", "Displays"}, {"image", "Image view", "Displays"},
+        {"analyzer", "Analyzer", "Displays"},
+        // outputs
+        {"audio", "Audio out (speaker / sound card)", "Sinks"}, {"wavsink", "WAV file (record)", "Sinks"}, {"bytesink", "Byte file (record)", "Sinks"},
     };
     return l;
 }
 
-inline std::unique_ptr<Block> makeBlock(const std::string& t) {
-    if (t == "input") return std::make_unique<InputBlock>();
+// Hidden search keywords for each block: related ideas, what it is used for, other names
+// (English and Polish without diacritics, the search box takes ASCII only)
+inline const char* blockTags(const std::string& t) {
+    static const std::map<std::string, const char*> m = {
+        {"rxin", "receiver radio input channel baseband iq second another sdr rx odbiornik wejscie kanal drugi"},
+        {"srciq", "generator oscillator nco tone carrier sine cosine complex exponential test signal generator sygnalu nosna ton sinus oscylator"},
+        {"srcreal", "generator oscillator tone sine square triangle sawtooth ramp dc constant function generator sinus prostokat trojkat pila stala sygnal testowy"},
+        {"noiseiq", "awgn gaussian white noise channel model snr test szum bialy gaussa kanal"},
+        {"noisereal", "awgn gaussian uniform white noise dither test szum bialy gaussa rownomierny"},
+        {"bitsrc", "prbs pn9 pn15 pn23 pseudo random sequence ber test data bity losowe generator danych"},
+        {"patsrc", "pattern repeat preamble sync word bits test wzorzec preambula powtarzanie"},
+        {"msgsrc", "message text string ascii packet payload counter beacon wiadomosc tekst ramka nadajnik"},
+        {"add", "sum adder mix combine plus superposition suma dodawanie sumator mieszanie"},
+        {"sub", "difference minus subtract compare error roznica odejmowanie"},
+        {"mul", "multiply mixer product modulate ring heterodyne mnozenie mieszacz iloczyn"},
+        {"mulconj", "conjugate correlation cross phase difference mixer sprzezenie korelacja roznica faz"},
+        {"affine", "scale offset constant gain bias multiply add skala przesuniecie stala"},
+        {"gain", "amplify attenuate volume level db wzmocnienie tlumienie glosnosc"},
+        {"mag", "magnitude abs power envelope rssi db log modul moc obwiednia amplituda decybele"},
+        {"c2r", "complex to real split i q real imaginary magnitude phase arg angle rozdziel czesc rzeczywista urojona faza"},
+        {"r2c", "real to complex combine i q make complex zloz zespolony"},
+        {"iqswap", "swap i q invert conjugate spectrum flip mirror negative frequency j rotate zamiana odwrocenie widma lustro"},
+        {"delay", "delay z-1 unit delay feedback loop sprzezenie zwrotne petla shift samples buffer align opoznienie przesuniecie probki"},
+        {"movavg", "moving average boxcar smoothing mean running sum lowpass srednia kroczaca wygladzanie"},
+        {"intdump", "integrate and dump matched filter rectangular pulse symbol energy calkowanie filtr dopasowany"},
+        {"diffr", "derivative differentiate difference slope highpass pochodna rozniczkowanie"},
+        {"accum", "accumulate integrator cumulative sum running total calka akumulator suma"},
+        {"clip", "clip limiter saturate hard limit clamp ogranicznik obcinanie nasycenie"},
+        {"fir", "fir convolution correlation matched filter taps coefficients impulse response kernel splot korelacja wspolczynniki odpowiedz impulsowa filtr dopasowany"},
+        {"conv", "convolution correlation two signals a b kernel cross correlation matched filter splot korelacja dwoch sygnalow wzajemna"},
+        {"tf", "transfer function laplace s domain plant model system lti bode poles zeros stability step response inertia oscillator transmitancja uklad inercyjny obiekt bieguny zera stabilnosc automatyka"},
+        {"pid", "pid controller regulator proportional integral derivative feedback control kp ki kd anti windup regulator automatyka sterowanie"},
+        {"loop", "closed loop feedback control system pid plant regulation set point disturbance uklad zamkniety sprzezenie zwrotne regulacja automatyka uchyb"},
+        {"stepinfo", "step response metrics rise time overshoot settling time steady state error peak odpowiedz skokowa czas narastania przeregulowanie czas regulacji uchyb ustalony"},
+        {"firdesign", "fir design windowed sinc lowpass highpass bandpass bandstop notch rrc gaussian kaiser hamming hann blackman window projekt filtra dolnoprzepustowy gornoprzepustowy pasmowy zaporowy okno"},
+        {"iir", "iir recursive biquad butterworth lowpass highpass bandpass notch peaking shelf poles zeros transfer function rekursywny bieguny zera transmitancja"},
+        {"hilbert", "hilbert analytic signal 90 degree phase shift ssb real to complex sygnal analityczny przesuniecie fazy"},
+        {"lowpass", "lowpass channel filter bandwidth anti alias selectivity dolnoprzepustowy filtr kanalu pasmo"},
+        {"rlowpass", "lowpass audio filter bandwidth smoothing anti alias dolnoprzepustowy filtr audio"},
+        {"rrc", "root raised cosine matched filter pulse shaping nyquist isi rolloff alpha filtr dopasowany ksztaltowanie impulsu"},
+        {"dc", "dc removal offset highpass blocker coupling skladowa stala usuwanie offset"},
+        {"deemph", "deemphasis emphasis 50us 75us fm broadcast audio tone deemfaza preemfaza"},
+        {"upsample", "upsample interpolate zero stuffing expander increase rate interpolacja nadprobkowanie"},
+        {"downsample", "downsample decimate keep every nth reduce rate decymacja"},
+        {"decim", "decimate average reduce sample rate decymacja zmniejszenie czestotliwosci probkowania"},
+        {"resample", "resample rational rate conversion interpolate audio rate zmiana czestotliwosci probkowania"},
+        {"shift", "frequency shift translate mixer nco tune offset doppler przesuniecie czestotliwosci strojenie mieszacz"},
+        {"agc", "automatic gain control normalize level amplitude automatyczna regulacja wzmocnienia normalizacja"},
+        {"gate", "burst trigger squelch gate detect threshold blokada szumow wyzwalanie paczka"},
+        {"fm", "fm demodulator frequency discriminator quadrature nbfm wbfm fsk demodulator czestotliwosci dyskryminator"},
+        {"am", "am demodulator envelope detector amplitude demodulator amplitudy detektor obwiedni"},
+        {"ssb", "ssb usb lsb real part product detector cw sideband wstega boczna"},
+        {"phase", "phase demodulator pm atan2 angle unwrap demodulator fazy kat"},
+        {"fsktones", "fsk tone detector goertzel mark space afsk dtmf wykrywanie tonow"},
+        {"matrix", "stereo matrix l r left right mpx sum difference wfm broadcast radio stereo lewy prawy"},
+        {"symsync", "symbol sync timing recovery clock gardner mueller muller baud synchronizacja symboli zegar odzyskiwanie"},
+        {"clockiq", "clock recovery timing gardner symbol sync psk qpsk complex odzyskiwanie zegara synchronizacja"},
+        {"decide", "slicer decision hard decision quantize levels comparator decyzja kwantyzacja komparator"},
+        {"threshold", "threshold comparator schmitt trigger hysteresis binary prog histereza komparator"},
+        {"slicer", "clock recovery slicer bits fsk symbols demod synchronizacja decyzja"},
+        {"costas", "costas loop carrier recovery pll bpsk qpsk phase lock frequency offset odzyskiwanie nosnej petla fazowa"},
+        {"pilot", "pll pilot tone 19 khz stereo phase locked loop subcarrier petla fazowa pilot podnosna"},
+        {"oqpsk", "oqpsk offset qpsk staggered half symbol delay meteor align"},
+        {"softbits", "soft bits llr soft decision viterbi input bity miekkie decyzje miekkie"},
+        {"levels", "nrz bits to levels 4fsk pam mapping line code modulator mapowanie poziomy"},
+        {"psk", "bpsk qpsk 8psk 16qam qam constellation mapper modulator symbols mapowanie konstelacja"},
+        {"fmmod", "fm modulator vco frequency modulation transmitter afsk fsk modulator czestotliwosci nadajnik"},
+        {"ammod", "am modulator amplitude modulation transmitter dsb modulator amplitudy nadajnik"},
+        {"convenc", "convolutional encoder fec k7 rate 1/2 forward error correction transmitter koder splotowy korekcja bledow"},
+        {"hdlcframer", "hdlc framer flags bit stuffing ax25 packet transmitter ramkowanie nadajnik"},
+        {"map", "symbols to bits demapper gray decode bity demapowanie"},
+        {"invbits", "invert bits not polarity flip negate negacja odwrocenie polaryzacji"},
+        {"nrzi", "nrzi decode transition differential ax25 line code dekodowanie"},
+        {"manch", "manchester biphase decode line code dekodowanie"},
+        {"diffbits", "differential encode decode bits xor dbpsk transition kodowanie roznicowe"},
+        {"diff", "differential decode soft dqpsk phase ambiguity meteor dekodowanie roznicowe"},
+        {"lfsr", "lfsr scrambler descrambler whitening randomizer polynomial pn additive multiplicative self synchronizing skrambler wybielanie wielomian"},
+        {"g3ruh", "g3ruh descrambler 9600 packet ax25 skrambler"},
+        {"derand", "derandomize ccsds pn whitening descrambler satellite derandomizacja satelita"},
+        {"sync", "frame sync word correlator preamble access code asm find header synchronizacja ramki slowo synchronizacyjne korelator"},
+        {"codedsync", "coded sync asm viterbi qpsk phase ambiguity ccsds lrpt satellite synchronizacja"},
+        {"viterbi", "viterbi decoder convolutional fec k7 error correction trellis dekoder korekcja bledow"},
+        {"pack", "pack bits to bytes octets frame bajty pakowanie"},
+        {"unpack", "unpack bytes to bits serialize bajty bity"},
+        {"hdlc", "hdlc deframer flags bit stuffing ax25 packet fcs crc aprs ramki"},
+        {"crc", "crc checksum fcs crc16 crc32 x25 ccitt error detection suma kontrolna wykrywanie bledow"},
+        {"slice", "slice bytes field extract header payload substring wycinanie pole naglowek"},
+        {"rs", "reed solomon fec error correction ccsds 255 223 korekcja bledow satellite satelita"},
+        {"ccsds", "ccsds vcdu mpdu packets space protocol satellite telemetry pakiety satelita telemetria"},
+        {"msumr", "meteor msu mr image jpeg lrpt satellite picture weather obraz satelita pogoda"},
+        {"raster", "raster image lines wefax apt fax picture scan obraz linie"},
+        {"scope", "oscilloscope scope time domain waveform plot oscyloskop przebieg czas"},
+        {"spectrum", "spectrum fft frequency domain psd analyzer widmo czestotliwosc analizator"},
+        {"waterfall", "waterfall spectrogram fft time frequency wodospad spektrogram"},
+        {"constel", "constellation xy iq plot scatter qpsk psk qam konstelacja"},
+        {"histogram", "histogram distribution statistics levels pdf rozklad statystyka"},
+        {"eye", "eye diagram isi timing symbol quality diagram oczkowy"},
+        {"probe", "probe number value meter rms mean power level display sonda wartosc miernik srednia"},
+        {"text", "text display console terminal ascii log print wyswietlacz tekst tekstu konsola"},
+        {"bits", "bits symbols view stream binary podglad bitow"},
+        {"framesview", "frames hex dump bytes packets view podglad ramek szesnastkowo"},
+        {"ax25", "ax25 aprs packet radio callsign decoder znak wywolawczy"},
+        {"image", "image view picture png save display obraz zdjecie zapis"},
+        {"analyzer", "analyzer classify modulation identify what is this signal analizator rozpoznawanie modulacji"},
+        {"audio", "audio speaker sound card output headphones play dzwiek glosnik karta dzwiekowa sluchawki"},
+        {"wavsink", "wav file record save output iq recording zapis nagrywanie plik"},
+        {"bytesink", "file record save bytes binary output dump zapis plik binarny"},
+    };
+    const auto it = m.find(t);
+    return it == m.end() ? "" : it->second;
+}
+
+inline std::unique_ptr<Block> makeBlockRaw(const std::string& t) {
+    if (t == "input") return std::make_unique<InputBlock>(true);
+    if (t == "rxin") return std::make_unique<InputBlock>(false);
     if (t == "shift") return std::make_unique<ShiftBlock>();
     if (t == "lowpass") return std::make_unique<LowpassIQ>();
     if (t == "decim") return std::make_unique<DecimateBlock>();
@@ -1085,18 +1507,116 @@ inline std::unique_ptr<Block> makeBlock(const std::string& t) {
     if (t == "bits") return std::make_unique<BitsView>();
     if (t == "audio") return std::make_unique<AudioOut>();
     if (t == "analyzer") return std::make_unique<AnalyzerView>();
+    if (t == "agc") return std::make_unique<AgcBlock>();
+    if (t == "rrc") return std::make_unique<RrcBlock>();
+    if (t == "fsktones") return std::make_unique<FskTones>();
+    if (t == "clockiq") return std::make_unique<ClockIQ>();
+    if (t == "costas") return std::make_unique<CostasBlock>();
+    if (t == "softbits") return std::make_unique<SoftBits>();
+    if (t == "g3ruh") return std::make_unique<G3ruhBlock>();
+    if (t == "codedsync") return std::make_unique<CodedSync>();
+    if (t == "viterbi") return std::make_unique<ViterbiBlock>();
+    if (t == "derand") return std::make_unique<DerandBlock>();
+    if (t == "pack") return std::make_unique<PackBytes>();
+    if (t == "hdlc") return std::make_unique<HdlcBlock>();
+    if (t == "rs") return std::make_unique<RsBlock>();
+    if (t == "ccsds") return std::make_unique<CcsdsPackets>();
+    if (t == "msumr") return std::make_unique<MsuMrBlock>();
+    if (t == "raster") return std::make_unique<RasterBlock>();
+    if (t == "image") return std::make_unique<ImageView>();
+    if (t == "ax25") return std::make_unique<Ax25View>();
+    if (t == "framesview") return std::make_unique<FramesView>();
+    if (t == "oqpsk") return std::make_unique<OqpskAlign>();
+    if (t == "diff") return std::make_unique<DiffDecode>();
+    if (t == "resample") return std::make_unique<ResampleReal>();
+    if (t == "pilot") return std::make_unique<PilotPll>();
+    if (t == "matrix") return std::make_unique<StereoMatrix>();
+    if (t == "deemph") return std::make_unique<Deemphasis>();
+    // the general library
+    if (t == "srciq") return std::make_unique<SignalSourceIQ>();
+    if (t == "srcreal") return std::make_unique<SignalSourceReal>();
+    if (t == "noiseiq") return std::make_unique<NoiseSource>(true);
+    if (t == "noisereal") return std::make_unique<NoiseSource>(false);
+    if (t == "bitsrc") return std::make_unique<BitSource>();
+    if (t == "patsrc") return std::make_unique<PatternSource>();
+    if (t == "msgsrc") return std::make_unique<MessageSource>();
+    if (t == "add") return std::make_unique<ArithBlock>(0);
+    if (t == "sub") return std::make_unique<ArithBlock>(1);
+    if (t == "mul") return std::make_unique<ArithBlock>(2);
+    if (t == "mulconj") return std::make_unique<ArithBlock>(3);
+    if (t == "affine") return std::make_unique<ConstBlock>();
+    if (t == "mag") return std::make_unique<MagBlock>();
+    if (t == "c2r") return std::make_unique<ComplexToReal>();
+    if (t == "r2c") return std::make_unique<RealToComplex>();
+    if (t == "iqswap") return std::make_unique<IqSwap>();
+    if (t == "delay") return std::make_unique<DelayBlock>();
+    if (t == "movavg") return std::make_unique<MovingAverage>();
+    if (t == "intdump") return std::make_unique<IntegrateDump>();
+    if (t == "diffr") return std::make_unique<Differentiate>();
+    if (t == "accum") return std::make_unique<Accumulate>();
+    if (t == "clip") return std::make_unique<ClipBlock>();
+    if (t == "fir") return std::make_unique<FirTaps>();
+    if (t == "conv") return std::make_unique<ConvolveBlock>();
+    if (t == "tf") return std::make_unique<TfBlock>();
+    if (t == "pid") return std::make_unique<PidBlock>();
+    if (t == "loop") return std::make_unique<ClosedLoopBlock>();
+    if (t == "stepinfo") return std::make_unique<StepInfoBlock>();
+    if (t == "firdesign") return std::make_unique<FirDesign>();
+    if (t == "iir") return std::make_unique<IirBlock>();
+    if (t == "hilbert") return std::make_unique<HilbertBlock>();
+    if (t == "upsample") return std::make_unique<Upsample>();
+    if (t == "downsample") return std::make_unique<Downsample>();
+    if (t == "symsync") return std::make_unique<SymbolSyncReal>();
+    if (t == "decide") return std::make_unique<SlicerOnly>();
+    if (t == "threshold") return std::make_unique<Threshold>();
+    if (t == "phase") return std::make_unique<PhaseDemod>();
+    if (t == "levels") return std::make_unique<BitsToLevels>();
+    if (t == "psk") return std::make_unique<BitsToSymbols>();
+    if (t == "fmmod") return std::make_unique<FmMod>();
+    if (t == "ammod") return std::make_unique<AmMod>();
+    if (t == "convenc") return std::make_unique<ConvEncoder>();
+    if (t == "hdlcframer") return std::make_unique<HdlcFramer>();
+    if (t == "lfsr") return std::make_unique<LfsrBlock>();
+    if (t == "diffbits") return std::make_unique<DiffBits>();
+    if (t == "invbits") return std::make_unique<InvertBits>();
+    if (t == "unpack") return std::make_unique<UnpackBytes>();
+    if (t == "crc") return std::make_unique<CrcBlock>();
+    if (t == "slice") return std::make_unique<SliceFrames>();
+    if (t == "text") return std::make_unique<TextDisplay>();
+    if (t == "probe") return std::make_unique<ProbeBlock>();
+    if (t == "waterfall") return std::make_unique<WaterfallBlock>();
+    if (t == "histogram") return std::make_unique<HistogramBlock>();
+    if (t == "eye") return std::make_unique<EyeBlock>();
+    if (t == "wavsink") return std::make_unique<WavSink>();
+    if (t == "bytesink") return std::make_unique<ByteSink>();
     return nullptr;
 }
 
-inline sf::Color categoryColor(const std::string& c) {
-    if (c == "Source") return sf::Color(255, 140, 0);
-    if (c == "I/Q") return sf::Color(70, 150, 220);
-    if (c == "Demodulate") return sf::Color(160, 110, 230);
-    if (c == "Real") return sf::Color(80, 180, 100);
-    if (c == "Symbols") return sf::Color(220, 160, 50);
-    if (c == "Bits") return sf::Color(200, 120, 60);
-    return sf::Color(120, 125, 140);   // View
+// A block with its palette title and category (the colour of its title bar)
+inline std::unique_ptr<Block> makeBlock(const std::string& t) {
+    auto b = makeBlockRaw(t);
+    if (b) for (const auto& bi : blockList()) if (t == bi.type) { b->category = bi.category; b->title = bi.title; }
+    return b;
 }
+
+inline sf::Color categoryColor(const std::string& c) {
+    if (c == "Source") return sf::Color(255, 140, 0);              // the channel input
+    if (c == "Sources") return sf::Color(230, 120, 40);
+    if (c == "Math") return sf::Color(90, 160, 160);
+    if (c == "Filters") return sf::Color(70, 150, 220);
+    if (c == "Resampling") return sf::Color(100, 120, 220);
+    if (c == "Channel") return sf::Color(60, 170, 200);
+    if (c == "Demodulate") return sf::Color(160, 110, 230);
+    if (c == "Sync") return sf::Color(220, 160, 50);
+    if (c == "Modulate") return sf::Color(230, 90, 120);
+    if (c == "Bits") return sf::Color(200, 120, 60);
+    if (c == "Frames") return sf::Color(200, 90, 170);
+    if (c == "Image") return sf::Color(180, 180, 190);
+    if (c == "Sinks") return sf::Color(150, 200, 90);
+    if (c == "Control") return sf::Color(80, 200, 150);
+    return sf::Color(120, 125, 140);   // Displays
+}
+
 
 // ---------------------------------------------------------------------
 //  JSON writing (the reader is orbit::parseJson)
@@ -1124,6 +1644,8 @@ struct Link { int from = 0, out = 0, to = 0, in = 0; };
 
 class Pipeline {
 public:
+    // a block, or a feedback loop (blocks that reach each other) worked out together
+    struct Unit { std::vector<Block*> members, inner; bool loop = false; };
     std::mutex mtx;   // the worker (process) and the editor (UI)
     std::string name = "Untitled";
     std::vector<std::unique_ptr<Block>> nodes;
@@ -1137,6 +1659,7 @@ public:
     // mtx held by the caller for all of these
     void clear() {
         nodes.clear(); links.clear(); nextId = 1; orderDirty = true;
+        fifo.clear(); lined.clear();
         auto in = makeBlock("input");
         in->id = nextId++; in->x = 40; in->y = 60;
         nodes.push_back(std::move(in));
@@ -1155,59 +1678,319 @@ public:
     void remove(int id) {
         Block* b = find(id);
         if (!b || !b->removable) return;
+        std::vector<int> fed;   // blocks this one fed (their spare inputs shrink)
+        for (const auto& l : links) if (l.from == id) fed.push_back(l.to);
         links.erase(std::remove_if(links.begin(), links.end(), [&](const Link& l) { return l.from == id || l.to == id; }), links.end());
+        for (int t : fed) fitIns(find(t));
+        forgetFifos(id);
         nodes.erase(std::remove_if(nodes.begin(), nodes.end(), [&](const std::unique_ptr<Block>& n) { return n->id == id; }), nodes.end());
         orderDirty = true;
     }
-    static bool compatible(PT out, PT in) { return out == in || (in == PT::Any && (out == PT::IQ || out == PT::Real)); }
+    // Any on an output: the same kind as the block's input (checked again while running)
+    static bool compatible(PT out, PT in) {
+        const auto signal = [](PT t) { return t == PT::IQ || t == PT::Real || t == PT::Any; };
+        return out == in || (in == PT::Any && signal(out)) || (out == PT::Any && signal(in));
+    }
     bool reaches(int from, int target) const {
         if (from == target) return true;
         for (const auto& l : links) if (l.from == from && reaches(l.to, target)) return true;
         return false;
     }
+    // Is there a path from `from` to `target` that does not go through a Delay? (a Delay's
+    // outputs do not count: a loop through one is allowed)
+    bool reachesPastDelays(int from, int target) const {
+        std::vector<int> stack {from};
+        std::set<int> seen;
+        while (!stack.empty()) {
+            const int id = stack.back(); stack.pop_back();
+            if (id == target) return true;
+            if (!seen.insert(id).second) continue;
+            const Block* b = const_cast<Pipeline*>(this)->find(id);
+            if (!b || b->isDelay) continue;
+            for (const auto& l : links) if (l.from == id) stack.push_back(l.to);
+        }
+        return false;
+    }
+    // A block with growing inputs: one free input after the last connected one
+    void fitIns(Block* b) {
+        if (!b || b->maxIns <= 1 || b->ins.empty()) return;
+        int last = -1;
+        for (const auto& l : links) if (l.to == b->id) last = std::max(last, l.in);
+        const size_t want = (size_t)std::clamp(last + 2, 1, b->maxIns);
+        const Port first = b->ins[0];
+        while (b->ins.size() < want) b->ins.push_back({first.name + " " + std::to_string(b->ins.size() + 1), first.type});
+        if (b->ins.size() > want) b->ins.resize(want);
+    }
     // Returns an error text, empty when connected
     std::string connect(int from, int out, int to, int in) {
         Block* a = find(from); Block* b = find(to);
+        if (b && b->maxIns > 1 && in >= 0 && in < b->maxIns)
+            while ((int)b->ins.size() <= in) b->ins.push_back({b->ins[0].name + " " + std::to_string(b->ins.size() + 1), b->ins[0].type});
+        const std::string e = connectPort(a, from, out, b, to, in);
+        fitIns(b);
+        return e;
+    }
+    std::string connectPort(Block* a, int from, int out, Block* b, int to, int in) {
         if (!a || !b || out >= (int)a->outs.size() || in >= (int)b->ins.size()) return "no such port";
         if (!compatible(a->outs[out].type, b->ins[in].type))
             return std::string("cannot connect ") + ptName(a->outs[out].type) + " to " + ptName(b->ins[in].type);
-        if (reaches(to, from)) return "that would make a loop";
-        disconnect(to, in);
+        if (!a->isDelay && reachesPastDelays(to, from)) return "a feedback loop needs a Delay in it (Math > Delay, z^-1)";
+        links.erase(std::remove_if(links.begin(), links.end(), [&](const Link& l) { return l.to == to && l.in == in; }), links.end());
         links.push_back({from, out, to, in});
         orderDirty = true;
         b->reset();
+        forgetFifos(to);
         return "";
     }
     void disconnect(int to, int in) {
         links.erase(std::remove_if(links.begin(), links.end(), [&](const Link& l) { return l.to == to && l.in == in; }), links.end());
         orderDirty = true;
+        fitIns(find(to));
     }
     const Link* linkInto(int to, int in) const { for (const auto& l : links) if (l.to == to && l.in == in) return &l; return nullptr; }
 
-    // Worker thread: one block of the channel's baseband (locks mtx)
-    void process(const CF* x, size_t n, double rate, const std::string& inputInfo) {
+    // Worker thread: one block of the channel's baseband (locks mtx). `seconds`: how much time
+    // this step stands for (generators make that much signal); < 0: n / rate. With no input
+    // (x == nullptr, n == 0) the module still calls it now and then, so generators run alone.
+    void process(const CF* x, size_t n, double rate, const std::string& inputInfo, double seconds = -1.0) {
         std::lock_guard<std::mutex> l(mtx);
         InputBlock* inb = input();
         if (!inb) return;
         inb->info = inputInfo;
         Stream& s = inb->out[0];
         s.clear(); s.type = PT::IQ; s.rate = rate;
-        s.iq.assign(x, x + n);
-        if (orderDirty) computeOrder();
-        std::vector<const Stream*> ins;
-        for (Block* b : order) {
-            if (b == inb) continue;
-            ins.assign(b->ins.size(), nullptr);
-            for (size_t i = 0; i < b->ins.size(); i++) {
-                const Link* lk = linkInto(b->id, (int)i);
-                if (!lk) continue;
-                Block* src = find(lk->from);
-                if (src && lk->out < (int)src->out.size()) ins[i] = &src->out[lk->out];
-            }
-            b->process(ins);
-        }
+        if (x && n) s.iq.assign(x, x + n);
+        for (auto& b : nodes) if (b->isInput && b.get() != inb) b->out[0].clear();
+        run(seconds >= 0.0 ? seconds : (rate > 0 ? n / rate : 0.0));
         processed += (long long)n;
     }
+
+    // mtx held: every block but the inputs (filled by the caller), once. `tick`: the seconds
+    // this step stands for (generators make that much signal)
+    void run(double tick) {
+        if (orderDirty) computeOrder();
+        std::vector<const Stream*> ins;
+        for (Unit& u : units) {
+            if (u.loop) { runLoop(u, tick); continue; }
+            Block* b = u.members[0];
+            if (b->isInput) continue;
+            b->tick = tick;
+            b->warning.clear();
+            gather(b, ins, [&](const Link& lk) -> const Stream* {
+                Block* src = find(lk.from);
+                return src && lk.out < (int)src->out.size() ? &src->out[lk.out] : nullptr;
+            });
+            if (b->syncInputs) lineUp(b, ins);
+            b->process(ins);
+        }
+    }
+
+    // The inputs of b, checked for their kind; `source` gives the stream behind a wire
+    template <typename F>
+    void gather(Block* b, std::vector<const Stream*>& ins, F source) {
+        ins.assign(b->ins.size(), nullptr);
+        for (size_t i = 0; i < b->ins.size(); i++) {
+            const Link* lk = linkInto(b->id, (int)i);
+            if (!lk) continue;
+            const Stream* st = source(*lk);
+            if (!st) continue;
+            // a "same as the input" output may carry the wrong kind for this input
+            const PT want = b->ins[i].type;
+            if (want != PT::Any && st->type != want && !(st->size() == 0)) {
+                b->warning = std::string("input ") + b->ins[i].name + ": got " + ptName(st->type) + ", needs " + ptName(want);
+                continue;
+            }
+            if (want == PT::Any && st->type != PT::IQ && st->type != PT::Real && st->size()) {
+                b->warning = std::string("input ") + b->ins[i].name + ": needs I/Q or real";
+                continue;
+            }
+            ins[i] = st;
+        }
+    }
+
+    // ---- feedback loops ----
+    // A loop (blocks that reach each other) must pass through a Delay of D samples. Its blocks
+    // are worked out D samples at a time (the smallest D of its Delays): first each Delay hands
+    // out what it holds, then the other blocks run in order, then the Delays take their inputs.
+    // The loop runs at the pace of the first signal that comes into it from outside.
+    static void sliceStream(const Stream& s, size_t a, size_t b, size_t L, Stream& o) {
+        const size_t M = s.size();
+        const size_t i0 = L ? (size_t)((double)a * M / L + 0.5) : 0, i1 = L ? (size_t)((double)b * M / L + 0.5) : M;
+        o.clear();
+        o.type = s.type; o.rate = s.rate; o.levels = s.levels; o.newBurst = s.newBurst && a == 0;
+        switch (s.type) {
+            case PT::IQ: o.iq.assign(s.iq.begin() + std::min(i0, M), s.iq.begin() + std::min(i1, M)); break;
+            case PT::Real: o.re.assign(s.re.begin() + std::min(i0, M), s.re.begin() + std::min(i1, M)); break;
+            case PT::Sym: o.sym.assign(s.sym.begin() + std::min(i0, M), s.sym.begin() + std::min(i1, M)); break;
+            case PT::Frames: o.frames.assign(s.frames.begin() + std::min(i0, M), s.frames.begin() + std::min(i1, M)); break;
+            default: o.lines.assign(s.lines.begin() + std::min(i0, M), s.lines.begin() + std::min(i1, M)); break;
+        }
+    }
+    static void appendStream(Stream& d, const Stream& s, bool first) {
+        if (first) { d.clear(); d.type = s.type; d.rate = s.rate; d.levels = s.levels; }
+        d.newBurst = d.newBurst || s.newBurst;
+        d.iq.insert(d.iq.end(), s.iq.begin(), s.iq.end());
+        d.re.insert(d.re.end(), s.re.begin(), s.re.end());
+        d.sym.insert(d.sym.end(), s.sym.begin(), s.sym.end());
+        d.frames.insert(d.frames.end(), s.frames.begin(), s.frames.end());
+        d.lines.insert(d.lines.end(), s.lines.begin(), s.lines.end());
+    }
+    void runLoop(Unit& u, double tick) {
+        std::set<int> mem;
+        for (Block* b : u.members) { mem.insert(b->id); b->warning.clear(); }
+        // the pace: the first signal that comes in from outside
+        const Stream* ref = nullptr;
+        for (Block* b : u.members) for (const auto& l : links) {
+            if (ref || l.to != b->id || mem.count(l.from)) continue;
+            Block* src = find(l.from);
+            if (!src || l.out >= (int)src->out.size()) continue;
+            const Stream& s = src->out[l.out];
+            if ((s.type == PT::IQ || s.type == PT::Real) && s.rate > 0 && s.size() > 0) ref = &s;
+        }
+        if (!ref) {
+            for (Block* b : u.members) for (auto& o : b->out) o.clear();
+            u.members[0]->warning = "feedback loop: no signal comes into it (it runs at the pace of its input)";
+            return;
+        }
+        (void)tick;
+        const size_t L = ref->size();
+        const double R = ref->rate;
+        size_t S = SIZE_MAX;
+        std::vector<Block*> delays, others;
+        for (Block* b : u.inner) (b->isDelay ? delays : others).push_back(b);
+        for (Block* d : delays) S = std::min(S, d->loopDelay());
+        if (delays.empty() || S == SIZE_MAX) S = L;
+        // what each Delay hands out: the kind of what goes into it
+        std::vector<PT> dType;
+        for (Block* d : delays) {
+            PT t = PT::Real;
+            if (const Link* lk = linkInto(d->id, 0)) if (Block* src = find(lk->from)) {
+                if (src->outs[lk->out].type == PT::IQ || src->outs[lk->out].type == PT::Real) t = src->outs[lk->out].type;
+                else if (src->out[lk->out].rate > 0 && (src->out[lk->out].type == PT::IQ || src->out[lk->out].type == PT::Real)) t = src->out[lk->out].type;
+            }
+            dType.push_back(t);
+        }
+        std::map<std::pair<int, int>, Stream> acc, slices;
+        auto source = [&](Block* b, const Link& lk, size_t pos, size_t len) -> const Stream* {
+            Block* src = find(lk.from);
+            if (!src || lk.out >= (int)src->out.size()) return nullptr;
+            if (mem.count(lk.from)) return &src->out[lk.out];
+            Stream& sl = slices[{b->id, lk.in}];
+            sliceStream(src->out[lk.out], pos, pos + len, L, sl);
+            return &sl;
+        };
+        std::vector<const Stream*> ins;
+        for (size_t pos = 0; pos < L; pos += S) {
+            const size_t len = std::min(S, L - pos);
+            for (size_t k = 0; k < delays.size(); k++) { delays[k]->tick = len / R; delays[k]->loopEmit(len, dType[k], R); }
+            for (Block* b : others) {
+                b->tick = len / R;
+                gather(b, ins, [&](const Link& lk) { return source(b, lk, pos, len); });
+                if (b->syncInputs) lineUp(b, ins);
+                b->process(ins);
+            }
+            for (Block* d : delays) {
+                const Link* lk = linkInto(d->id, 0);
+                d->loopAbsorb(lk ? source(d, *lk, pos, len) : nullptr, len);
+            }
+            for (Block* b : u.members)
+                for (size_t k = 0; k < b->out.size(); k++) appendStream(acc[{b->id, (int)k}], b->out[k], pos == 0);
+        }
+        for (Block* b : u.members)
+            for (size_t k = 0; k < b->out.size(); k++) b->out[k] = std::move(acc[{b->id, (int)k}]);
+    }
+
+    // ---- lining up the inputs of a block that combines samples (Add, Multiply, Real to complex,
+    //      Audio left / right ...) ----
+    // Each input waits in a FIFO; the block gets the same number of samples on every input, all
+    // at the rate of the first one (others are converted, linear interpolation - shown as a
+    // note). An input that brings nothing while the first has 0.3 s waiting is left out (0).
+    struct SyncIn {
+        PT type = PT::IQ;
+        double srcRate = 0.0, rate = 0.0, t = 0.0;
+        std::vector<CF> iq;
+        std::vector<float> re;
+        CF pc {0, 0};
+        float pr = 0.0f;
+        bool primed = false;
+        bool silent = false;   // brought nothing for a while: left out until it brings samples
+        size_t size() const { return type == PT::IQ ? iq.size() : re.size(); }
+    };
+    std::map<std::pair<int, int>, SyncIn> fifo;
+    std::map<std::pair<int, int>, Stream> lined;
+
+    void lineUp(Block* b, std::vector<const Stream*>& ins) {
+        b->note.clear();
+        auto signal = [](const Stream* s) { return s && (s->type == PT::IQ || s->type == PT::Real) && s->rate > 0; };
+        int ref = -1;
+        for (size_t i = 0; i < ins.size() && ref < 0; i++) if (signal(ins[i])) ref = (int)i;
+        if (ref < 0) return;
+        const double R = ins[ref]->rate;
+        std::vector<int> used;
+        for (size_t i = 0; i < ins.size(); i++) {
+            if (!signal(ins[i])) continue;
+            const Stream& s = *ins[i];
+            SyncIn& f = fifo[{b->id, (int)i}];
+            if (f.type != s.type || f.srcRate != s.rate || f.rate != R) { f = SyncIn(); f.type = s.type; f.srcRate = s.rate; f.rate = R; }
+            if (s.rate == R) {
+                if (s.type == PT::IQ) f.iq.insert(f.iq.end(), s.iq.begin(), s.iq.end());
+                else f.re.insert(f.re.end(), s.re.begin(), s.re.end());
+            } else {
+                // to the first input's rate
+                const double step = s.rate / R;
+                if (s.type == PT::IQ) {
+                    for (CF x : s.iq) {
+                        if (!f.primed) { f.pc = x; f.primed = true; continue; }
+                        while (f.t < 1.0) { f.iq.push_back(f.pc + (x - f.pc) * (float)f.t); f.t += step; }
+                        f.t -= 1.0; f.pc = x;
+                    }
+                } else {
+                    for (float x : s.re) {
+                        if (!f.primed) { f.pr = x; f.primed = true; continue; }
+                        while (f.t < 1.0) { f.re.push_back(f.pr + (x - f.pr) * (float)f.t); f.t += step; }
+                        f.t -= 1.0; f.pr = x;
+                    }
+                }
+                char t[160];
+                std::snprintf(t, sizeof(t), "%s%s %.4g -> %.4g kS/s", b->note.empty() ? "" : ", ", b->ins[i].name.c_str(), s.rate / 1000.0, R / 1000.0);
+                b->note += t;
+            }
+            used.push_back((int)i);
+        }
+        const size_t refHave = fifo[{b->id, ref}].size();
+        size_t n = refHave;
+        for (int i : used) {
+            SyncIn& f = fifo[{b->id, i}];
+            if (f.size() > 0) f.silent = false;
+            if (i != ref && f.size() == 0 && (f.silent || refHave > (size_t)(0.3 * R))) {
+                f.silent = true;
+                ins[i] = nullptr;   // brings nothing: left out
+                b->note += std::string(b->note.empty() ? "" : ", ") + b->ins[i].name + ": no samples";
+                continue;
+            }
+            n = std::min(n, f.size());
+        }
+        for (int i : used) {
+            if (!ins[i]) continue;
+            SyncIn& f = fifo[{b->id, i}];
+            Stream& o = lined[{b->id, i}];
+            o.clear();
+            o.type = f.type; o.rate = R; o.newBurst = ins[i]->newBurst; o.levels = ins[i]->levels;
+            if (f.type == PT::IQ) { o.iq.assign(f.iq.begin(), f.iq.begin() + n); f.iq.erase(f.iq.begin(), f.iq.begin() + n); }
+            else { o.re.assign(f.re.begin(), f.re.begin() + n); f.re.erase(f.re.begin(), f.re.begin() + n); }
+            // never more than 2 s waiting (an input far ahead of the others)
+            const size_t cap = (size_t)(2.0 * R) + 1;
+            if (f.iq.size() > cap) f.iq.erase(f.iq.begin(), f.iq.end() - cap);
+            if (f.re.size() > cap) f.re.erase(f.re.begin(), f.re.end() - cap);
+            ins[i] = &o;
+        }
+    }
+    void forgetFifos(int id) {
+        for (auto it = fifo.begin(); it != fifo.end();) it = it->first.first == id ? fifo.erase(it) : std::next(it);
+        for (auto it = lined.begin(); it != lined.end();) it = it->first.first == id ? lined.erase(it) : std::next(it);
+    }
+    // the dynamic choice lists (receivers, sound cards) read again - UI thread, mtx held
+    void refreshChoices() { for (auto& b : nodes) b->refreshChoices(); }
 
     // ---- JSON ----
     std::string toJson(int indent = 2) const {
@@ -1220,6 +2003,13 @@ public:
             for (size_t k = 0; k < b.params.size(); k++) {
                 const Param& p = b.params[k];
                 o += (k ? ", " : "") + jsonStr(p.key) + ": " + (p.kind == Param::Text ? jsonStr(p.text) : jsonNum(p.v));
+                // a choice from a list that may change (sound cards): its name too
+                if (p.kind == Param::Choice && p.dynamic) {
+                    std::string nm = p.show();
+                    const size_t g = nm.find(Block::GONE);
+                    if (g != std::string::npos) nm.erase(g);
+                    o += ", " + jsonStr(p.key + "__name") + ": " + jsonStr(nm);
+                }
             }
             o += "}}" + std::string(i + 1 < nodes.size() ? "," : "") + "\n";
         }
@@ -1251,10 +2041,21 @@ public:
                     const orbit::JsonValue* pv = ps->get(p.key);
                     if (!pv) continue;
                     if (p.kind == Param::Text && pv->type == orbit::JsonValue::String) p.text = pv->str;
-                    else if (pv->type == orbit::JsonValue::Number) p.v = p.kind == Param::Num ? std::clamp(pv->num, p.lo, p.hi) : std::clamp(pv->num, p.lo, p.hi);
+                    else if (pv->type == orbit::JsonValue::Number) p.v = std::clamp(pv->num, p.lo, p.hi);
+                    if (p.kind == Param::Choice && p.dynamic) {
+                        const std::string nm = ps->getString(p.key + "__name");
+                        bool found = false;
+                        for (size_t c = 0; c < p.choices.size(); c++) if (!nm.empty() && p.choices[c] == nm) { p.v = (double)c; found = true; }
+                        if (!found && !nm.empty() && nm != "receiver's speaker") {
+                            p.choices.push_back(nm + Block::GONE);   // not here now: refreshChoices() looks again
+                            p.hi = (double)p.choices.size() - 1;
+                            p.v = p.hi;
+                        } else if (!found) p.v = 0;
+                    }
                 }
             }
             if (b->type == "input") { if (haveInput) continue; haveInput = true; }
+            b->refreshChoices();
             maxId = std::max(maxId, b->id);
             nn.push_back(std::move(b));
         }
@@ -1265,6 +2066,7 @@ public:
         }
         nodes = std::move(nn);
         links.clear();
+        fifo.clear(); lined.clear();
         nextId = maxId + 1;
         name = v.getString("name", name);
         if (const orbit::JsonValue* ls = v.get("links")) {
@@ -1276,19 +2078,74 @@ public:
     }
 
 private:
+    std::vector<Unit> units;
     std::vector<Block*> order;
     bool orderDirty = true;
+    // The order of work: every group of blocks that reach each other (a feedback loop) is one
+    // unit; the units in the order of their wires; inside a loop, the order with the Delays'
+    // outputs left out (they are known before the step)
     void computeOrder() {
         order.clear();
-        std::map<int, int> indeg;
-        for (auto& n : nodes) indeg[n->id] = 0;
-        for (const auto& l : links) indeg[l.to]++;
+        units.clear();
+        // Tarjan's strongly connected components
+        std::map<int, int> index, low, comp;
+        std::vector<int> stack;
+        std::set<int> onStack;
+        int counter = 0, ncomp = 0;
+        std::function<void(int)> visit = [&](int v) {
+            index[v] = low[v] = counter++;
+            stack.push_back(v); onStack.insert(v);
+            for (const auto& l : links) {
+                if (l.from != v) continue;
+                const int w = l.to;
+                if (!index.count(w)) { visit(w); low[v] = std::min(low[v], low[w]); }
+                else if (onStack.count(w)) low[v] = std::min(low[v], index[w]);
+            }
+            if (low[v] == index[v]) {
+                for (;;) { const int w = stack.back(); stack.pop_back(); onStack.erase(w); comp[w] = ncomp; if (w == v) break; }
+                ncomp++;
+            }
+        };
+        for (auto& n : nodes) if (!index.count(n->id)) visit(n->id);
+        // the components in the order of the wires between them
+        std::vector<std::vector<Block*>> members(ncomp);
+        for (auto& n : nodes) members[comp[n->id]].push_back(n.get());
+        std::vector<int> indeg(ncomp, 0);
+        std::set<std::pair<int, int>> edges;
+        for (const auto& l : links) {
+            const int a = comp[l.from], b = comp[l.to];
+            if (a != b && edges.insert({a, b}).second) indeg[b]++;
+        }
         std::deque<int> q;
-        for (auto& n : nodes) if (indeg[n->id] == 0) q.push_back(n->id);
+        for (int c = 0; c < ncomp; c++) if (indeg[c] == 0) q.push_back(c);
         while (!q.empty()) {
-            const int id = q.front(); q.pop_front();
-            if (Block* b = find(id)) order.push_back(b);
-            for (const auto& l : links) if (l.from == id && --indeg[l.to] == 0) q.push_back(l.to);
+            const int c = q.front(); q.pop_front();
+            Unit u;
+            u.members = members[c];
+            bool self = false;
+            for (const auto& l : links) if (l.from == l.to && comp[l.from] == c) self = true;
+            u.loop = u.members.size() > 1 || self;
+            if (u.loop) {
+                // inside: wires out of a Delay do not count
+                std::map<int, int> in2;
+                for (Block* b : u.members) in2[b->id] = 0;
+                for (const auto& l : links) if (comp[l.from] == c && comp[l.to] == c && !find(l.from)->isDelay) in2[l.to]++;
+                std::deque<int> q2;
+                for (Block* b : u.members) if (in2[b->id] == 0) q2.push_back(b->id);
+                std::set<int> placed;
+                while (!q2.empty()) {
+                    const int id = q2.front(); q2.pop_front();
+                    u.inner.push_back(find(id)); placed.insert(id);
+                    if (find(id)->isDelay) continue;
+                    for (const auto& l : links) if (l.from == id && comp[l.to] == c && --in2[l.to] == 0) q2.push_back(l.to);
+                }
+                for (Block* b : u.members) if (!placed.count(b->id)) u.inner.push_back(b);   // (a loop without a Delay: not allowed by connect)
+            } else {
+                u.inner = u.members;
+            }
+            for (Block* b : u.inner) order.push_back(b);
+            units.push_back(std::move(u));
+            for (const auto& e : edges) if (e.first == c && --indeg[e.second] == 0) q.push_back(e.second);
         }
         orderDirty = false;
     }
@@ -1354,6 +2211,321 @@ inline const std::vector<Preset>& presets() {
             {"id":6,"type":"constel","x":760,"y":330}],
             "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
                      {"from":2,"out":0,"to":5,"in":0},{"from":2,"out":0,"to":6,"in":0}]})"},
+        // Meteor-M LRPT, 137.1 / 137.9 MHz: QPSK 72 kBd, K=7 r=1/2, CCSDS frames, RS, packets,
+        // MSU-MR image. Analyzer channel ~140 kHz wide on the satellite.
+        {"LRPT Meteor-M (137.1 / 137.9, QPSK 72k)", R"({"name":"LRPT Meteor-M","nodes":[
+            {"id":1,"type":"input","x":20,"y":30},
+            {"id":2,"type":"agc","x":250,"y":30,"params":{"tc":20}},
+            {"id":3,"type":"rrc","x":480,"y":30,"params":{"baud":72000,"alpha":0.6,"span":8}},
+            {"id":4,"type":"clockiq","x":710,"y":30,"params":{"baud":72000,"gain":0.02}},
+            {"id":5,"type":"costas","x":940,"y":30,"params":{"ord":1,"bw":0.01,"max":8000}},
+            {"id":6,"type":"constel","x":1170,"y":30,"params":{"dec":1}},
+            {"id":7,"type":"softbits","x":20,"y":250,"params":{"w":0}},
+            {"id":8,"type":"codedsync","x":250,"y":250,"params":{"asm":"0x1ACFFC1D","len":16384,"err":8}},
+            {"id":9,"type":"viterbi","x":480,"y":250,"params":{"poly":0}},
+            {"id":10,"type":"sync","x":710,"y":250,"params":{"pat":"0x1ACFFC1D","err":3,"len":8160,"inv":0}},
+            {"id":11,"type":"derand","x":940,"y":250,"params":{"skip":32}},
+            {"id":12,"type":"pack","x":20,"y":420,"params":{"skip":32,"len":1020}},
+            {"id":13,"type":"rs","x":250,"y":420,"params":{"depth":4,"dual":1,"bad":0,"out":0}},
+            {"id":14,"type":"ccsds","x":480,"y":420,"params":{"vcid":-1,"hdr":8}},
+            {"id":15,"type":"msumr","x":710,"y":420,"params":{"apid":64}},
+            {"id":16,"type":"msumr","x":710,"y":530,"params":{"apid":65}},
+            {"id":17,"type":"image","x":940,"y":420},
+            {"id":18,"type":"image","x":1420,"y":420}],
+            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
+                     {"from":4,"out":0,"to":5,"in":0},{"from":5,"out":0,"to":6,"in":0},{"from":5,"out":0,"to":7,"in":0},
+                     {"from":7,"out":0,"to":8,"in":0},{"from":8,"out":0,"to":9,"in":0},{"from":9,"out":0,"to":10,"in":0},
+                     {"from":10,"out":0,"to":11,"in":0},{"from":11,"out":0,"to":12,"in":0},{"from":12,"out":0,"to":13,"in":0},
+                     {"from":13,"out":0,"to":14,"in":0},{"from":14,"out":0,"to":15,"in":0},{"from":14,"out":0,"to":16,"in":0},
+                     {"from":15,"out":0,"to":17,"in":0},{"from":16,"out":0,"to":18,"in":0}]})"},
+        // Learning, no radio needed (the sources run on their own): an AX.25 / AFSK 1200 modem
+        // built from basic blocks, transmitter and receiver, with a noisy channel between them
+        {"Lab: AFSK 1200 modem loopback (no radio)", R"({"name":"Lab AFSK loopback","nodes":[
+            {"id":1,"type":"input","x":20,"y":600},
+            {"id":2,"type":"msgsrc","x":20,"y":20,"params":{"m":"Hello from OrbitSDR %n","every":1}},
+            {"id":3,"type":"hdlcframer","x":250,"y":20,"params":{"pre":20,"post":3,"crc":0,"rate":1200}},
+            {"id":4,"type":"invbits","x":480,"y":20},
+            {"id":5,"type":"diffbits","x":710,"y":20,"params":{"m":1}},
+            {"id":6,"type":"levels","x":940,"y":20,"params":{"k":1}},
+            {"id":7,"type":"upsample","x":1170,"y":20,"params":{"n":20,"m":1}},
+            {"id":8,"type":"affine","x":20,"y":200,"params":{"k":-500,"c":1700}},
+            {"id":9,"type":"fmmod","x":250,"y":200,"params":{"dev":1}},
+            {"id":10,"type":"c2r","x":480,"y":200},
+            {"id":11,"type":"fmmod","x":710,"y":200,"params":{"dev":3000}},
+            {"id":12,"type":"noiseiq","x":710,"y":330,"params":{"rate":24000,"a":0.3}},
+            {"id":13,"type":"add","x":940,"y":200,"params":{"k":1}},
+            {"id":14,"type":"spectrum","x":1170,"y":200},
+            {"id":15,"type":"fm","x":20,"y":420},
+            {"id":16,"type":"fsktones","x":250,"y":420,"params":{"mark":1200,"space":2200,"baud":1200}},
+            {"id":17,"type":"slicer","x":480,"y":420,"params":{"baud":1200,"lv":0,"clk":0}},
+            {"id":18,"type":"map","x":710,"y":420,"params":{"m":0}},
+            {"id":19,"type":"nrzi","x":940,"y":470,"params":{"m":0}},
+            {"id":20,"type":"hdlc","x":1170,"y":470,"params":{"crc":0,"min":5}},
+            {"id":21,"type":"text","x":1170,"y":600,"params":{"f":0,"ts":0}},
+            {"id":22,"type":"scope","x":250,"y":560,"params":{"ms":20,"mode":0}}],
+            "links":[{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},{"from":4,"out":0,"to":5,"in":0},
+                     {"from":5,"out":0,"to":6,"in":0},{"from":6,"out":0,"to":7,"in":0},{"from":7,"out":0,"to":8,"in":0},
+                     {"from":8,"out":0,"to":9,"in":0},{"from":9,"out":0,"to":10,"in":0},{"from":10,"out":0,"to":11,"in":0},
+                     {"from":11,"out":0,"to":13,"in":0},{"from":12,"out":0,"to":13,"in":1},{"from":13,"out":0,"to":14,"in":0},
+                     {"from":13,"out":0,"to":15,"in":0},{"from":15,"out":0,"to":16,"in":0},{"from":16,"out":0,"to":17,"in":0},
+                     {"from":17,"out":0,"to":18,"in":0},{"from":18,"out":0,"to":19,"in":0},{"from":19,"out":0,"to":20,"in":0},
+                     {"from":20,"out":0,"to":21,"in":0},{"from":16,"out":0,"to":22,"in":0}]})"},
+        // Learning: a square wave plus noise through a designed FIR and an IIR, spectra side by side
+        {"Lab: filters (FIR / IIR, no radio)", R"({"name":"Lab filters","nodes":[
+            {"id":1,"type":"input","x":20,"y":600},
+            {"id":2,"type":"srcreal","x":20,"y":20,"params":{"rate":48000,"w":1,"f":440,"a":0.5}},
+            {"id":3,"type":"noisereal","x":20,"y":200,"params":{"rate":48000,"a":0.1}},
+            {"id":4,"type":"add","x":250,"y":20,"params":{"k":1}},
+            {"id":5,"type":"firdesign","x":480,"y":20,"params":{"t":0,"f1":2000,"n":101,"win":1}},
+            {"id":6,"type":"iir","x":480,"y":300,"params":{"t":6,"f":2000,"ord":4,"bt":0}},
+            {"id":7,"type":"spectrum","x":800,"y":20},
+            {"id":8,"type":"spectrum","x":800,"y":300},
+            {"id":9,"type":"scope","x":1200,"y":20,"params":{"ms":10,"mode":0}},
+            {"id":10,"type":"spectrum","x":1200,"y":380}],
+            "links":[{"from":2,"out":0,"to":4,"in":0},{"from":3,"out":0,"to":4,"in":1},{"from":4,"out":0,"to":5,"in":0},
+                     {"from":4,"out":0,"to":6,"in":0},{"from":5,"out":0,"to":7,"in":0},{"from":6,"out":0,"to":8,"in":0},
+                     {"from":5,"out":0,"to":9,"in":0},{"from":4,"out":0,"to":10,"in":0}]})"},
+        // Control engineering: unit steps (square 0 -> 1 -> 0 every 20 s) into a PID loop around
+        // G(s) = 1 / (s+1)^3, the same G(s) open loop for comparison, metrics of the response
+        {"Lab: control loop (PID, step response, no radio)", R"({"name":"Lab control loop","nodes":[
+            {"id":1,"type":"input","x":20,"y":620},
+            {"id":2,"type":"srcreal","x":20,"y":20,"params":{"rate":1000,"w":1,"f":0.025,"a":0.5,"off":0.5}},
+            {"id":3,"type":"loop","x":290,"y":20,"params":{"num":"1","den":"1, 3, 3, 1","kp":2,"ki":1,"kd":0.5,"nf":100,"h":1}},
+            {"id":4,"type":"tf","x":290,"y":470,"params":{"num":"1","den":"1, 3, 3, 1"}},
+            {"id":5,"type":"scope","x":720,"y":20,"params":{"ms":20000,"mode":1,"src":0,"lvl":0.5,"tch":1,"scale":0}},
+            {"id":6,"type":"stepinfo","x":720,"y":380},
+            {"id":7,"type":"scope","x":1150,"y":20,"params":{"ms":20000,"mode":1,"src":0,"lvl":0.5,"tch":1,"scale":1}}],
+            "links":[{"from":2,"out":0,"to":3,"in":0},{"from":2,"out":0,"to":4,"in":0},
+                     {"from":2,"out":0,"to":5,"in":0},{"from":3,"out":0,"to":5,"in":1},{"from":4,"out":0,"to":5,"in":2},
+                     {"from":2,"out":0,"to":6,"in":0},{"from":3,"out":0,"to":6,"in":1},
+                     {"from":2,"out":0,"to":7,"in":0},{"from":3,"out":1,"to":7,"in":1},{"from":3,"out":2,"to":7,"in":2}]})"},
+        // The same loop as the control lab, built from single blocks: a feedback wire through a
+        // Delay (z^-1 at 1 kS/s) next to the Closed loop block - the two curves nearly coincide
+        {"Lab: feedback loop from blocks (PID + G(s) + z^-1)", R"({"name":"Lab feedback from blocks","nodes":[
+            {"id":1,"type":"input","x":20,"y":640},
+            {"id":2,"type":"srcreal","x":20,"y":20,"params":{"rate":1000,"w":1,"f":0.025,"a":0.5,"off":0.5}},
+            {"id":3,"type":"sub","x":290,"y":20,"params":{"k":1}},
+            {"id":4,"type":"pid","x":520,"y":20,"params":{"kp":2,"ki":1,"kd":0.5,"nf":100}},
+            {"id":5,"type":"tf","x":750,"y":20,"params":{"num":"1","den":"1, 3, 3, 1"}},
+            {"id":6,"type":"delay","x":520,"y":330,"params":{"n":1}},
+            {"id":7,"type":"loop","x":290,"y":440,"params":{"num":"1","den":"1, 3, 3, 1","kp":2,"ki":1,"kd":0.5,"nf":100,"h":1}},
+            {"id":8,"type":"scope","x":1120,"y":20,"params":{"ms":20000,"mode":1,"src":0,"lvl":0.5,"tch":1,"scale":0}},
+            {"id":9,"type":"stepinfo","x":1120,"y":390}],
+            "links":[{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},{"from":4,"out":0,"to":5,"in":0},
+                     {"from":5,"out":0,"to":6,"in":0},{"from":6,"out":0,"to":3,"in":1},{"from":2,"out":0,"to":7,"in":0},
+                     {"from":2,"out":0,"to":8,"in":0},{"from":5,"out":0,"to":8,"in":1},{"from":7,"out":0,"to":8,"in":2},
+                     {"from":2,"out":0,"to":9,"in":0},{"from":5,"out":0,"to":9,"in":1}]})"},
+        // A PLL from control blocks: a tone whose frequency steps +-5 Hz (an FM modulator fed with
+        // a square) is followed by x * conj(v) -> Im -> PI -> + 1000 Hz -> VCO -> z^-8. The PI
+        // output is the VCO's frequency: the PLL's step response (wn = 2 pi 5 rad/s, zeta 0.7;
+        // lock-in ~ 2 zeta wn = 7 Hz: a much larger step slips cycles before it locks again)
+        {"Lab: PLL from blocks (frequency steps, no radio)", R"({"name":"Lab PLL from blocks","nodes":[
+            {"id":1,"type":"input","x":20,"y":660},
+            {"id":2,"type":"srcreal","x":20,"y":20,"params":{"rate":8000,"w":1,"f":0.5,"a":5}},
+            {"id":3,"type":"affine","x":20,"y":250,"params":{"k":1,"c":1000}},
+            {"id":4,"type":"fmmod","x":20,"y":400,"params":{"dev":1}},
+            {"id":5,"type":"mulconj","x":290,"y":20,"params":{"k":1}},
+            {"id":6,"type":"c2r","x":520,"y":20},
+            {"id":7,"type":"pid","x":750,"y":20,"params":{"kp":7.07,"ki":157,"kd":0,"nf":100}},
+            {"id":8,"type":"affine","x":980,"y":20,"params":{"k":1,"c":1000}},
+            {"id":9,"type":"fmmod","x":980,"y":190,"params":{"dev":1}},
+            {"id":10,"type":"delay","x":750,"y":300,"params":{"n":8}},
+            {"id":11,"type":"scope","x":1220,"y":20,"params":{"ms":2000,"mode":1,"src":0,"lvl":0,"tch":1,"scale":0}},
+            {"id":12,"type":"stepinfo","x":1220,"y":390},
+            {"id":13,"type":"scope","x":290,"y":420,"params":{"ms":2000,"mode":1,"src":0,"lvl":0,"tch":1,"scale":1}}],
+            "links":[{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},{"from":4,"out":0,"to":5,"in":0},
+                     {"from":10,"out":0,"to":5,"in":1},{"from":5,"out":0,"to":6,"in":0},{"from":6,"out":1,"to":7,"in":0},
+                     {"from":7,"out":0,"to":8,"in":0},{"from":8,"out":0,"to":9,"in":0},{"from":9,"out":0,"to":10,"in":0},
+                     {"from":2,"out":0,"to":11,"in":0},{"from":7,"out":0,"to":11,"in":1},
+                     {"from":2,"out":0,"to":12,"in":0},{"from":7,"out":0,"to":12,"in":1},
+                     {"from":2,"out":0,"to":13,"in":0},{"from":6,"out":3,"to":13,"in":1}]})"},
+        // A Costas loop from control blocks: BPSK (a square as data) on a carrier 30 Hz off, with
+        // noise. y = x * conj(v); error I * Q; PI; VCO; z^-8. The PI output shows the carrier
+        // offset it found; the constellation turns from a ring into two points
+        {"Lab: Costas loop from blocks (BPSK, no radio)", R"({"name":"Lab Costas from blocks","nodes":[
+            {"id":1,"type":"input","x":20,"y":700},
+            {"id":2,"type":"srcreal","x":20,"y":20,"params":{"rate":48000,"w":1,"f":100,"a":1}},
+            {"id":3,"type":"r2c","x":20,"y":200},
+            {"id":4,"type":"srciq","x":20,"y":330,"params":{"rate":48000,"f":30,"a":1}},
+            {"id":5,"type":"mul","x":290,"y":200,"params":{"k":1}},
+            {"id":6,"type":"noiseiq","x":290,"y":330,"params":{"rate":48000,"a":0.1}},
+            {"id":7,"type":"add","x":520,"y":200,"params":{"k":1}},
+            {"id":8,"type":"mulconj","x":750,"y":20,"params":{"k":1}},
+            {"id":9,"type":"c2r","x":980,"y":20},
+            {"id":10,"type":"mul","x":1210,"y":20,"params":{"k":1}},
+            {"id":11,"type":"pid","x":1210,"y":170,"params":{"kp":14.1,"ki":628,"kd":0,"nf":100}},
+            {"id":12,"type":"fmmod","x":980,"y":330,"params":{"dev":1}},
+            {"id":13,"type":"delay","x":750,"y":330,"params":{"n":8}},
+            {"id":14,"type":"constel","x":520,"y":420},
+            {"id":15,"type":"constel","x":980,"y":470},
+            {"id":16,"type":"probe","x":1440,"y":170}],
+            "links":[{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":5,"in":0},{"from":4,"out":0,"to":5,"in":1},
+                     {"from":5,"out":0,"to":7,"in":0},{"from":6,"out":0,"to":7,"in":1},{"from":7,"out":0,"to":8,"in":0},
+                     {"from":13,"out":0,"to":8,"in":1},{"from":8,"out":0,"to":9,"in":0},{"from":9,"out":0,"to":10,"in":0},
+                     {"from":9,"out":1,"to":10,"in":1},{"from":10,"out":0,"to":11,"in":0},{"from":11,"out":0,"to":12,"in":0},
+                     {"from":12,"out":0,"to":13,"in":0},{"from":7,"out":0,"to":14,"in":0},{"from":8,"out":0,"to":15,"in":0},
+                     {"from":11,"out":0,"to":16,"in":0}]})"},
+        // An AGC from control blocks: a tone whose level steps 0.1 <-> 1 is multiplied by a gain;
+        // |y| is compared with the target 0.5 and an integrator (PID with Ki only) sets the gain
+        // through z^-16. Faster on strong signals (the loop gain grows with the level)
+        {"Lab: AGC from blocks (level steps, no radio)", R"({"name":"Lab AGC from blocks","nodes":[
+            {"id":1,"type":"input","x":20,"y":660},
+            {"id":2,"type":"srciq","x":20,"y":20,"params":{"rate":48000,"f":1000,"a":1}},
+            {"id":3,"type":"srcreal","x":20,"y":200,"params":{"rate":48000,"w":1,"f":0.5,"a":0.45,"off":0.55}},
+            {"id":4,"type":"mul","x":290,"y":20,"params":{"k":1}},
+            {"id":5,"type":"mul","x":520,"y":20,"params":{"k":1}},
+            {"id":6,"type":"mag","x":750,"y":20,"params":{"m":0}},
+            {"id":7,"type":"srcreal","x":750,"y":200,"params":{"rate":48000,"w":4,"a":0.5}},
+            {"id":8,"type":"sub","x":980,"y":20,"params":{"k":1}},
+            {"id":9,"type":"pid","x":1210,"y":20,"params":{"kp":0,"ki":200,"kd":0,"nf":100,"lo":0,"hi":100}},
+            {"id":10,"type":"delay","x":980,"y":330,"params":{"n":16}},
+            {"id":11,"type":"mag","x":290,"y":420,"params":{"m":0}},
+            {"id":12,"type":"scope","x":520,"y":420,"params":{"ms":2000,"mode":1,"src":0,"lvl":0.5,"tch":1,"scale":1}}],
+            "links":[{"from":2,"out":0,"to":4,"in":0},{"from":3,"out":0,"to":4,"in":1},{"from":4,"out":0,"to":5,"in":0},
+                     {"from":10,"out":0,"to":5,"in":1},{"from":5,"out":0,"to":6,"in":0},{"from":7,"out":0,"to":8,"in":0},
+                     {"from":6,"out":0,"to":8,"in":1},{"from":8,"out":0,"to":9,"in":0},{"from":9,"out":0,"to":10,"in":0},
+                     {"from":4,"out":0,"to":11,"in":0},{"from":11,"out":0,"to":12,"in":0},{"from":6,"out":0,"to":12,"in":1},
+                     {"from":9,"out":0,"to":12,"in":2}]})"},
+        // Convolution of two signals: a square wave convolved with one period of a positive
+        // triangle (held): the edges come out rounded (a smoothing kernel); below the same
+        // as a correlation (the kernel reversed)
+        {"Lab: convolution of two signals (no radio)", R"({"name":"Lab convolution","nodes":[
+            {"id":1,"type":"input","x":20,"y":560},
+            {"id":2,"type":"srcreal","x":20,"y":20,"params":{"rate":48000,"w":1,"f":50,"a":1}},
+            {"id":3,"type":"srcreal","x":20,"y":250,"params":{"rate":48000,"w":2,"f":200,"a":0.5,"off":0.5}},
+            {"id":4,"type":"conv","x":300,"y":20,"params":{"n":240,"src":1,"op":0,"sc":1}},
+            {"id":5,"type":"conv","x":300,"y":330,"params":{"n":240,"src":1,"op":1,"sc":1}},
+            {"id":6,"type":"scope","x":700,"y":20,"params":{"ms":60,"mode":0,"src":0,"lvl":0,"tch":1,"scale":1}}],
+            "links":[{"from":2,"out":0,"to":4,"in":0},{"from":3,"out":0,"to":4,"in":1},
+                     {"from":2,"out":0,"to":5,"in":0},{"from":3,"out":0,"to":5,"in":1},
+                     {"from":2,"out":0,"to":6,"in":0},{"from":3,"out":0,"to":6,"in":1},{"from":4,"out":0,"to":6,"in":2},{"from":5,"out":0,"to":6,"in":3}]})"},
+        // FM broadcast in stereo: the Analyzer channel on the station, ~200 kHz wide (demodulator
+        // OFF lets it be that wide). MPX at 192 kS/s: L+R below 15 kHz, pilot 19 kHz, L-R on 38 kHz.
+        // The pilot PLL built from blocks (a feedback loop through a Delay): MPX -> x * conj(v)
+        // -> Im (phase error) -> PID (PI: wn = 2 pi 5 rad/s, zeta 0.7 for a 7.5 kHz pilot) -> + 19 kHz
+        // -> FM modulator (the VCO) -> z^-16 -> back. Locked, v lags the pilot by 90 deg, so
+        // the 38 kHz subcarrier sin(2 p) = -Im(v^2) (the multiplier's "Times" -1). The probe
+        // shows the VCO's offset from 19 kHz.
+        {"WFM stereo (FM broadcast)", R"({"name":"WFM stereo","nodes":[
+            {"id":1,"type":"input","x":20,"y":30},
+            {"id":2,"type":"fm","x":250,"y":30},
+            {"id":3,"type":"resample","x":480,"y":30,"params":{"rate":192000}},
+            {"id":4,"type":"rlowpass","x":1170,"y":30,"params":{"cut":15000}},
+            {"id":13,"type":"r2c","x":250,"y":250},
+            {"id":14,"type":"mulconj","x":480,"y":250,"params":{"k":1}},
+            {"id":15,"type":"c2r","x":710,"y":250},
+            {"id":16,"type":"pid","x":940,"y":250,"params":{"kp":0.001886,"ki":0.0419,"kd":0,"nf":100}},
+            {"id":17,"type":"affine","x":1170,"y":250,"params":{"k":1,"c":19000}},
+            {"id":18,"type":"fmmod","x":1170,"y":420,"params":{"dev":1}},
+            {"id":19,"type":"delay","x":940,"y":500,"params":{"n":16}},
+            {"id":20,"type":"mul","x":480,"y":560,"params":{"k":1}},
+            {"id":21,"type":"c2r","x":710,"y":560},
+            {"id":22,"type":"probe","x":1400,"y":250},
+            {"id":6,"type":"mul","x":940,"y":680,"params":{"k":-1}},
+            {"id":7,"type":"rlowpass","x":1170,"y":680,"params":{"cut":15000}},
+            {"id":8,"type":"matrix","x":1400,"y":30,"params":{"k":2}},
+            {"id":9,"type":"deemph","x":1630,"y":30,"params":{"tau":0}},
+            {"id":10,"type":"deemph","x":1630,"y":150,"params":{"tau":0}},
+            {"id":11,"type":"audio","x":1630,"y":270,"params":{"vol":0,"agc":0}},
+            {"id":12,"type":"spectrum","x":20,"y":420}],
+            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
+                     {"from":3,"out":0,"to":13,"in":0},{"from":13,"out":0,"to":14,"in":0},{"from":19,"out":0,"to":14,"in":1},
+                     {"from":14,"out":0,"to":15,"in":0},{"from":15,"out":1,"to":16,"in":0},{"from":16,"out":0,"to":17,"in":0},
+                     {"from":17,"out":0,"to":18,"in":0},{"from":18,"out":0,"to":19,"in":0},
+                     {"from":19,"out":0,"to":20,"in":0},{"from":19,"out":0,"to":20,"in":1},{"from":20,"out":0,"to":21,"in":0},
+                     {"from":16,"out":0,"to":22,"in":0},
+                     {"from":3,"out":0,"to":6,"in":0},{"from":21,"out":1,"to":6,"in":1},
+                     {"from":6,"out":0,"to":7,"in":0},{"from":4,"out":0,"to":8,"in":0},{"from":7,"out":0,"to":8,"in":1},
+                     {"from":8,"out":0,"to":9,"in":0},{"from":8,"out":1,"to":10,"in":0},{"from":9,"out":0,"to":11,"in":0},
+                     {"from":10,"out":0,"to":11,"in":1},{"from":3,"out":0,"to":12,"in":0}]})"},
+        {"FM stereo, ready-made Pilot PLL block", R"({"name":"FM stereo with the Pilot PLL block","nodes":[
+            {"id":1,"type":"input","x":20,"y":30},
+            {"id":2,"type":"fm","x":250,"y":30},
+            {"id":3,"type":"resample","x":480,"y":30,"params":{"rate":192000}},
+            {"id":4,"type":"rlowpass","x":710,"y":30,"params":{"cut":15000}},
+            {"id":5,"type":"pilot","x":480,"y":170,"params":{"hz":19000,"mult":2,"bw":30}},
+            {"id":6,"type":"mul","x":710,"y":170,"params":{"k":1}},
+            {"id":7,"type":"rlowpass","x":940,"y":170,"params":{"cut":15000}},
+            {"id":8,"type":"matrix","x":1170,"y":30,"params":{"k":2}},
+            {"id":9,"type":"deemph","x":1400,"y":30,"params":{"tau":0}},
+            {"id":10,"type":"deemph","x":1400,"y":150,"params":{"tau":0}},
+            {"id":11,"type":"audio","x":1400,"y":270,"params":{"vol":0,"agc":0}},
+            {"id":12,"type":"spectrum","x":20,"y":330}],
+            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
+                     {"from":3,"out":0,"to":5,"in":0},{"from":3,"out":0,"to":6,"in":0},{"from":5,"out":0,"to":6,"in":1},
+                     {"from":6,"out":0,"to":7,"in":0},{"from":4,"out":0,"to":8,"in":0},{"from":7,"out":0,"to":8,"in":1},
+                     {"from":8,"out":0,"to":9,"in":0},{"from":8,"out":1,"to":10,"in":0},{"from":9,"out":0,"to":11,"in":0},
+                     {"from":10,"out":0,"to":11,"in":1},{"from":3,"out":0,"to":12,"in":0}]})"},
+        // Meteor-M2-3 / M2-4 LRPT 72k: OQPSK with differential coding (found on a real M2-4 pass).
+        // The carrier loop runs on the samples (OQPSK stays near the 4 points), then I is delayed
+        // half a symbol and the rest is QPSK.
+        {"LRPT Meteor-M2-3 / M2-4 (OQPSK 72k, differential)", R"({"name":"LRPT Meteor-M2-x","nodes":[
+            {"id":1,"type":"input","x":20,"y":30},
+            {"id":2,"type":"agc","x":250,"y":30,"params":{"tc":20}},
+            {"id":3,"type":"rrc","x":480,"y":30,"params":{"baud":72000,"alpha":0.6,"span":8}},
+            {"id":4,"type":"costas","x":710,"y":30,"params":{"ord":1,"bw":0.002,"max":8000}},
+            {"id":5,"type":"oqpsk","x":940,"y":30,"params":{"baud":72000,"which":0}},
+            {"id":6,"type":"clockiq","x":1170,"y":30,"params":{"baud":72000,"gain":0.02}},
+            {"id":7,"type":"constel","x":1400,"y":30,"params":{"dec":1}},
+            {"id":8,"type":"softbits","x":20,"y":250,"params":{"w":0}},
+            {"id":9,"type":"diff","x":250,"y":250,"params":{"mode":0}},
+            {"id":10,"type":"codedsync","x":480,"y":250,"params":{"asm":"0x1ACFFC1D","len":16384,"err":8}},
+            {"id":11,"type":"viterbi","x":710,"y":250,"params":{"poly":0}},
+            {"id":12,"type":"sync","x":940,"y":250,"params":{"pat":"0x1ACFFC1D","err":3,"len":8160,"inv":1}},
+            {"id":13,"type":"derand","x":1170,"y":250,"params":{"skip":32}},
+            {"id":14,"type":"pack","x":20,"y":440,"params":{"skip":32,"len":1020}},
+            {"id":15,"type":"rs","x":250,"y":440,"params":{"depth":4,"dual":1,"bad":0,"out":0}},
+            {"id":16,"type":"ccsds","x":480,"y":440,"params":{"vcid":-1,"hdr":8}},
+            {"id":17,"type":"msumr","x":710,"y":440,"params":{"apid":64}},
+            {"id":18,"type":"msumr","x":710,"y":550,"params":{"apid":65}},
+            {"id":19,"type":"image","x":940,"y":440},
+            {"id":20,"type":"image","x":1420,"y":440}],
+            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
+                     {"from":4,"out":0,"to":5,"in":0},{"from":5,"out":0,"to":6,"in":0},{"from":6,"out":0,"to":7,"in":0},
+                     {"from":6,"out":0,"to":8,"in":0},{"from":8,"out":0,"to":9,"in":0},{"from":9,"out":0,"to":10,"in":0},
+                     {"from":10,"out":0,"to":11,"in":0},{"from":11,"out":0,"to":12,"in":0},{"from":12,"out":0,"to":13,"in":0},
+                     {"from":13,"out":0,"to":14,"in":0},{"from":14,"out":0,"to":15,"in":0},{"from":15,"out":0,"to":16,"in":0},
+                     {"from":16,"out":0,"to":17,"in":0},{"from":16,"out":0,"to":18,"in":0},{"from":17,"out":0,"to":19,"in":0},
+                     {"from":18,"out":0,"to":20,"in":0}]})"},
+        // AX.25 1200 Bd AFSK (APRS 144.800 MHz and packet radio): FM, Bell 202 tones
+        {"AX.25 packet 1200 Bd (AFSK, APRS)", R"({"name":"AX.25 1200","nodes":[
+            {"id":1,"type":"input","x":20,"y":30},
+            {"id":2,"type":"fm","x":250,"y":30},
+            {"id":3,"type":"fsktones","x":480,"y":30,"params":{"mark":1200,"space":2200,"baud":1200}},
+            {"id":4,"type":"slicer","x":710,"y":30,"params":{"baud":1200,"lv":0,"clk":0}},
+            {"id":5,"type":"map","x":940,"y":30,"params":{"m":0}},
+            {"id":6,"type":"nrzi","x":20,"y":220,"params":{"m":0}},
+            {"id":7,"type":"hdlc","x":250,"y":220,"params":{"crc":0,"min":17}},
+            {"id":8,"type":"ax25","x":480,"y":220},
+            {"id":9,"type":"scope","x":980,"y":200,"params":{"ms":20,"mode":0}}],
+            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
+                     {"from":4,"out":0,"to":5,"in":0},{"from":5,"out":0,"to":6,"in":0},{"from":6,"out":0,"to":7,"in":0},
+                     {"from":7,"out":0,"to":8,"in":0},{"from":3,"out":0,"to":9,"in":0}]})"},
+        // AX.25 9600 Bd G3RUH (FM, scrambled baseband FSK)
+        {"AX.25 packet 9600 Bd (G3RUH)", R"({"name":"AX.25 9600","nodes":[
+            {"id":1,"type":"input","x":20,"y":30},
+            {"id":2,"type":"fm","x":250,"y":30},
+            {"id":3,"type":"rlowpass","x":480,"y":30,"params":{"cut":6000}},
+            {"id":4,"type":"slicer","x":710,"y":30,"params":{"baud":9600,"lv":0,"clk":0}},
+            {"id":5,"type":"map","x":940,"y":30,"params":{"m":0}},
+            {"id":6,"type":"g3ruh","x":20,"y":220},
+            {"id":7,"type":"nrzi","x":250,"y":220,"params":{"m":0}},
+            {"id":8,"type":"hdlc","x":480,"y":220,"params":{"crc":0,"min":17}},
+            {"id":9,"type":"ax25","x":710,"y":220}],
+            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
+                     {"from":4,"out":0,"to":5,"in":0},{"from":5,"out":0,"to":6,"in":0},{"from":6,"out":0,"to":7,"in":0},
+                     {"from":7,"out":0,"to":8,"in":0},{"from":8,"out":0,"to":9,"in":0}]})"},
+        // HF radiofax: the Analyzer channel on the fax signal's centre (dial + 1.9 kHz on USB), ~3 kHz
+        // wide; FM of the tone: -400 Hz black, +400 Hz white
+        {"WEFAX radiofax (120 LPM, IOC 576)", R"({"name":"WEFAX","nodes":[
+            {"id":1,"type":"input","x":20,"y":30},
+            {"id":2,"type":"fm","x":250,"y":30},
+            {"id":3,"type":"rlowpass","x":480,"y":30,"params":{"cut":1500}},
+            {"id":4,"type":"raster","x":710,"y":30,"params":{"lpm":120,"width":1809,"black":-400,"white":400,"start":1,"tstart":300,"tstop":450}},
+            {"id":5,"type":"image","x":20,"y":250},
+            {"id":6,"type":"scope","x":980,"y":30,"params":{"ms":500,"mode":0}}],
+            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
+                     {"from":4,"out":0,"to":5,"in":0},{"from":3,"out":0,"to":6,"in":0}]})"},
     };
     return p;
 }

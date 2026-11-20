@@ -46,6 +46,9 @@ public:
     // `out`, returns true while it speaks. duckMain = true: mute the main demodulator meanwhile.
     // Called by the DSP thread for every block of the speaker.
     virtual bool mixVoice(float* /*out*/, size_t /*n*/, bool& /*duckMain*/) { return false; }
+    // The same in stereo (48 kHz, left and right on their own); a module that has only mono
+    // leaves it and is mixed to both sides through mixVoice()
+    virtual bool mixStereo(float* /*left*/, float* /*right*/, size_t /*n*/, bool& /*duckMain*/) { return false; }
 
     // The channels this decoder listens to (yellow bands + handles on the tuning bar).
     // nullptr for decoders without channels. Not shown while the input is audio.
