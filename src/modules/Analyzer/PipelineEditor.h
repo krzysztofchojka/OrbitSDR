@@ -76,6 +76,11 @@ class PipelineEditor {
     sf::Vector2f menuAt;
     bool showHelp = false;
     sf::Clock lastDraw, choicesClock;
+    // The wheel changes a number only when the mouse has rested on it: scrolling the canvas
+    // slides values under the pointer, and they must not change on the way (a PLL's PID
+    // got detuned like that). A scroll in progress stays a scroll.
+    int hoverNode = -1, hoverIdx = -1;
+    sf::Clock hoverClock, canvasScrollClock;
 
     // saving
     bool dirty = false;
@@ -157,7 +162,7 @@ class PipelineEditor {
         initialised = true;
         auto& st = store();
         if (!st.loaded && hooks().storePath) st.load(hooks().storePath());
-        if (st.items.empty()) {
+        if (st.items.empty() && !presets().empty()) {
             orbit::JsonValue v;
             if (orbit::parseJson(presets()[0].json, v)) {
                 Pipeline tmp;
@@ -207,7 +212,14 @@ class PipelineEditor {
         auto& st = store();
         if (id == "chains") { menu = menu == 1 ? 0 : 1; return; }
         if (id == "help") { showHelp = !showHelp; return; }
-        if (id == "presets") { menu = menu == 2 ? 0 : 2; return; }
+        if (id == "presets") {
+            menu = menu == 2 ? 0 : 2;
+            if (menu == 2) {   // the files again: a chain just dropped into a preset folder shows up
+                reloadPresets();
+                if (presets().empty()) say("No presets found: assets/pipelines (next to the program) and " + userPresetDir() + " are empty");
+            }
+            return;
+        }
         menu = 0;
         if (id == "new") {
             if (dirty) saveNow();
@@ -594,6 +606,11 @@ public:
             mouse = toWin(mm->position);
             mouseC = toCanvas(mouse);
             std::lock_guard<std::mutex> l(pipe.mtx);
+            {
+                const Hit hv = hitTest(mouseC);
+                if (hv.kind == 4) { if (hv.node != hoverNode || hv.idx != hoverIdx) { hoverNode = hv.node; hoverIdx = hv.idx; hoverClock.restart(); } }
+                else hoverNode = -1;
+            }
             if (drag == Drag::Node) {
                 if (Block* b = pipe.find(dragNode)) { b->x = mouseC.x - origin().x - dragOffset.x; b->y = mouseC.y - origin().y - dragOffset.y; markDirty(); }
             } else if (drag == Drag::Pan) {
@@ -654,7 +671,11 @@ public:
                 std::lock_guard<std::mutex> l(pipe.mtx);
                 const sf::Vector2f mc = toCanvas(m);
                 const Hit h = hitTest(mc);
-                if (h.kind == 4 && !ctrl) {
+                // the value slid under a still pointer: it starts resting on it now
+                if (h.kind == 4 && (h.node != hoverNode || h.idx != hoverIdx)) { hoverNode = h.node; hoverIdx = h.idx; hoverClock.restart(); }
+                const bool rested = h.kind == 4 && hoverClock.getElapsedTime().asSeconds() > 0.4f &&
+                                    canvasScrollClock.getElapsedTime().asSeconds() > 0.6f;
+                if (h.kind == 4 && !ctrl && rested) {
                     if (Block* b = pipe.find(h.node)) {
                         const bool fine = sf::Keyboard::isKeyPressed(sf::Keyboard::Key::LShift);
                         stepParam(b, h.idx, (sc->delta > 0 ? 1.0 : -1.0) * (fine ? 0.1 : 1.0));
@@ -666,6 +687,7 @@ public:
                     zoom = nz;
                 } else {
                     pan.y += sc->delta * 40.0f / zoom;   // scroll the canvas
+                    canvasScrollClock.restart();
                 }
             }
             return true;
@@ -811,6 +833,8 @@ public:
             choicesClock.restart();
             std::lock_guard<std::mutex> l(pipe.mtx);
             pipe.refreshChoices();
+            // a block changed its own parameters (a Script's code edited in an outside editor)
+            for (auto& b : pipe.nodes) if (b->wantsSave) { b->wantsSave = false; markDirty(); }
         }
         area = r;
         const Draw d = dr(w);

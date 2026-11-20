@@ -138,6 +138,11 @@ if [ "$IS_MACOS" = true ]; then
     if [ -f "assets/bandplan.json" ]; then
         cp "assets/bandplan.json" "$APP_BUNDLE/Contents/Resources/"
     fi
+    # The pipeline presets (one JSON file each)
+    if [ -d "assets/pipelines" ]; then
+        rm -rf "$APP_BUNDLE/Contents/Resources/pipelines"
+        cp -r "assets/pipelines" "$APP_BUNDLE/Contents/Resources/"
+    fi
     # Satellite map configuration (proxy / map URL)
     if [ -f "assets/orbitsdr.ini" ]; then
         cp "assets/orbitsdr.ini" "$APP_BUNDLE/Contents/Resources/"
@@ -204,6 +209,7 @@ EOF
 
 else
     # --- LINUX LOGIC ---
-    # icon.png and bandplan.json are found in assets/ at run time (see findResourceFile)
+    # icon.png, bandplan.json and the pipeline presets are found in assets/ at run time
+    # (see findResourceFile and builtinPresetDir)
     echo "SUCCESS! Run ./$OUT_FILE"
 fi

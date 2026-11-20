@@ -2,7 +2,7 @@
 # Builds a .deb from the staged Linux bundle folder.
 #
 # Usage: packaging/build_deb.sh <stage_dir> <arch> <version> <output.deb>
-#   stage_dir : folder containing OrbitSDR, libs/, bandplan.json, icon.png ...
+#   stage_dir : folder containing OrbitSDR, libs/, bandplan.json, pipelines/, icon.png ...
 #   arch      : amd64 | arm64
 #   version   : e.g. 1.0.0 or 0.0.0+git1a2b3c4
 set -euo pipefail

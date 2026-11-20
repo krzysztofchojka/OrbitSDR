@@ -1,0 +1,15 @@
+{
+  "preset": "AM audio",
+  "name": "AM audio",
+  "nodes": [
+    {"id": 1, "type": "input", "x": 30, "y": 40},
+    {"id": 2, "type": "am", "x": 250, "y": 40},
+    {"id": 3, "type": "dc", "x": 480, "y": 40},
+    {"id": 4, "type": "audio", "x": 720, "y": 40}
+  ],
+  "links": [
+    {"from": 1, "out": 0, "to": 2, "in": 0},
+    {"from": 2, "out": 0, "to": 3, "in": 0},
+    {"from": 3, "out": 0, "to": 4, "in": 0}
+  ]
+}

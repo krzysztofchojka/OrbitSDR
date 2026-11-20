@@ -1,0 +1,26 @@
+{
+  "preset": "AX.25 packet 9600 Bd (G3RUH)",
+  "description": "AX.25 9600 Bd G3RUH (FM, scrambled baseband FSK)",
+  "name": "AX.25 9600",
+  "nodes": [
+    {"id": 1, "type": "input", "x": 20, "y": 30},
+    {"id": 2, "type": "fm", "x": 250, "y": 30},
+    {"id": 3, "type": "rlowpass", "x": 480, "y": 30, "params": {"cut": 6000}},
+    {"id": 4, "type": "slicer", "x": 710, "y": 30, "params": {"baud": 9600, "lv": 0, "clk": 0}},
+    {"id": 5, "type": "map", "x": 940, "y": 30, "params": {"m": 0}},
+    {"id": 6, "type": "g3ruh", "x": 20, "y": 220},
+    {"id": 7, "type": "nrzi", "x": 250, "y": 220, "params": {"m": 0}},
+    {"id": 8, "type": "hdlc", "x": 480, "y": 220, "params": {"crc": 0, "min": 17}},
+    {"id": 9, "type": "ax25", "x": 710, "y": 220}
+  ],
+  "links": [
+    {"from": 1, "out": 0, "to": 2, "in": 0},
+    {"from": 2, "out": 0, "to": 3, "in": 0},
+    {"from": 3, "out": 0, "to": 4, "in": 0},
+    {"from": 4, "out": 0, "to": 5, "in": 0},
+    {"from": 5, "out": 0, "to": 6, "in": 0},
+    {"from": 6, "out": 0, "to": 7, "in": 0},
+    {"from": 7, "out": 0, "to": 8, "in": 0},
+    {"from": 8, "out": 0, "to": 9, "in": 0}
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "preset": "Lab: PLL from blocks (frequency steps, no radio)",
+  "description": "A PLL from control blocks: a tone whose frequency steps +-5 Hz (an FM modulator fed with a square) is followed by x * conj(v) -> Im -> PI -> + 1000 Hz -> VCO -> z^-8. The PI output is the VCO's frequency: the PLL's step response (wn = 2 pi 5 rad/s, zeta 0.7; lock-in ~ 2 zeta wn = 7 Hz: a much larger step slips cycles before it locks again)",
+  "name": "Lab PLL from blocks",
+  "nodes": [
+    {"id": 1, "type": "input", "x": 20, "y": 660},
+    {"id": 2, "type": "srcreal", "x": 20, "y": 20, "params": {"rate": 8000, "w": 1, "f": 0.5, "a": 5}},
+    {"id": 3, "type": "affine", "x": 20, "y": 250, "params": {"k": 1, "c": 1000}},
+    {"id": 4, "type": "fmmod", "x": 20, "y": 400, "params": {"dev": 1}},
+    {"id": 5, "type": "mulconj", "x": 290, "y": 20, "params": {"k": 1}},
+    {"id": 6, "type": "c2r", "x": 520, "y": 20},
+    {"id": 7, "type": "pid", "x": 750, "y": 20, "params": {"kp": 7.07, "ki": 157, "kd": 0, "nf": 100}},
+    {"id": 8, "type": "affine", "x": 980, "y": 20, "params": {"k": 1, "c": 1000}},
+    {"id": 9, "type": "fmmod", "x": 980, "y": 190, "params": {"dev": 1}},
+    {"id": 10, "type": "delay", "x": 750, "y": 300, "params": {"n": 8}},
+    {"id": 11, "type": "scope", "x": 1220, "y": 20, "params": {"ms": 2000, "mode": 1, "src": 0, "lvl": 0, "tch": 1, "scale": 0}},
+    {"id": 12, "type": "stepinfo", "x": 1220, "y": 390},
+    {"id": 13, "type": "scope", "x": 290, "y": 420, "params": {"ms": 2000, "mode": 1, "src": 0, "lvl": 0, "tch": 1, "scale": 1}}
+  ],
+  "links": [
+    {"from": 2, "out": 0, "to": 3, "in": 0},
+    {"from": 3, "out": 0, "to": 4, "in": 0},
+    {"from": 4, "out": 0, "to": 5, "in": 0},
+    {"from": 10, "out": 0, "to": 5, "in": 1},
+    {"from": 5, "out": 0, "to": 6, "in": 0},
+    {"from": 6, "out": 1, "to": 7, "in": 0},
+    {"from": 7, "out": 0, "to": 8, "in": 0},
+    {"from": 8, "out": 0, "to": 9, "in": 0},
+    {"from": 9, "out": 0, "to": 10, "in": 0},
+    {"from": 2, "out": 0, "to": 11, "in": 0},
+    {"from": 7, "out": 0, "to": 11, "in": 1},
+    {"from": 2, "out": 0, "to": 12, "in": 0},
+    {"from": 7, "out": 0, "to": 12, "in": 1},
+    {"from": 2, "out": 0, "to": 13, "in": 0},
+    {"from": 6, "out": 3, "to": 13, "in": 1}
+  ]
+}

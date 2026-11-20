@@ -1,0 +1,24 @@
+{
+  "preset": "Lab: LoRa modem loopback (no radio)",
+  "name": "Lab LoRa loopback",
+  "nodes": [
+    {"id": 1, "type": "input", "x": 20, "y": 30},
+    {"id": 2, "type": "msgsrc", "x": 20, "y": 140, "params": {"m": "LoRa test %n", "every": 1.5}},
+    {"id": 3, "type": "loramod", "x": 280, "y": 140, "params": {"sf": 2, "bw": 7, "cr": 0, "os": 4, "sw": "0x12"}},
+    {"id": 4, "type": "shift", "x": 560, "y": 140, "params": {"hz": 2000}},
+    {"id": 5, "type": "noiseiq", "x": 560, "y": 330, "params": {"rate": 500000, "a": 0.7}},
+    {"id": 6, "type": "add", "x": 820, "y": 140},
+    {"id": 7, "type": "lora", "x": 1060, "y": 30, "params": {"sf": 0, "bw": 0}},
+    {"id": 8, "type": "text", "x": 1060, "y": 470, "params": {"f": 0}},
+    {"id": 9, "type": "waterfall", "x": 820, "y": 330, "params": {"range": 40}}
+  ],
+  "links": [
+    {"from": 2, "out": 0, "to": 3, "in": 0},
+    {"from": 3, "out": 0, "to": 4, "in": 0},
+    {"from": 4, "out": 0, "to": 6, "in": 0},
+    {"from": 5, "out": 0, "to": 6, "in": 1},
+    {"from": 6, "out": 0, "to": 7, "in": 0},
+    {"from": 7, "out": 0, "to": 8, "in": 0},
+    {"from": 6, "out": 0, "to": 9, "in": 0}
+  ]
+}

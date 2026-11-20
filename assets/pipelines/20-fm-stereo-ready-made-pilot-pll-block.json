@@ -1,0 +1,34 @@
+{
+  "preset": "FM stereo, ready-made Pilot PLL block",
+  "name": "FM stereo with the Pilot PLL block",
+  "nodes": [
+    {"id": 1, "type": "input", "x": 20, "y": 30},
+    {"id": 2, "type": "fm", "x": 250, "y": 30},
+    {"id": 3, "type": "resample", "x": 480, "y": 30, "params": {"rate": 192000}},
+    {"id": 4, "type": "rlowpass", "x": 710, "y": 30, "params": {"cut": 15000}},
+    {"id": 5, "type": "pilot", "x": 480, "y": 170, "params": {"hz": 19000, "mult": 2, "bw": 30}},
+    {"id": 6, "type": "mul", "x": 710, "y": 170, "params": {"k": 1}},
+    {"id": 7, "type": "rlowpass", "x": 940, "y": 170, "params": {"cut": 15000}},
+    {"id": 8, "type": "matrix", "x": 1170, "y": 30, "params": {"k": 2}},
+    {"id": 9, "type": "deemph", "x": 1400, "y": 30, "params": {"tau": 0}},
+    {"id": 10, "type": "deemph", "x": 1400, "y": 150, "params": {"tau": 0}},
+    {"id": 11, "type": "audio", "x": 1400, "y": 270, "params": {"vol": 0, "agc": 0}},
+    {"id": 12, "type": "spectrum", "x": 20, "y": 330}
+  ],
+  "links": [
+    {"from": 1, "out": 0, "to": 2, "in": 0},
+    {"from": 2, "out": 0, "to": 3, "in": 0},
+    {"from": 3, "out": 0, "to": 4, "in": 0},
+    {"from": 3, "out": 0, "to": 5, "in": 0},
+    {"from": 3, "out": 0, "to": 6, "in": 0},
+    {"from": 5, "out": 0, "to": 6, "in": 1},
+    {"from": 6, "out": 0, "to": 7, "in": 0},
+    {"from": 4, "out": 0, "to": 8, "in": 0},
+    {"from": 7, "out": 0, "to": 8, "in": 1},
+    {"from": 8, "out": 0, "to": 9, "in": 0},
+    {"from": 8, "out": 1, "to": 10, "in": 0},
+    {"from": 9, "out": 0, "to": 11, "in": 0},
+    {"from": 10, "out": 0, "to": 11, "in": 1},
+    {"from": 3, "out": 0, "to": 12, "in": 0}
+  ]
+}

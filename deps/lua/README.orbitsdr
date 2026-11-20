@@ -1,0 +1,4 @@
+Lua 5.4.7 (https://www.lua.org/ftp/lua-5.4.7.tar.gz, sha256 9fbf5e28ef86c69858f6d3d34eccc32e911c1a28b4120ff3e84aaa70cfbf1e30),
+the src/ folder without lua.c / luac.c / Makefile. MIT license (LICENSE).
+Used by the pipelines' Script block (src/modules/Analyzer/PipelineScript.h); compiled into main.cpp
+through src/modules/Analyzer/LuaImpl.h, so no build script needs it.

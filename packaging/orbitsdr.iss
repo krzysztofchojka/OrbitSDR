@@ -56,6 +56,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "..\orbitsdr.exe";    DestDir: "{app}"; Flags: ignoreversion
 Source: "..\*.dll";           DestDir: "{app}"; Flags: ignoreversion
 Source: "..\assets\bandplan.json"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\assets\pipelines\*.json"; DestDir: "{app}\pipelines"; Flags: ignoreversion
 Source: "..\assets\orbitsdr.ini"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\assets\icon.png"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 

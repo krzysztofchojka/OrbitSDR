@@ -1,0 +1,26 @@
+{
+  "preset": "AX.25 packet 1200 Bd (AFSK, APRS)",
+  "description": "AX.25 1200 Bd AFSK (APRS 144.800 MHz and packet radio): FM, Bell 202 tones",
+  "name": "AX.25 1200",
+  "nodes": [
+    {"id": 1, "type": "input", "x": 20, "y": 30},
+    {"id": 2, "type": "fm", "x": 250, "y": 30},
+    {"id": 3, "type": "fsktones", "x": 480, "y": 30, "params": {"mark": 1200, "space": 2200, "baud": 1200}},
+    {"id": 4, "type": "slicer", "x": 710, "y": 30, "params": {"baud": 1200, "lv": 0, "clk": 0}},
+    {"id": 5, "type": "map", "x": 940, "y": 30, "params": {"m": 0}},
+    {"id": 6, "type": "nrzi", "x": 20, "y": 220, "params": {"m": 0}},
+    {"id": 7, "type": "hdlc", "x": 250, "y": 220, "params": {"crc": 0, "min": 17}},
+    {"id": 8, "type": "ax25", "x": 480, "y": 220},
+    {"id": 9, "type": "scope", "x": 980, "y": 200, "params": {"ms": 20, "mode": 0}}
+  ],
+  "links": [
+    {"from": 1, "out": 0, "to": 2, "in": 0},
+    {"from": 2, "out": 0, "to": 3, "in": 0},
+    {"from": 3, "out": 0, "to": 4, "in": 0},
+    {"from": 4, "out": 0, "to": 5, "in": 0},
+    {"from": 5, "out": 0, "to": 6, "in": 0},
+    {"from": 6, "out": 0, "to": 7, "in": 0},
+    {"from": 7, "out": 0, "to": 8, "in": 0},
+    {"from": 3, "out": 0, "to": 9, "in": 0}
+  ]
+}

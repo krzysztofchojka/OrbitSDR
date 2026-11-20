@@ -24,6 +24,13 @@
 #include <chrono>
 #include <cstring>
 #include "../../DSP.h"
+#include "../../PlatformUtils.h"     // getExecutableDir (where the preset files are)
+#include "../../NativeDialogs.h"      // openWithDefaultApp (the Script block's "Edit code")
+#include "../../../deps/lua/lua.h"    // the Script block (PipelineScript.h); Lua itself: LuaImpl.h
+#include "../../../deps/lua/lauxlib.h"
+#include "../../../deps/lua/lualib.h"
+#include <filesystem>
+#include <sys/stat.h>
 #include "../../orbit/Json.h"
 #include "AnalyzerCore.h"
 
@@ -50,11 +57,11 @@ namespace pl {
 using CF = std::complex<float>;
 constexpr double PI_D = 3.14159265358979323846;
 
-enum class PT { IQ, Real, Sym, Frames, Lines, Any };   // Any: an input that takes I/Q or real
+enum class PT { IQ, Real, Sym, Frames, Lines, Any, All };   // Any: an input that takes I/Q or real; All: anything (Script)
 // Frames: whole frames / packets of bytes. Lines: rows of an image (8-bit grey)
 inline const char* ptName(PT t) {
     return t == PT::IQ ? "I/Q" : t == PT::Real ? "real" : t == PT::Sym ? "symbols / bits" : t == PT::Frames ? "frames (bytes)"
-         : t == PT::Lines ? "image lines" : "I/Q or real";
+         : t == PT::Lines ? "image lines" : t == PT::All ? "anything" : "I/Q or real";
 }
 inline sf::Color ptColor(PT t) {
     return t == PT::IQ ? sf::Color(90, 200, 255) : t == PT::Real ? sf::Color(120, 230, 120) : t == PT::Sym ? sf::Color(255, 190, 80)
@@ -108,6 +115,7 @@ struct Param {
     std::function<std::vector<std::string>()> source;
     std::vector<std::string> fixed;
     bool keyFirstWord = false;      // the same entry when the first word matches ("RX1  ..." stays RX1)
+    bool hidden = false;            // saved, but not listed on the block (a Script's code: edited outside)
     // shown only while the choice parameter `showKey` has one of the values in showWhen
     std::string showKey;
     std::vector<int> showWhen;
@@ -196,6 +204,7 @@ public:
     int paramVersion = 0;          // bumped by the editor on every change
     double tick = 0.0;             // seconds this process() call stands for (generators)
     std::string warning;           // set by the pipeline: an input of the wrong kind (shown red)
+    bool wantsSave = false;        // the block changed a parameter itself (a Script's code edited outside): the editor saves
     int maxIns = 0;                // > 1: a free input appears for every wire connected (up to this many)
     bool isDelay = false;          // a Delay: a feedback loop may pass through it (see Pipeline::runLoop)
     // In a feedback loop: the delay hands out `n` samples it has (of kind t) before it gets its
@@ -265,6 +274,7 @@ public:
         for (auto& p : params) if (p.key == key) { p.showKey = on; p.showWhen = std::move(values); }
     }
     bool shown(const Param& p) const {
+        if (p.hidden) return false;
         if (p.showKey.empty()) return true;
         const int c = choice(p.showKey);
         return std::find(p.showWhen.begin(), p.showWhen.end(), c) != p.showWhen.end();
@@ -1332,6 +1342,7 @@ public:
 #include "PipelineSat.h"      // pictures: analog lines by a sync pattern, image lines from frames
 
 #include "PipelineLora.h"     // LoRa (chirp spread spectrum): receiver and modulator
+#include "PipelineScript.h"   // Script (Lua): a protocol's logic written into the pipeline
 
 #include "PipelineTelemetry.h" // packets by a length field, telemetry fields of a frame
 
@@ -1396,6 +1407,8 @@ inline const std::vector<BlockInfo>& blockList() {
         {"probe", "Number display (probe)", "Displays"}, {"text", "Text display", "Displays"}, {"bits", "Bits / symbols view", "Displays"},
         {"framesview", "Frames view (hex)", "Displays"}, {"ax25", "AX.25 packets", "Displays"}, {"image", "Image view", "Displays"},
         {"analyzer", "Analyzer", "Displays"},
+        // code
+        {"script", "Script (Lua)", "Code"},
         // outputs
         {"audio", "Audio out (speaker / sound card)", "Sinks"}, {"wavsink", "WAV file (record)", "Sinks"}, {"bytesink", "Byte file (record)", "Sinks"},
     };
@@ -1513,6 +1526,7 @@ inline const char* blockTags(const std::string& t) {
         {"ax25", "ax25 aprs packet radio callsign decoder znak wywolawczy"},
         {"image", "image view picture png save display obraz zdjecie zapis"},
         {"analyzer", "analyzer classify modulation identify what is this signal analizator rozpoznawanie modulacji"},
+        {"script", "script lua code program custom protocol logic syndrome checksum parser state machine kod skrypt wlasny protokol"},
         {"audio", "audio speaker sound card output headphones play dzwiek glosnik karta dzwiekowa sluchawki"},
         {"wavsink", "wav file record save output iq recording zapis nagrywanie plik"},
         {"bytesink", "file record save bytes binary output dump zapis plik binarny"},
@@ -1623,6 +1637,7 @@ inline std::unique_ptr<Block> makeBlockRaw(const std::string& t) {
     if (t == "crc") return std::make_unique<CrcBlock>();
     if (t == "slice") return std::make_unique<SliceFrames>();
     if (t == "xorbytes") return std::make_unique<XorBytes>();
+    if (t == "script") return std::make_unique<ScriptBlock>();
     if (t == "text") return std::make_unique<TextDisplay>();
     if (t == "probe") return std::make_unique<ProbeBlock>();
     if (t == "waterfall") return std::make_unique<WaterfallBlock>();
@@ -1659,6 +1674,7 @@ inline sf::Color categoryColor(const std::string& c) {
     if (c == "Image") return sf::Color(180, 180, 190);
     if (c == "Sinks") return sf::Color(150, 200, 90);
     if (c == "Control") return sf::Color(80, 200, 150);
+    if (c == "Code") return sf::Color(240, 220, 90);
     return sf::Color(120, 125, 140);   // Displays
 }
 
@@ -1734,7 +1750,7 @@ public:
     // Any on an output: the same kind as the block's input (checked again while running)
     static bool compatible(PT out, PT in) {
         const auto signal = [](PT t) { return t == PT::IQ || t == PT::Real || t == PT::Any; };
-        return out == in || (in == PT::Any && signal(out)) || (out == PT::Any && signal(in));
+        return out == in || in == PT::All || (in == PT::Any && signal(out)) || (out == PT::Any && signal(in));
     }
     bool reaches(int from, int target) const {
         if (from == target) return true;
@@ -1850,6 +1866,7 @@ public:
             if (!st) continue;
             // a "same as the input" output may carry the wrong kind for this input
             const PT want = b->ins[i].type;
+            if (want == PT::All) { ins[i] = st; continue; }   // (a Script takes every kind)
             if (want != PT::Any && st->type != want && !(st->size() == 0)) {
                 b->warning = std::string("input ") + b->ins[i].name + ": got " + ptName(st->type) + ", needs " + ptName(want);
                 continue;
@@ -2208,480 +2225,69 @@ private:
 };
 
 // ---------------------------------------------------------------------
-//  Built-in starting points
+//  Presets: ready-made chains, one JSON file each.
+//   - the ones that come with OrbitSDR: assets/pipelines/ in the repository, next to the
+//     program after installing (pipelines/ beside the .exe, in the app bundle's Resources,
+//     in the Linux bundle's folder);
+//   - the user's own: the "presets" folder next to pipelines.json in the settings folder.
+//     A chain dropped there (e.g. written by an AI assistant from docs/pipeline.md) is in
+//     the Presets menu the next time it opens.
+//  A preset file is a chain (section 11 of docs/pipeline.md) with two more fields: "preset",
+//  its name in the menu (else "name" is used), and "description". The files are listed by
+//  file name (the built-in ones start with a number for their order).
 // ---------------------------------------------------------------------
-struct Preset { const char* name; const char* json; };
+struct Preset { std::string name, json, description, file; };
+
+// the folder of the built-in presets, "" when there is none
+inline std::string builtinPresetDir() {
+    const std::string exe = getExecutableDir();
+    for (const std::string& c : {exe + "/pipelines", exe + "/../Resources/pipelines", std::string("./assets/pipelines"),
+                                 exe + "/../assets/pipelines", exe + "/assets/pipelines", std::string("../Resources/pipelines")}) {
+        std::error_code ec;
+        if (std::filesystem::is_directory(c, ec)) return c;
+    }
+    return "";
+}
+inline std::string userPresetDir() {
+    if (!hooks().storePath) return "";
+    return (std::filesystem::path(hooks().storePath()).parent_path() / "presets").string();
+}
+
+inline std::vector<Preset> loadPresetDir(const std::string& dir) {
+    std::vector<Preset> v;
+    if (dir.empty()) return v;
+    std::error_code ec;
+    std::vector<std::filesystem::path> files;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec))
+        if (e.is_regular_file(ec) && e.path().extension() == ".json") files.push_back(e.path());
+    std::sort(files.begin(), files.end());
+    for (const auto& f : files) {
+        std::ifstream in(f, std::ios::binary);
+        std::stringstream ss;
+        ss << in.rdbuf();
+        orbit::JsonValue j;
+        if (!orbit::parseJson(ss.str(), j) || !j.get("nodes")) continue;   // not a chain
+        Preset p;
+        p.json = ss.str();
+        p.name = j.getString("preset", j.getString("name", f.stem().string()));
+        p.description = j.getString("description", "");
+        p.file = f.string();
+        v.push_back(std::move(p));
+    }
+    return v;
+}
+
+// The presets, read again by reloadPresets() (the editor does when its Presets menu opens)
+inline std::vector<Preset>& presetList() { static std::vector<Preset> p; return p; }
+inline void reloadPresets() {
+    auto& p = presetList();
+    p = loadPresetDir(builtinPresetDir());
+    for (auto& u : loadPresetDir(userPresetDir())) { u.name = "(mine) " + u.name; p.push_back(std::move(u)); }
+}
 inline const std::vector<Preset>& presets() {
-    static const std::vector<Preset> p = {
-        {"FSK data -> bits (4FSK 4800)", R"({"name":"FSK data -> bits","nodes":[
-            {"id":1,"type":"input","x":30,"y":40},
-            {"id":2,"type":"gate","x":250,"y":40,"params":{"thr":8,"mode":0}},
-            {"id":3,"type":"fm","x":520,"y":40},
-            {"id":4,"type":"slicer","x":760,"y":40,"params":{"baud":4800,"lv":1}},
-            {"id":5,"type":"map","x":1000,"y":40,"params":{"m":2}},
-            {"id":6,"type":"bits","x":760,"y":420,"params":{"fmt":1,"len":256}},
-            {"id":7,"type":"scope","x":330,"y":200,"params":{"ms":20,"mode":1,"src":1}},
-            {"id":8,"type":"analyzer","x":30,"y":540}],
-            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
-                     {"from":4,"out":0,"to":5,"in":0},{"from":5,"out":0,"to":6,"in":0},{"from":3,"out":0,"to":7,"in":0},
-                     {"from":1,"out":0,"to":8,"in":0}]})"},
-        {"POCSAG pager (2FSK 1200)", R"({"name":"POCSAG","nodes":[
-            {"id":1,"type":"input","x":30,"y":40},
-            {"id":2,"type":"fm","x":250,"y":40},
-            {"id":3,"type":"slicer","x":480,"y":40,"params":{"baud":1200,"lv":0}},
-            {"id":4,"type":"map","x":740,"y":40,"params":{"m":1}},
-            {"id":5,"type":"sync","x":740,"y":170,"params":{"pat":"0x7CD215D8","err":2,"len":512,"inv":1}},
-            {"id":6,"type":"bits","x":1000,"y":40,"params":{"fmt":1}},
-            {"id":7,"type":"scope","x":250,"y":200,"params":{"ms":30,"mode":0}}],
-            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
-                     {"from":4,"out":0,"to":5,"in":0},{"from":5,"out":0,"to":6,"in":0},{"from":2,"out":0,"to":7,"in":0}]})"},
-        {"FM audio", R"({"name":"FM audio","nodes":[
-            {"id":1,"type":"input","x":30,"y":40},
-            {"id":2,"type":"fm","x":250,"y":40},
-            {"id":3,"type":"rlowpass","x":480,"y":40,"params":{"cut":3500}},
-            {"id":4,"type":"audio","x":720,"y":40},
-            {"id":5,"type":"spectrum","x":250,"y":180}],
-            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},{"from":1,"out":0,"to":5,"in":0}]})"},
-        {"AM audio", R"({"name":"AM audio","nodes":[
-            {"id":1,"type":"input","x":30,"y":40},
-            {"id":2,"type":"am","x":250,"y":40},
-            {"id":3,"type":"dc","x":480,"y":40},
-            {"id":4,"type":"audio","x":720,"y":40}],
-            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0}]})"},
-        {"OOK -> bits (remotes, sensors)", R"({"name":"OOK -> bits","nodes":[
-            {"id":1,"type":"input","x":30,"y":40},
-            {"id":2,"type":"gate","x":250,"y":40,"params":{"thr":10}},
-            {"id":3,"type":"am","x":520,"y":40},
-            {"id":4,"type":"slicer","x":750,"y":40,"params":{"baud":2000,"lv":0,"clk":1}},
-            {"id":5,"type":"map","x":1000,"y":40,"params":{"m":0}},
-            {"id":6,"type":"bits","x":1000,"y":180},
-            {"id":7,"type":"scope","x":520,"y":200,"params":{"ms":50,"mode":1,"src":1}}],
-            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
-                     {"from":4,"out":0,"to":5,"in":0},{"from":5,"out":0,"to":6,"in":0},{"from":3,"out":0,"to":7,"in":0}]})"},
-        {"Single-shot capture (scope + spectrum)", R"({"name":"Single-shot capture","nodes":[
-            {"id":1,"type":"input","x":30,"y":40},
-            {"id":2,"type":"gate","x":250,"y":40,"params":{"mode":1}},
-            {"id":3,"type":"fm","x":520,"y":40},
-            {"id":4,"type":"scope","x":760,"y":40,"params":{"ms":100,"mode":2,"src":1}},
-            {"id":5,"type":"spectrum","x":250,"y":260},
-            {"id":6,"type":"constel","x":760,"y":330}],
-            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
-                     {"from":2,"out":0,"to":5,"in":0},{"from":2,"out":0,"to":6,"in":0}]})"},
-        // Meteor-M LRPT, 137.1 / 137.9 MHz: QPSK 72 kBd, K=7 r=1/2, CCSDS frames, RS, packets,
-        // MSU-MR image. Analyzer channel ~140 kHz wide on the satellite.
-        {"LRPT Meteor-M (137.1 / 137.9, QPSK 72k)", R"({"name":"LRPT Meteor-M","nodes":[
-            {"id":1,"type":"input","x":20,"y":30},
-            {"id":2,"type":"agc","x":250,"y":30,"params":{"tc":20}},
-            {"id":3,"type":"rrc","x":480,"y":30,"params":{"baud":72000,"alpha":0.6,"span":8}},
-            {"id":4,"type":"clockiq","x":710,"y":30,"params":{"baud":72000,"gain":0.02}},
-            {"id":5,"type":"costas","x":940,"y":30,"params":{"ord":1,"bw":0.01,"max":8000}},
-            {"id":6,"type":"constel","x":1170,"y":30,"params":{"dec":1}},
-            {"id":7,"type":"softbits","x":20,"y":250,"params":{"w":0}},
-            {"id":8,"type":"codedsync","x":250,"y":250,"params":{"asm":"0x1ACFFC1D","len":16384,"err":8}},
-            {"id":9,"type":"viterbi","x":480,"y":250,"params":{"poly":0}},
-            {"id":10,"type":"sync","x":710,"y":250,"params":{"pat":"0x1ACFFC1D","err":3,"len":8160,"inv":0}},
-            {"id":11,"type":"derand","x":940,"y":250,"params":{"skip":32}},
-            {"id":12,"type":"pack","x":20,"y":420,"params":{"skip":32,"len":1020}},
-            {"id":13,"type":"rs","x":250,"y":420,"params":{"depth":4,"dual":1,"bad":0,"out":0}},
-            {"id":14,"type":"ccsds","x":480,"y":420,"params":{"vcid":-1,"hdr":8}},
-            {"id":15,"type":"msumr","x":710,"y":420,"params":{"apid":64}},
-            {"id":16,"type":"msumr","x":710,"y":530,"params":{"apid":65}},
-            {"id":17,"type":"image","x":940,"y":420},
-            {"id":18,"type":"image","x":1420,"y":420}],
-            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
-                     {"from":4,"out":0,"to":5,"in":0},{"from":5,"out":0,"to":6,"in":0},{"from":5,"out":0,"to":7,"in":0},
-                     {"from":7,"out":0,"to":8,"in":0},{"from":8,"out":0,"to":9,"in":0},{"from":9,"out":0,"to":10,"in":0},
-                     {"from":10,"out":0,"to":11,"in":0},{"from":11,"out":0,"to":12,"in":0},{"from":12,"out":0,"to":13,"in":0},
-                     {"from":13,"out":0,"to":14,"in":0},{"from":14,"out":0,"to":15,"in":0},{"from":14,"out":0,"to":16,"in":0},
-                     {"from":15,"out":0,"to":17,"in":0},{"from":16,"out":0,"to":18,"in":0}]})"},
-        // NOAA APT (NOAA 15 / 18 / 19, 137.62 / 137.9125 / 137.1 MHz): FM, a 2400 Hz AM subcarrier,
-        // 2 lines a second of 2080 pixels (4160 / s): sync A, image A (visible / IR), telemetry,
-        // sync B, image B (IR), telemetry. Orange channel ~40 kHz wide.
-        {"NOAA APT (137 MHz, analog)", R"({"name":"NOAA APT","nodes":[
-            {"id":1,"type":"input","x":20,"y":30},
-            {"id":2,"type":"fm","x":250,"y":30},
-            {"id":3,"type":"hilbert","x":480,"y":30},
-            {"id":4,"type":"mag","x":710,"y":30,"params":{"m":0}},
-            {"id":5,"type":"linesync","x":940,"y":30,"params":{"width":2080,"lps":2,"min":0.5,"lev":0}},
-            {"id":6,"type":"image","x":940,"y":330},
-            {"id":7,"type":"spectrum","x":250,"y":250},
-            {"id":8,"type":"scope","x":250,"y":450,"params":{"ms":500,"mode":0}}],
-            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
-                     {"from":4,"out":0,"to":5,"in":0},{"from":5,"out":0,"to":6,"in":0},{"from":2,"out":0,"to":7,"in":0},
-                     {"from":4,"out":0,"to":8,"in":0}]})"},
-        // NOAA HRPT (1698 / 1702.5 / 1707 MHz): PM +-67 deg with a residual carrier, Manchester
-        // (split-phase) 665.4 kbps. Carrier PLL from blocks (x * conj(v) -> phase -> PI -> VCO ->
-        // z^-64, wn = 2 pi 500 rad/s) with FLL help for large offsets (Doppler, the radio's ppm):
-        // the frequency of x * conj(v) (FM demodulator, averaged over 512 samples) x 1e-4 is
-        // added to the phase error. The phase is the data; clock at 1.3308 Mchip/s; Manchester;
-        // minor frames of 11090 10-bit words with a 60-bit sync; AVHRR from word 750, five
-        // channels interleaved, 2048 pixels (here channels 2 and 4). Orange channel ~1.6 MHz wide
-        // (the radio at >= 3.2 MS/s).
-        {"NOAA HRPT (1.7 GHz, 665.4 kbps)", R"({"name":"NOAA HRPT","nodes":[
-            {"id":1,"type":"input","x":20,"y":30},
-            {"id":2,"type":"mulconj","x":250,"y":30,"params":{"k":1}},
-            {"id":3,"type":"c2r","x":480,"y":30},
-            {"id":4,"type":"pid","x":940,"y":470,"params":{"kp":707,"ki":1571000,"kd":0,"nf":100,"lo":-200000,"hi":200000}},
-            {"id":16,"type":"fm","x":250,"y":250},
-            {"id":17,"type":"movavg","x":250,"y":400,"params":{"n":512}},
-            {"id":18,"type":"affine","x":480,"y":400,"params":{"k":0.0001,"c":0}},
-            {"id":19,"type":"add","x":710,"y":400,"params":{"k":1}},
-            {"id":5,"type":"fmmod","x":940,"y":620,"params":{"dev":1}},
-            {"id":6,"type":"delay","x":480,"y":620,"params":{"n":64}},
-            {"id":7,"type":"symsync","x":940,"y":30,"params":{"baud":1330800,"gain":0.1}},
-            {"id":8,"type":"decide","x":1170,"y":30,"params":{"lv":2,"th":1,"t":"0"}},
-            {"id":9,"type":"manch","x":1400,"y":30,"params":{"m":0}},
-            {"id":10,"type":"sync","x":940,"y":250,"params":{"pat":"101000010001011011111101011100011001110100001000001111001101","err":6,"len":110840,"inv":1}},
-            {"id":11,"type":"framelines","x":1170,"y":250,"params":{"nb":10,"first":751,"stride":5,"count":2048,"lev":0}},
-            {"id":12,"type":"image","x":1170,"y":470},
-            {"id":13,"type":"framelines","x":1640,"y":250,"params":{"nb":10,"first":753,"stride":5,"count":2048,"lev":0}},
-            {"id":14,"type":"image","x":1640,"y":470},
-            {"id":15,"type":"constel","x":20,"y":250,"params":{"dec":16}}],
-            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":6,"out":0,"to":2,"in":1},{"from":2,"out":0,"to":3,"in":0},
-                     {"from":2,"out":0,"to":16,"in":0},{"from":16,"out":0,"to":17,"in":0},{"from":17,"out":0,"to":18,"in":0},
-                     {"from":3,"out":3,"to":19,"in":0},{"from":18,"out":0,"to":19,"in":1},
-                     {"from":19,"out":0,"to":4,"in":0},{"from":4,"out":0,"to":5,"in":0},{"from":5,"out":0,"to":6,"in":0},
-                     {"from":3,"out":3,"to":7,"in":0},{"from":7,"out":0,"to":8,"in":0},{"from":8,"out":0,"to":9,"in":0},
-                     {"from":9,"out":0,"to":10,"in":0},{"from":10,"out":0,"to":11,"in":0},{"from":11,"out":0,"to":12,"in":0},
-                     {"from":10,"out":0,"to":13,"in":0},{"from":13,"out":0,"to":14,"in":0},{"from":2,"out":0,"to":15,"in":0}]})"},
-        // Learning, no radio needed (the sources run on their own): an AX.25 / AFSK 1200 modem
-        // built from basic blocks, transmitter and receiver, with a noisy channel between them
-        {"Lab: AFSK 1200 modem loopback (no radio)", R"({"name":"Lab AFSK loopback","nodes":[
-            {"id":1,"type":"input","x":20,"y":600},
-            {"id":2,"type":"msgsrc","x":20,"y":20,"params":{"m":"Hello from OrbitSDR %n","every":1}},
-            {"id":3,"type":"hdlcframer","x":250,"y":20,"params":{"pre":20,"post":3,"crc":0,"rate":1200}},
-            {"id":4,"type":"invbits","x":480,"y":20},
-            {"id":5,"type":"diffbits","x":710,"y":20,"params":{"m":1}},
-            {"id":6,"type":"levels","x":940,"y":20,"params":{"k":1}},
-            {"id":7,"type":"upsample","x":1170,"y":20,"params":{"n":20,"m":1}},
-            {"id":8,"type":"affine","x":20,"y":200,"params":{"k":-500,"c":1700}},
-            {"id":9,"type":"fmmod","x":250,"y":200,"params":{"dev":1}},
-            {"id":10,"type":"c2r","x":480,"y":200},
-            {"id":11,"type":"fmmod","x":710,"y":200,"params":{"dev":3000}},
-            {"id":12,"type":"noiseiq","x":710,"y":330,"params":{"rate":24000,"a":0.3}},
-            {"id":13,"type":"add","x":940,"y":200,"params":{"k":1}},
-            {"id":14,"type":"spectrum","x":1170,"y":200},
-            {"id":15,"type":"fm","x":20,"y":420},
-            {"id":16,"type":"fsktones","x":250,"y":420,"params":{"mark":1200,"space":2200,"baud":1200}},
-            {"id":17,"type":"slicer","x":480,"y":420,"params":{"baud":1200,"lv":0,"clk":0}},
-            {"id":18,"type":"map","x":710,"y":420,"params":{"m":0}},
-            {"id":19,"type":"nrzi","x":940,"y":470,"params":{"m":0}},
-            {"id":20,"type":"hdlc","x":1170,"y":470,"params":{"crc":0,"min":5}},
-            {"id":21,"type":"text","x":1170,"y":600,"params":{"f":0,"ts":0}},
-            {"id":22,"type":"scope","x":250,"y":560,"params":{"ms":20,"mode":0}}],
-            "links":[{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},{"from":4,"out":0,"to":5,"in":0},
-                     {"from":5,"out":0,"to":6,"in":0},{"from":6,"out":0,"to":7,"in":0},{"from":7,"out":0,"to":8,"in":0},
-                     {"from":8,"out":0,"to":9,"in":0},{"from":9,"out":0,"to":10,"in":0},{"from":10,"out":0,"to":11,"in":0},
-                     {"from":11,"out":0,"to":13,"in":0},{"from":12,"out":0,"to":13,"in":1},{"from":13,"out":0,"to":14,"in":0},
-                     {"from":13,"out":0,"to":15,"in":0},{"from":15,"out":0,"to":16,"in":0},{"from":16,"out":0,"to":17,"in":0},
-                     {"from":17,"out":0,"to":18,"in":0},{"from":18,"out":0,"to":19,"in":0},{"from":19,"out":0,"to":20,"in":0},
-                     {"from":20,"out":0,"to":21,"in":0},{"from":16,"out":0,"to":22,"in":0}]})"},
-        // Learning: a square wave plus noise through a designed FIR and an IIR, spectra side by side
-        {"Lab: filters (FIR / IIR, no radio)", R"({"name":"Lab filters","nodes":[
-            {"id":1,"type":"input","x":20,"y":600},
-            {"id":2,"type":"srcreal","x":20,"y":20,"params":{"rate":48000,"w":1,"f":440,"a":0.5}},
-            {"id":3,"type":"noisereal","x":20,"y":200,"params":{"rate":48000,"a":0.1}},
-            {"id":4,"type":"add","x":250,"y":20,"params":{"k":1}},
-            {"id":5,"type":"firdesign","x":480,"y":20,"params":{"t":0,"f1":2000,"n":101,"win":1}},
-            {"id":6,"type":"iir","x":480,"y":300,"params":{"t":6,"f":2000,"ord":4,"bt":0}},
-            {"id":7,"type":"spectrum","x":800,"y":20},
-            {"id":8,"type":"spectrum","x":800,"y":300},
-            {"id":9,"type":"scope","x":1200,"y":20,"params":{"ms":10,"mode":0}},
-            {"id":10,"type":"spectrum","x":1200,"y":380}],
-            "links":[{"from":2,"out":0,"to":4,"in":0},{"from":3,"out":0,"to":4,"in":1},{"from":4,"out":0,"to":5,"in":0},
-                     {"from":4,"out":0,"to":6,"in":0},{"from":5,"out":0,"to":7,"in":0},{"from":6,"out":0,"to":8,"in":0},
-                     {"from":5,"out":0,"to":9,"in":0},{"from":4,"out":0,"to":10,"in":0}]})"},
-        // Control engineering: unit steps (square 0 -> 1 -> 0 every 20 s) into a PID loop around
-        // G(s) = 1 / (s+1)^3, the same G(s) open loop for comparison, metrics of the response
-        {"Lab: control loop (PID, step response, no radio)", R"({"name":"Lab control loop","nodes":[
-            {"id":1,"type":"input","x":20,"y":620},
-            {"id":2,"type":"srcreal","x":20,"y":20,"params":{"rate":1000,"w":1,"f":0.025,"a":0.5,"off":0.5}},
-            {"id":3,"type":"loop","x":290,"y":20,"params":{"num":"1","den":"1, 3, 3, 1","kp":2,"ki":1,"kd":0.5,"nf":100,"h":1}},
-            {"id":4,"type":"tf","x":290,"y":470,"params":{"num":"1","den":"1, 3, 3, 1"}},
-            {"id":5,"type":"scope","x":720,"y":20,"params":{"ms":20000,"mode":1,"src":0,"lvl":0.5,"tch":1,"scale":0}},
-            {"id":6,"type":"stepinfo","x":720,"y":380},
-            {"id":7,"type":"scope","x":1150,"y":20,"params":{"ms":20000,"mode":1,"src":0,"lvl":0.5,"tch":1,"scale":1}}],
-            "links":[{"from":2,"out":0,"to":3,"in":0},{"from":2,"out":0,"to":4,"in":0},
-                     {"from":2,"out":0,"to":5,"in":0},{"from":3,"out":0,"to":5,"in":1},{"from":4,"out":0,"to":5,"in":2},
-                     {"from":2,"out":0,"to":6,"in":0},{"from":3,"out":0,"to":6,"in":1},
-                     {"from":2,"out":0,"to":7,"in":0},{"from":3,"out":1,"to":7,"in":1},{"from":3,"out":2,"to":7,"in":2}]})"},
-        // The same loop as the control lab, built from single blocks: a feedback wire through a
-        // Delay (z^-1 at 1 kS/s) next to the Closed loop block - the two curves nearly coincide
-        {"Lab: feedback loop from blocks (PID + G(s) + z^-1)", R"({"name":"Lab feedback from blocks","nodes":[
-            {"id":1,"type":"input","x":20,"y":640},
-            {"id":2,"type":"srcreal","x":20,"y":20,"params":{"rate":1000,"w":1,"f":0.025,"a":0.5,"off":0.5}},
-            {"id":3,"type":"sub","x":290,"y":20,"params":{"k":1}},
-            {"id":4,"type":"pid","x":520,"y":20,"params":{"kp":2,"ki":1,"kd":0.5,"nf":100}},
-            {"id":5,"type":"tf","x":750,"y":20,"params":{"num":"1","den":"1, 3, 3, 1"}},
-            {"id":6,"type":"delay","x":520,"y":330,"params":{"n":1}},
-            {"id":7,"type":"loop","x":290,"y":440,"params":{"num":"1","den":"1, 3, 3, 1","kp":2,"ki":1,"kd":0.5,"nf":100,"h":1}},
-            {"id":8,"type":"scope","x":1120,"y":20,"params":{"ms":20000,"mode":1,"src":0,"lvl":0.5,"tch":1,"scale":0}},
-            {"id":9,"type":"stepinfo","x":1120,"y":390}],
-            "links":[{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},{"from":4,"out":0,"to":5,"in":0},
-                     {"from":5,"out":0,"to":6,"in":0},{"from":6,"out":0,"to":3,"in":1},{"from":2,"out":0,"to":7,"in":0},
-                     {"from":2,"out":0,"to":8,"in":0},{"from":5,"out":0,"to":8,"in":1},{"from":7,"out":0,"to":8,"in":2},
-                     {"from":2,"out":0,"to":9,"in":0},{"from":5,"out":0,"to":9,"in":1}]})"},
-        // A PLL from control blocks: a tone whose frequency steps +-5 Hz (an FM modulator fed with
-        // a square) is followed by x * conj(v) -> Im -> PI -> + 1000 Hz -> VCO -> z^-8. The PI
-        // output is the VCO's frequency: the PLL's step response (wn = 2 pi 5 rad/s, zeta 0.7;
-        // lock-in ~ 2 zeta wn = 7 Hz: a much larger step slips cycles before it locks again)
-        {"Lab: PLL from blocks (frequency steps, no radio)", R"({"name":"Lab PLL from blocks","nodes":[
-            {"id":1,"type":"input","x":20,"y":660},
-            {"id":2,"type":"srcreal","x":20,"y":20,"params":{"rate":8000,"w":1,"f":0.5,"a":5}},
-            {"id":3,"type":"affine","x":20,"y":250,"params":{"k":1,"c":1000}},
-            {"id":4,"type":"fmmod","x":20,"y":400,"params":{"dev":1}},
-            {"id":5,"type":"mulconj","x":290,"y":20,"params":{"k":1}},
-            {"id":6,"type":"c2r","x":520,"y":20},
-            {"id":7,"type":"pid","x":750,"y":20,"params":{"kp":7.07,"ki":157,"kd":0,"nf":100}},
-            {"id":8,"type":"affine","x":980,"y":20,"params":{"k":1,"c":1000}},
-            {"id":9,"type":"fmmod","x":980,"y":190,"params":{"dev":1}},
-            {"id":10,"type":"delay","x":750,"y":300,"params":{"n":8}},
-            {"id":11,"type":"scope","x":1220,"y":20,"params":{"ms":2000,"mode":1,"src":0,"lvl":0,"tch":1,"scale":0}},
-            {"id":12,"type":"stepinfo","x":1220,"y":390},
-            {"id":13,"type":"scope","x":290,"y":420,"params":{"ms":2000,"mode":1,"src":0,"lvl":0,"tch":1,"scale":1}}],
-            "links":[{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},{"from":4,"out":0,"to":5,"in":0},
-                     {"from":10,"out":0,"to":5,"in":1},{"from":5,"out":0,"to":6,"in":0},{"from":6,"out":1,"to":7,"in":0},
-                     {"from":7,"out":0,"to":8,"in":0},{"from":8,"out":0,"to":9,"in":0},{"from":9,"out":0,"to":10,"in":0},
-                     {"from":2,"out":0,"to":11,"in":0},{"from":7,"out":0,"to":11,"in":1},
-                     {"from":2,"out":0,"to":12,"in":0},{"from":7,"out":0,"to":12,"in":1},
-                     {"from":2,"out":0,"to":13,"in":0},{"from":6,"out":3,"to":13,"in":1}]})"},
-        // A Costas loop from control blocks: BPSK (a square as data) on a carrier 30 Hz off, with
-        // noise. y = x * conj(v); error I * Q; PI; VCO; z^-8. The PI output shows the carrier
-        // offset it found; the constellation turns from a ring into two points
-        {"Lab: Costas loop from blocks (BPSK, no radio)", R"({"name":"Lab Costas from blocks","nodes":[
-            {"id":1,"type":"input","x":20,"y":700},
-            {"id":2,"type":"srcreal","x":20,"y":20,"params":{"rate":48000,"w":1,"f":100,"a":1}},
-            {"id":3,"type":"r2c","x":20,"y":200},
-            {"id":4,"type":"srciq","x":20,"y":330,"params":{"rate":48000,"f":30,"a":1}},
-            {"id":5,"type":"mul","x":290,"y":200,"params":{"k":1}},
-            {"id":6,"type":"noiseiq","x":290,"y":330,"params":{"rate":48000,"a":0.1}},
-            {"id":7,"type":"add","x":520,"y":200,"params":{"k":1}},
-            {"id":8,"type":"mulconj","x":750,"y":20,"params":{"k":1}},
-            {"id":9,"type":"c2r","x":980,"y":20},
-            {"id":10,"type":"mul","x":1210,"y":20,"params":{"k":1}},
-            {"id":11,"type":"pid","x":1210,"y":170,"params":{"kp":14.1,"ki":628,"kd":0,"nf":100}},
-            {"id":12,"type":"fmmod","x":980,"y":330,"params":{"dev":1}},
-            {"id":13,"type":"delay","x":750,"y":330,"params":{"n":8}},
-            {"id":14,"type":"constel","x":520,"y":420},
-            {"id":15,"type":"constel","x":980,"y":470},
-            {"id":16,"type":"probe","x":1440,"y":170}],
-            "links":[{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":5,"in":0},{"from":4,"out":0,"to":5,"in":1},
-                     {"from":5,"out":0,"to":7,"in":0},{"from":6,"out":0,"to":7,"in":1},{"from":7,"out":0,"to":8,"in":0},
-                     {"from":13,"out":0,"to":8,"in":1},{"from":8,"out":0,"to":9,"in":0},{"from":9,"out":0,"to":10,"in":0},
-                     {"from":9,"out":1,"to":10,"in":1},{"from":10,"out":0,"to":11,"in":0},{"from":11,"out":0,"to":12,"in":0},
-                     {"from":12,"out":0,"to":13,"in":0},{"from":7,"out":0,"to":14,"in":0},{"from":8,"out":0,"to":15,"in":0},
-                     {"from":11,"out":0,"to":16,"in":0}]})"},
-        // An AGC from control blocks: a tone whose level steps 0.1 <-> 1 is multiplied by a gain;
-        // |y| is compared with the target 0.5 and an integrator (PID with Ki only) sets the gain
-        // through z^-16. Faster on strong signals (the loop gain grows with the level)
-        {"Lab: AGC from blocks (level steps, no radio)", R"({"name":"Lab AGC from blocks","nodes":[
-            {"id":1,"type":"input","x":20,"y":660},
-            {"id":2,"type":"srciq","x":20,"y":20,"params":{"rate":48000,"f":1000,"a":1}},
-            {"id":3,"type":"srcreal","x":20,"y":200,"params":{"rate":48000,"w":1,"f":0.5,"a":0.45,"off":0.55}},
-            {"id":4,"type":"mul","x":290,"y":20,"params":{"k":1}},
-            {"id":5,"type":"mul","x":520,"y":20,"params":{"k":1}},
-            {"id":6,"type":"mag","x":750,"y":20,"params":{"m":0}},
-            {"id":7,"type":"srcreal","x":750,"y":200,"params":{"rate":48000,"w":4,"a":0.5}},
-            {"id":8,"type":"sub","x":980,"y":20,"params":{"k":1}},
-            {"id":9,"type":"pid","x":1210,"y":20,"params":{"kp":0,"ki":200,"kd":0,"nf":100,"lo":0,"hi":100}},
-            {"id":10,"type":"delay","x":980,"y":330,"params":{"n":16}},
-            {"id":11,"type":"mag","x":290,"y":420,"params":{"m":0}},
-            {"id":12,"type":"scope","x":520,"y":420,"params":{"ms":2000,"mode":1,"src":0,"lvl":0.5,"tch":1,"scale":1}}],
-            "links":[{"from":2,"out":0,"to":4,"in":0},{"from":3,"out":0,"to":4,"in":1},{"from":4,"out":0,"to":5,"in":0},
-                     {"from":10,"out":0,"to":5,"in":1},{"from":5,"out":0,"to":6,"in":0},{"from":7,"out":0,"to":8,"in":0},
-                     {"from":6,"out":0,"to":8,"in":1},{"from":8,"out":0,"to":9,"in":0},{"from":9,"out":0,"to":10,"in":0},
-                     {"from":4,"out":0,"to":11,"in":0},{"from":11,"out":0,"to":12,"in":0},{"from":6,"out":0,"to":12,"in":1},
-                     {"from":9,"out":0,"to":12,"in":2}]})"},
-        // Convolution of two signals: a square wave convolved with one period of a positive
-        // triangle (held): the edges come out rounded (a smoothing kernel); below the same
-        // as a correlation (the kernel reversed)
-        {"Lab: convolution of two signals (no radio)", R"({"name":"Lab convolution","nodes":[
-            {"id":1,"type":"input","x":20,"y":560},
-            {"id":2,"type":"srcreal","x":20,"y":20,"params":{"rate":48000,"w":1,"f":50,"a":1}},
-            {"id":3,"type":"srcreal","x":20,"y":250,"params":{"rate":48000,"w":2,"f":200,"a":0.5,"off":0.5}},
-            {"id":4,"type":"conv","x":300,"y":20,"params":{"n":240,"src":1,"op":0,"sc":1}},
-            {"id":5,"type":"conv","x":300,"y":330,"params":{"n":240,"src":1,"op":1,"sc":1}},
-            {"id":6,"type":"scope","x":700,"y":20,"params":{"ms":60,"mode":0,"src":0,"lvl":0,"tch":1,"scale":1}}],
-            "links":[{"from":2,"out":0,"to":4,"in":0},{"from":3,"out":0,"to":4,"in":1},
-                     {"from":2,"out":0,"to":5,"in":0},{"from":3,"out":0,"to":5,"in":1},
-                     {"from":2,"out":0,"to":6,"in":0},{"from":3,"out":0,"to":6,"in":1},{"from":4,"out":0,"to":6,"in":2},{"from":5,"out":0,"to":6,"in":3}]})"},
-        // FM broadcast in stereo: the Analyzer channel on the station, ~200 kHz wide (demodulator
-        // OFF lets it be that wide). MPX at 192 kS/s: L+R below 15 kHz, pilot 19 kHz, L-R on 38 kHz.
-        // The pilot PLL built from blocks (a feedback loop through a Delay): MPX -> x * conj(v)
-        // -> Im (phase error) -> PID (PI: wn = 2 pi 5 rad/s, zeta 0.7 for a 7.5 kHz pilot) -> + 19 kHz
-        // -> FM modulator (the VCO) -> z^-16 -> back. Locked, v lags the pilot by 90 deg, so
-        // the 38 kHz subcarrier sin(2 p) = -Im(v^2) (the multiplier's "Times" -1). The probe
-        // shows the VCO's offset from 19 kHz.
-        {"WFM stereo (FM broadcast)", R"({"name":"WFM stereo","nodes":[
-            {"id":1,"type":"input","x":20,"y":30},
-            {"id":2,"type":"fm","x":250,"y":30},
-            {"id":3,"type":"resample","x":480,"y":30,"params":{"rate":192000}},
-            {"id":4,"type":"rlowpass","x":1170,"y":30,"params":{"cut":15000}},
-            {"id":13,"type":"r2c","x":250,"y":250},
-            {"id":14,"type":"mulconj","x":480,"y":250,"params":{"k":1}},
-            {"id":15,"type":"c2r","x":710,"y":250},
-            {"id":16,"type":"pid","x":940,"y":250,"params":{"kp":0.001886,"ki":0.0419,"kd":0,"nf":100}},
-            {"id":17,"type":"affine","x":1170,"y":250,"params":{"k":1,"c":19000}},
-            {"id":18,"type":"fmmod","x":1170,"y":420,"params":{"dev":1}},
-            {"id":19,"type":"delay","x":940,"y":500,"params":{"n":16}},
-            {"id":20,"type":"mul","x":480,"y":560,"params":{"k":1}},
-            {"id":21,"type":"c2r","x":710,"y":560},
-            {"id":22,"type":"probe","x":1400,"y":250},
-            {"id":6,"type":"mul","x":940,"y":680,"params":{"k":-1}},
-            {"id":7,"type":"rlowpass","x":1170,"y":680,"params":{"cut":15000}},
-            {"id":8,"type":"matrix","x":1400,"y":30,"params":{"k":2}},
-            {"id":9,"type":"deemph","x":1630,"y":30,"params":{"tau":0}},
-            {"id":10,"type":"deemph","x":1630,"y":150,"params":{"tau":0}},
-            {"id":11,"type":"audio","x":1630,"y":270,"params":{"vol":0,"agc":0}},
-            {"id":12,"type":"spectrum","x":20,"y":420}],
-            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
-                     {"from":3,"out":0,"to":13,"in":0},{"from":13,"out":0,"to":14,"in":0},{"from":19,"out":0,"to":14,"in":1},
-                     {"from":14,"out":0,"to":15,"in":0},{"from":15,"out":1,"to":16,"in":0},{"from":16,"out":0,"to":17,"in":0},
-                     {"from":17,"out":0,"to":18,"in":0},{"from":18,"out":0,"to":19,"in":0},
-                     {"from":19,"out":0,"to":20,"in":0},{"from":19,"out":0,"to":20,"in":1},{"from":20,"out":0,"to":21,"in":0},
-                     {"from":16,"out":0,"to":22,"in":0},
-                     {"from":3,"out":0,"to":6,"in":0},{"from":21,"out":1,"to":6,"in":1},
-                     {"from":6,"out":0,"to":7,"in":0},{"from":4,"out":0,"to":8,"in":0},{"from":7,"out":0,"to":8,"in":1},
-                     {"from":8,"out":0,"to":9,"in":0},{"from":8,"out":1,"to":10,"in":0},{"from":9,"out":0,"to":11,"in":0},
-                     {"from":10,"out":0,"to":11,"in":1},{"from":3,"out":0,"to":12,"in":0}]})"},
-        {"FM stereo, ready-made Pilot PLL block", R"({"name":"FM stereo with the Pilot PLL block","nodes":[
-            {"id":1,"type":"input","x":20,"y":30},
-            {"id":2,"type":"fm","x":250,"y":30},
-            {"id":3,"type":"resample","x":480,"y":30,"params":{"rate":192000}},
-            {"id":4,"type":"rlowpass","x":710,"y":30,"params":{"cut":15000}},
-            {"id":5,"type":"pilot","x":480,"y":170,"params":{"hz":19000,"mult":2,"bw":30}},
-            {"id":6,"type":"mul","x":710,"y":170,"params":{"k":1}},
-            {"id":7,"type":"rlowpass","x":940,"y":170,"params":{"cut":15000}},
-            {"id":8,"type":"matrix","x":1170,"y":30,"params":{"k":2}},
-            {"id":9,"type":"deemph","x":1400,"y":30,"params":{"tau":0}},
-            {"id":10,"type":"deemph","x":1400,"y":150,"params":{"tau":0}},
-            {"id":11,"type":"audio","x":1400,"y":270,"params":{"vol":0,"agc":0}},
-            {"id":12,"type":"spectrum","x":20,"y":330}],
-            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
-                     {"from":3,"out":0,"to":5,"in":0},{"from":3,"out":0,"to":6,"in":0},{"from":5,"out":0,"to":6,"in":1},
-                     {"from":6,"out":0,"to":7,"in":0},{"from":4,"out":0,"to":8,"in":0},{"from":7,"out":0,"to":8,"in":1},
-                     {"from":8,"out":0,"to":9,"in":0},{"from":8,"out":1,"to":10,"in":0},{"from":9,"out":0,"to":11,"in":0},
-                     {"from":10,"out":0,"to":11,"in":1},{"from":3,"out":0,"to":12,"in":0}]})"},
-        // Meteor-M2-3 / M2-4 LRPT 72k: OQPSK with differential coding (found on a real M2-4 pass).
-        // The carrier loop runs on the samples (OQPSK stays near the 4 points), then I is delayed
-        // half a symbol and the rest is QPSK.
-        {"LRPT Meteor-M2-3 / M2-4 (OQPSK 72k, differential)", R"({"name":"LRPT Meteor-M2-x","nodes":[
-            {"id":1,"type":"input","x":20,"y":30},
-            {"id":2,"type":"agc","x":250,"y":30,"params":{"tc":20}},
-            {"id":3,"type":"rrc","x":480,"y":30,"params":{"baud":72000,"alpha":0.6,"span":8}},
-            {"id":4,"type":"costas","x":710,"y":30,"params":{"ord":1,"bw":0.002,"max":8000}},
-            {"id":5,"type":"oqpsk","x":940,"y":30,"params":{"baud":72000,"which":0}},
-            {"id":6,"type":"clockiq","x":1170,"y":30,"params":{"baud":72000,"gain":0.02}},
-            {"id":7,"type":"constel","x":1400,"y":30,"params":{"dec":1}},
-            {"id":8,"type":"softbits","x":20,"y":250,"params":{"w":0}},
-            {"id":9,"type":"diff","x":250,"y":250,"params":{"mode":0}},
-            {"id":10,"type":"codedsync","x":480,"y":250,"params":{"asm":"0x1ACFFC1D","len":16384,"err":8}},
-            {"id":11,"type":"viterbi","x":710,"y":250,"params":{"poly":0}},
-            {"id":12,"type":"sync","x":940,"y":250,"params":{"pat":"0x1ACFFC1D","err":3,"len":8160,"inv":1}},
-            {"id":13,"type":"derand","x":1170,"y":250,"params":{"skip":32}},
-            {"id":14,"type":"pack","x":20,"y":440,"params":{"skip":32,"len":1020}},
-            {"id":15,"type":"rs","x":250,"y":440,"params":{"depth":4,"dual":1,"bad":0,"out":0}},
-            {"id":16,"type":"ccsds","x":480,"y":440,"params":{"vcid":-1,"hdr":8}},
-            {"id":17,"type":"msumr","x":710,"y":440,"params":{"apid":64}},
-            {"id":18,"type":"msumr","x":710,"y":550,"params":{"apid":65}},
-            {"id":19,"type":"image","x":940,"y":440},
-            {"id":20,"type":"image","x":1420,"y":440}],
-            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
-                     {"from":4,"out":0,"to":5,"in":0},{"from":5,"out":0,"to":6,"in":0},{"from":6,"out":0,"to":7,"in":0},
-                     {"from":6,"out":0,"to":8,"in":0},{"from":8,"out":0,"to":9,"in":0},{"from":9,"out":0,"to":10,"in":0},
-                     {"from":10,"out":0,"to":11,"in":0},{"from":11,"out":0,"to":12,"in":0},{"from":12,"out":0,"to":13,"in":0},
-                     {"from":13,"out":0,"to":14,"in":0},{"from":14,"out":0,"to":15,"in":0},{"from":15,"out":0,"to":16,"in":0},
-                     {"from":16,"out":0,"to":17,"in":0},{"from":16,"out":0,"to":18,"in":0},{"from":17,"out":0,"to":19,"in":0},
-                     {"from":18,"out":0,"to":20,"in":0}]})"},
-        // AX.25 1200 Bd AFSK (APRS 144.800 MHz and packet radio): FM, Bell 202 tones
-        {"AX.25 packet 1200 Bd (AFSK, APRS)", R"({"name":"AX.25 1200","nodes":[
-            {"id":1,"type":"input","x":20,"y":30},
-            {"id":2,"type":"fm","x":250,"y":30},
-            {"id":3,"type":"fsktones","x":480,"y":30,"params":{"mark":1200,"space":2200,"baud":1200}},
-            {"id":4,"type":"slicer","x":710,"y":30,"params":{"baud":1200,"lv":0,"clk":0}},
-            {"id":5,"type":"map","x":940,"y":30,"params":{"m":0}},
-            {"id":6,"type":"nrzi","x":20,"y":220,"params":{"m":0}},
-            {"id":7,"type":"hdlc","x":250,"y":220,"params":{"crc":0,"min":17}},
-            {"id":8,"type":"ax25","x":480,"y":220},
-            {"id":9,"type":"scope","x":980,"y":200,"params":{"ms":20,"mode":0}}],
-            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
-                     {"from":4,"out":0,"to":5,"in":0},{"from":5,"out":0,"to":6,"in":0},{"from":6,"out":0,"to":7,"in":0},
-                     {"from":7,"out":0,"to":8,"in":0},{"from":3,"out":0,"to":9,"in":0}]})"},
-        // AX.25 9600 Bd G3RUH (FM, scrambled baseband FSK)
-        {"AX.25 packet 9600 Bd (G3RUH)", R"({"name":"AX.25 9600","nodes":[
-            {"id":1,"type":"input","x":20,"y":30},
-            {"id":2,"type":"fm","x":250,"y":30},
-            {"id":3,"type":"rlowpass","x":480,"y":30,"params":{"cut":6000}},
-            {"id":4,"type":"slicer","x":710,"y":30,"params":{"baud":9600,"lv":0,"clk":0}},
-            {"id":5,"type":"map","x":940,"y":30,"params":{"m":0}},
-            {"id":6,"type":"g3ruh","x":20,"y":220},
-            {"id":7,"type":"nrzi","x":250,"y":220,"params":{"m":0}},
-            {"id":8,"type":"hdlc","x":480,"y":220,"params":{"crc":0,"min":17}},
-            {"id":9,"type":"ax25","x":710,"y":220}],
-            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
-                     {"from":4,"out":0,"to":5,"in":0},{"from":5,"out":0,"to":6,"in":0},{"from":6,"out":0,"to":7,"in":0},
-                     {"from":7,"out":0,"to":8,"in":0},{"from":8,"out":0,"to":9,"in":0}]})"},
-        // HF radiofax: the Analyzer channel on the fax signal's centre (dial + 1.9 kHz on USB), ~3 kHz
-        // wide; FM of the tone: -400 Hz black, +400 Hz white
-        {"WEFAX radiofax (120 LPM, IOC 576)", R"({"name":"WEFAX","nodes":[
-            {"id":1,"type":"input","x":20,"y":30},
-            {"id":2,"type":"fm","x":250,"y":30},
-            {"id":3,"type":"rlowpass","x":480,"y":30,"params":{"cut":1500}},
-            {"id":4,"type":"raster","x":710,"y":30,"params":{"lpm":120,"width":1809,"black":-400,"white":400,"start":1,"tstart":300,"tstop":450}},
-            {"id":5,"type":"image","x":20,"y":250},
-            {"id":6,"type":"scope","x":980,"y":30,"params":{"ms":500,"mode":0}}],
-            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
-                     {"from":4,"out":0,"to":5,"in":0},{"from":3,"out":0,"to":6,"in":0}]})"},
-        {"LoRa receiver (auto SF / BW: EByte E22 / E32 / E220, RFM95 ...)", R"({"name":"LoRa receiver","nodes":[
-            {"id":1,"type":"input","x":20,"y":30},
-            {"id":2,"type":"lora","x":280,"y":30,"params":{"sf":0,"bw":0,"sw":"any"}},
-            {"id":3,"type":"text","x":280,"y":470,"params":{"f":2,"ts":0}},
-            {"id":4,"type":"waterfall","x":20,"y":180,"params":{"range":50}}],
-            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":1,"out":0,"to":4,"in":0}]})"},
-        // An EByte E32 (SX1278) in transparent mode, as measured on an E32-433T20D: SF7 / 500 kHz,
-        // CR 4/6, LDRO on, a 32-symbol preamble. Its payload is an 8-byte header (2C 17, two check
-        // bytes, 00 00 00, the data length) and then the data XORed with 0x12.
-        {"LoRa EByte E32 (header cut, data unscrambled)", R"({"name":"LoRa EByte E32","nodes":[
-            {"id":1,"type":"input","x":20,"y":30},
-            {"id":2,"type":"lora","x":280,"y":30,"params":{"sf":0,"bw":0,"sw":"any"}},
-            {"id":3,"type":"slice","x":820,"y":30,"params":{"from":8,"n":0}},
-            {"id":4,"type":"xorbytes","x":820,"y":150,"params":{"key":"0x12"}},
-            {"id":5,"type":"text","x":820,"y":270,"params":{"f":0,"ts":0}},
-            {"id":6,"type":"text","x":280,"y":470,"params":{"f":1,"ts":0}},
-            {"id":7,"type":"waterfall","x":20,"y":180,"params":{"range":50}}],
-            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
-                     {"from":4,"out":0,"to":5,"in":0},{"from":2,"out":0,"to":6,"in":0},{"from":1,"out":0,"to":7,"in":0}]})"},
-        {"Lab: LoRa modem loopback (no radio)", R"({"name":"Lab LoRa loopback","nodes":[
-            {"id":1,"type":"input","x":20,"y":30},
-            {"id":2,"type":"msgsrc","x":20,"y":140,"params":{"m":"LoRa test %n","every":1.5}},
-            {"id":3,"type":"loramod","x":280,"y":140,"params":{"sf":2,"bw":7,"cr":0,"os":4,"sw":"0x12"}},
-            {"id":4,"type":"shift","x":560,"y":140,"params":{"hz":2000}},
-            {"id":5,"type":"noiseiq","x":560,"y":330,"params":{"rate":500000,"a":0.7}},
-            {"id":6,"type":"add","x":820,"y":140},
-            {"id":7,"type":"lora","x":1060,"y":30,"params":{"sf":0,"bw":0}},
-            {"id":8,"type":"text","x":1060,"y":470,"params":{"f":0}},
-            {"id":9,"type":"waterfall","x":820,"y":330,"params":{"range":40}}],
-            "links":[{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},{"from":4,"out":0,"to":6,"in":0},
-                     {"from":5,"out":0,"to":6,"in":1},{"from":6,"out":0,"to":7,"in":0},{"from":7,"out":0,"to":8,"in":0},
-                     {"from":6,"out":0,"to":9,"in":0}]})"},
-        {"FSK packets with a length byte (CC1101 / SX127x FSK, 9600 Bd)", R"({"name":"FSK packets 9600","nodes":[
-            {"id":1,"type":"input","x":20,"y":30},
-            {"id":2,"type":"gate","x":240,"y":30,"params":{"thr":8,"mode":0}},
-            {"id":3,"type":"fm","x":480,"y":30},
-            {"id":4,"type":"slicer","x":700,"y":30,"params":{"baud":9600,"lv":0}},
-            {"id":5,"type":"map","x":940,"y":30,"params":{"m":0}},
-            {"id":6,"type":"sync","x":940,"y":170,"params":{"pat":"0xD391D391","err":2,"len":2100,"inv":1}},
-            {"id":7,"type":"lenpkt","x":700,"y":330,"params":{"skip":32,"lpos":0,"lsz":0,"add":2,"inc":0,"max":255}},
-            {"id":8,"type":"crc","x":940,"y":400,"params":{"p":5,"m":1,"w":16,"poly":"0x8005","init":"0xFFFF","xo":"0x0000","rf":0}},
-            {"id":9,"type":"fields","x":240,"y":560,"params":{"f":"len u8 @0; addr u8 @1; data hex 4 @2"}},
-            {"id":10,"type":"text","x":700,"y":620,"params":{"f":2}},
-            {"id":11,"type":"scope","x":240,"y":200,"params":{"ms":20,"mode":1,"src":1}}],
-            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
-                     {"from":4,"out":0,"to":5,"in":0},{"from":5,"out":0,"to":6,"in":0},{"from":6,"out":0,"to":7,"in":0},
-                     {"from":7,"out":0,"to":8,"in":0},{"from":8,"out":0,"to":9,"in":0},{"from":8,"out":0,"to":10,"in":0},
-                     {"from":3,"out":0,"to":11,"in":0}]})"},
-    };
-    return p;
+    static bool loaded = false;
+    if (!loaded) { loaded = true; reloadPresets(); }
+    return presetList();
 }
 
 // =====================================================================

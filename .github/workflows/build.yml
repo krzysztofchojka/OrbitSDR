@@ -66,7 +66,7 @@ jobs:
       - name: Create portable zip
         shell: pwsh
         run: |
-          Compress-Archive -Path orbitsdr.exe, *.dll, assets/bandplan.json, assets/orbitsdr.ini -DestinationPath "OrbitSDR_${env:FILE_TAG}_windows_x64_portable.zip"
+          Compress-Archive -Path orbitsdr.exe, *.dll, assets/bandplan.json, assets/orbitsdr.ini, assets/pipelines -DestinationPath "OrbitSDR_${env:FILE_TAG}_windows_x64_portable.zip"
 
       # 5. Installer (Inno Setup)
       - name: Build installer
@@ -188,7 +188,7 @@ jobs:
       - name: Create portable zip
         shell: pwsh
         run: |
-          Compress-Archive -Path orbitsdr.exe, *.dll, assets/bandplan.json, assets/orbitsdr.ini -DestinationPath "OrbitSDR_${env:FILE_TAG}_windows_arm64_portable.zip"
+          Compress-Archive -Path orbitsdr.exe, *.dll, assets/bandplan.json, assets/orbitsdr.ini, assets/pipelines -DestinationPath "OrbitSDR_${env:FILE_TAG}_windows_arm64_portable.zip"
 
       - name: Build installer
         shell: pwsh
@@ -320,6 +320,7 @@ jobs:
           cp orbitsdr OrbitSDR_Linux/OrbitSDR
           cp assets/icon.png OrbitSDR_Linux/ || true
           cp assets/bandplan.json OrbitSDR_Linux/ || true
+          cp -r assets/pipelines OrbitSDR_Linux/ || true   # the pipeline presets
           cp assets/orbitsdr.ini OrbitSDR_Linux/ || true
           cp LICENSE OrbitSDR_Linux/ || true
 
@@ -408,6 +409,7 @@ jobs:
           # 2. Copy Binary & resources
           cp orbitsdr OrbitSDR.app/Contents/MacOS/OrbitSDR
           cp assets/bandplan.json OrbitSDR.app/Contents/Resources/ || true
+          cp -r assets/pipelines OrbitSDR.app/Contents/Resources/ || true   # the pipeline presets
           cp assets/orbitsdr.ini OrbitSDR.app/Contents/Resources/ || true
           cp assets/icon.png OrbitSDR.app/Contents/Resources/ || true
 

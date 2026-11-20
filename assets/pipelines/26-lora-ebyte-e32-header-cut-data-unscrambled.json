@@ -1,0 +1,22 @@
+{
+  "preset": "LoRa EByte E32 (header cut, data unscrambled)",
+  "description": "An EByte E32 (SX1278) in transparent mode, as measured on an E32-433T20D: SF7 / 500 kHz, CR 4/6, LDRO on, a 32-symbol preamble. Its payload is an 8-byte header (2C 17, two check bytes, 00 00 00, the data length) and then the data XORed with 0x12.",
+  "name": "LoRa EByte E32",
+  "nodes": [
+    {"id": 1, "type": "input", "x": 20, "y": 30},
+    {"id": 2, "type": "lora", "x": 280, "y": 30, "params": {"sf": 0, "bw": 0, "sw": "any"}},
+    {"id": 3, "type": "slice", "x": 820, "y": 30, "params": {"from": 8, "n": 0}},
+    {"id": 4, "type": "xorbytes", "x": 820, "y": 150, "params": {"key": "0x12"}},
+    {"id": 5, "type": "text", "x": 820, "y": 270, "params": {"f": 0, "ts": 0}},
+    {"id": 6, "type": "text", "x": 280, "y": 470, "params": {"f": 1, "ts": 0}},
+    {"id": 7, "type": "waterfall", "x": 20, "y": 180, "params": {"range": 50}}
+  ],
+  "links": [
+    {"from": 1, "out": 0, "to": 2, "in": 0},
+    {"from": 2, "out": 0, "to": 3, "in": 0},
+    {"from": 3, "out": 0, "to": 4, "in": 0},
+    {"from": 4, "out": 0, "to": 5, "in": 0},
+    {"from": 2, "out": 0, "to": 6, "in": 0},
+    {"from": 1, "out": 0, "to": 7, "in": 0}
+  ]
+}

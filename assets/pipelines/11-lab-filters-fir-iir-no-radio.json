@@ -1,0 +1,27 @@
+{
+  "preset": "Lab: filters (FIR / IIR, no radio)",
+  "description": "Learning: a square wave plus noise through a designed FIR and an IIR, spectra side by side",
+  "name": "Lab filters",
+  "nodes": [
+    {"id": 1, "type": "input", "x": 20, "y": 600},
+    {"id": 2, "type": "srcreal", "x": 20, "y": 20, "params": {"rate": 48000, "w": 1, "f": 440, "a": 0.5}},
+    {"id": 3, "type": "noisereal", "x": 20, "y": 200, "params": {"rate": 48000, "a": 0.1}},
+    {"id": 4, "type": "add", "x": 250, "y": 20, "params": {"k": 1}},
+    {"id": 5, "type": "firdesign", "x": 480, "y": 20, "params": {"t": 0, "f1": 2000, "n": 101, "win": 1}},
+    {"id": 6, "type": "iir", "x": 480, "y": 300, "params": {"t": 6, "f": 2000, "ord": 4, "bt": 0}},
+    {"id": 7, "type": "spectrum", "x": 800, "y": 20},
+    {"id": 8, "type": "spectrum", "x": 800, "y": 300},
+    {"id": 9, "type": "scope", "x": 1200, "y": 20, "params": {"ms": 10, "mode": 0}},
+    {"id": 10, "type": "spectrum", "x": 1200, "y": 380}
+  ],
+  "links": [
+    {"from": 2, "out": 0, "to": 4, "in": 0},
+    {"from": 3, "out": 0, "to": 4, "in": 1},
+    {"from": 4, "out": 0, "to": 5, "in": 0},
+    {"from": 4, "out": 0, "to": 6, "in": 0},
+    {"from": 5, "out": 0, "to": 7, "in": 0},
+    {"from": 6, "out": 0, "to": 8, "in": 0},
+    {"from": 5, "out": 0, "to": 9, "in": 0},
+    {"from": 4, "out": 0, "to": 10, "in": 0}
+  ]
+}

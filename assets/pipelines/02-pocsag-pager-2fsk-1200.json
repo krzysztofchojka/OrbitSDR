@@ -1,0 +1,21 @@
+{
+  "preset": "POCSAG pager (2FSK 1200)",
+  "name": "POCSAG",
+  "nodes": [
+    {"id": 1, "type": "input", "x": 30, "y": 40},
+    {"id": 2, "type": "fm", "x": 250, "y": 40},
+    {"id": 3, "type": "slicer", "x": 480, "y": 40, "params": {"baud": 1200, "lv": 0}},
+    {"id": 4, "type": "map", "x": 740, "y": 40, "params": {"m": 1}},
+    {"id": 5, "type": "sync", "x": 740, "y": 170, "params": {"pat": "0x7CD215D8", "err": 2, "len": 512, "inv": 1}},
+    {"id": 6, "type": "bits", "x": 1000, "y": 40, "params": {"fmt": 1}},
+    {"id": 7, "type": "scope", "x": 250, "y": 200, "params": {"ms": 30, "mode": 0}}
+  ],
+  "links": [
+    {"from": 1, "out": 0, "to": 2, "in": 0},
+    {"from": 2, "out": 0, "to": 3, "in": 0},
+    {"from": 3, "out": 0, "to": 4, "in": 0},
+    {"from": 4, "out": 0, "to": 5, "in": 0},
+    {"from": 5, "out": 0, "to": 6, "in": 0},
+    {"from": 2, "out": 0, "to": 7, "in": 0}
+  ]
+}

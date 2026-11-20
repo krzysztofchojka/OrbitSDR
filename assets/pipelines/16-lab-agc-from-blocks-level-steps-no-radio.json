@@ -1,0 +1,34 @@
+{
+  "preset": "Lab: AGC from blocks (level steps, no radio)",
+  "description": "An AGC from control blocks: a tone whose level steps 0.1 <-> 1 is multiplied by a gain; |y| is compared with the target 0.5 and an integrator (PID with Ki only) sets the gain through z^-16. Faster on strong signals (the loop gain grows with the level)",
+  "name": "Lab AGC from blocks",
+  "nodes": [
+    {"id": 1, "type": "input", "x": 20, "y": 660},
+    {"id": 2, "type": "srciq", "x": 20, "y": 20, "params": {"rate": 48000, "f": 1000, "a": 1}},
+    {"id": 3, "type": "srcreal", "x": 20, "y": 200, "params": {"rate": 48000, "w": 1, "f": 0.5, "a": 0.45, "off": 0.55}},
+    {"id": 4, "type": "mul", "x": 290, "y": 20, "params": {"k": 1}},
+    {"id": 5, "type": "mul", "x": 520, "y": 20, "params": {"k": 1}},
+    {"id": 6, "type": "mag", "x": 750, "y": 20, "params": {"m": 0}},
+    {"id": 7, "type": "srcreal", "x": 750, "y": 200, "params": {"rate": 48000, "w": 4, "a": 0.5}},
+    {"id": 8, "type": "sub", "x": 980, "y": 20, "params": {"k": 1}},
+    {"id": 9, "type": "pid", "x": 1210, "y": 20, "params": {"kp": 0, "ki": 200, "kd": 0, "nf": 100, "lo": 0, "hi": 100}},
+    {"id": 10, "type": "delay", "x": 980, "y": 330, "params": {"n": 16}},
+    {"id": 11, "type": "mag", "x": 290, "y": 420, "params": {"m": 0}},
+    {"id": 12, "type": "scope", "x": 520, "y": 420, "params": {"ms": 2000, "mode": 1, "src": 0, "lvl": 0.5, "tch": 1, "scale": 1}}
+  ],
+  "links": [
+    {"from": 2, "out": 0, "to": 4, "in": 0},
+    {"from": 3, "out": 0, "to": 4, "in": 1},
+    {"from": 4, "out": 0, "to": 5, "in": 0},
+    {"from": 10, "out": 0, "to": 5, "in": 1},
+    {"from": 5, "out": 0, "to": 6, "in": 0},
+    {"from": 7, "out": 0, "to": 8, "in": 0},
+    {"from": 6, "out": 0, "to": 8, "in": 1},
+    {"from": 8, "out": 0, "to": 9, "in": 0},
+    {"from": 9, "out": 0, "to": 10, "in": 0},
+    {"from": 4, "out": 0, "to": 11, "in": 0},
+    {"from": 11, "out": 0, "to": 12, "in": 0},
+    {"from": 6, "out": 0, "to": 12, "in": 1},
+    {"from": 9, "out": 0, "to": 12, "in": 2}
+  ]
+}

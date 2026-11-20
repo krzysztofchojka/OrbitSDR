@@ -1,0 +1,20 @@
+{
+  "preset": "WEFAX radiofax (120 LPM, IOC 576)",
+  "description": "HF radiofax: the Analyzer channel on the fax signal's centre (dial + 1.9 kHz on USB), ~3 kHz wide; FM of the tone: -400 Hz black, +400 Hz white",
+  "name": "WEFAX",
+  "nodes": [
+    {"id": 1, "type": "input", "x": 20, "y": 30},
+    {"id": 2, "type": "fm", "x": 250, "y": 30},
+    {"id": 3, "type": "rlowpass", "x": 480, "y": 30, "params": {"cut": 1500}},
+    {"id": 4, "type": "raster", "x": 710, "y": 30, "params": {"lpm": 120, "width": 1809, "black": -400, "white": 400, "start": 1, "tstart": 300, "tstop": 450}},
+    {"id": 5, "type": "image", "x": 20, "y": 250},
+    {"id": 6, "type": "scope", "x": 980, "y": 30, "params": {"ms": 500, "mode": 0}}
+  ],
+  "links": [
+    {"from": 1, "out": 0, "to": 2, "in": 0},
+    {"from": 2, "out": 0, "to": 3, "in": 0},
+    {"from": 3, "out": 0, "to": 4, "in": 0},
+    {"from": 4, "out": 0, "to": 5, "in": 0},
+    {"from": 3, "out": 0, "to": 6, "in": 0}
+  ]
+}

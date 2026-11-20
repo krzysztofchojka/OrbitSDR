@@ -1,0 +1,24 @@
+{
+  "preset": "NOAA APT (137 MHz, analog)",
+  "description": "NOAA APT (NOAA 15 / 18 / 19, 137.62 / 137.9125 / 137.1 MHz): FM, a 2400 Hz AM subcarrier, 2 lines a second of 2080 pixels (4160 / s): sync A, image A (visible / IR), telemetry, sync B, image B (IR), telemetry. Orange channel ~40 kHz wide.",
+  "name": "NOAA APT",
+  "nodes": [
+    {"id": 1, "type": "input", "x": 20, "y": 30},
+    {"id": 2, "type": "fm", "x": 250, "y": 30},
+    {"id": 3, "type": "hilbert", "x": 480, "y": 30},
+    {"id": 4, "type": "mag", "x": 710, "y": 30, "params": {"m": 0}},
+    {"id": 5, "type": "linesync", "x": 940, "y": 30, "params": {"width": 2080, "lps": 2, "min": 0.5, "lev": 0}},
+    {"id": 6, "type": "image", "x": 940, "y": 330},
+    {"id": 7, "type": "spectrum", "x": 250, "y": 250},
+    {"id": 8, "type": "scope", "x": 250, "y": 450, "params": {"ms": 500, "mode": 0}}
+  ],
+  "links": [
+    {"from": 1, "out": 0, "to": 2, "in": 0},
+    {"from": 2, "out": 0, "to": 3, "in": 0},
+    {"from": 3, "out": 0, "to": 4, "in": 0},
+    {"from": 4, "out": 0, "to": 5, "in": 0},
+    {"from": 5, "out": 0, "to": 6, "in": 0},
+    {"from": 2, "out": 0, "to": 7, "in": 0},
+    {"from": 4, "out": 0, "to": 8, "in": 0}
+  ]
+}

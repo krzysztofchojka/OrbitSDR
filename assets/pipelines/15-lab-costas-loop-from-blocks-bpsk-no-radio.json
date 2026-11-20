@@ -1,0 +1,41 @@
+{
+  "preset": "Lab: Costas loop from blocks (BPSK, no radio)",
+  "description": "A Costas loop from control blocks: BPSK (a square as data) on a carrier 30 Hz off, with noise. y = x * conj(v); error I * Q; PI; VCO; z^-8. The PI output shows the carrier offset it found; the constellation turns from a ring into two points",
+  "name": "Lab Costas from blocks",
+  "nodes": [
+    {"id": 1, "type": "input", "x": 20, "y": 700},
+    {"id": 2, "type": "srcreal", "x": 20, "y": 20, "params": {"rate": 48000, "w": 1, "f": 100, "a": 1}},
+    {"id": 3, "type": "r2c", "x": 20, "y": 200},
+    {"id": 4, "type": "srciq", "x": 20, "y": 330, "params": {"rate": 48000, "f": 30, "a": 1}},
+    {"id": 5, "type": "mul", "x": 290, "y": 200, "params": {"k": 1}},
+    {"id": 6, "type": "noiseiq", "x": 290, "y": 330, "params": {"rate": 48000, "a": 0.1}},
+    {"id": 7, "type": "add", "x": 520, "y": 200, "params": {"k": 1}},
+    {"id": 8, "type": "mulconj", "x": 750, "y": 20, "params": {"k": 1}},
+    {"id": 9, "type": "c2r", "x": 980, "y": 20},
+    {"id": 10, "type": "mul", "x": 1210, "y": 20, "params": {"k": 1}},
+    {"id": 11, "type": "pid", "x": 1210, "y": 170, "params": {"kp": 14.1, "ki": 628, "kd": 0, "nf": 100}},
+    {"id": 12, "type": "fmmod", "x": 980, "y": 330, "params": {"dev": 1}},
+    {"id": 13, "type": "delay", "x": 750, "y": 330, "params": {"n": 8}},
+    {"id": 14, "type": "constel", "x": 520, "y": 420},
+    {"id": 15, "type": "constel", "x": 980, "y": 470},
+    {"id": 16, "type": "probe", "x": 1440, "y": 170}
+  ],
+  "links": [
+    {"from": 2, "out": 0, "to": 3, "in": 0},
+    {"from": 3, "out": 0, "to": 5, "in": 0},
+    {"from": 4, "out": 0, "to": 5, "in": 1},
+    {"from": 5, "out": 0, "to": 7, "in": 0},
+    {"from": 6, "out": 0, "to": 7, "in": 1},
+    {"from": 7, "out": 0, "to": 8, "in": 0},
+    {"from": 13, "out": 0, "to": 8, "in": 1},
+    {"from": 8, "out": 0, "to": 9, "in": 0},
+    {"from": 9, "out": 0, "to": 10, "in": 0},
+    {"from": 9, "out": 1, "to": 10, "in": 1},
+    {"from": 10, "out": 0, "to": 11, "in": 0},
+    {"from": 11, "out": 0, "to": 12, "in": 0},
+    {"from": 12, "out": 0, "to": 13, "in": 0},
+    {"from": 7, "out": 0, "to": 14, "in": 0},
+    {"from": 8, "out": 0, "to": 15, "in": 0},
+    {"from": 11, "out": 0, "to": 16, "in": 0}
+  ]
+}

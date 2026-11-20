@@ -1,0 +1,19 @@
+{
+  "preset": "Single-shot capture (scope + spectrum)",
+  "name": "Single-shot capture",
+  "nodes": [
+    {"id": 1, "type": "input", "x": 30, "y": 40},
+    {"id": 2, "type": "gate", "x": 250, "y": 40, "params": {"mode": 1}},
+    {"id": 3, "type": "fm", "x": 520, "y": 40},
+    {"id": 4, "type": "scope", "x": 760, "y": 40, "params": {"ms": 100, "mode": 2, "src": 1}},
+    {"id": 5, "type": "spectrum", "x": 250, "y": 260},
+    {"id": 6, "type": "constel", "x": 760, "y": 330}
+  ],
+  "links": [
+    {"from": 1, "out": 0, "to": 2, "in": 0},
+    {"from": 2, "out": 0, "to": 3, "in": 0},
+    {"from": 3, "out": 0, "to": 4, "in": 0},
+    {"from": 2, "out": 0, "to": 5, "in": 0},
+    {"from": 2, "out": 0, "to": 6, "in": 0}
+  ]
+}

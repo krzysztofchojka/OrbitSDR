@@ -4491,3 +4491,6 @@ int main() {
 
     return 0;
 }
+
+// The Lua interpreter of the pipelines' Script block (compiled here, last: its macros reach no other code)
+#include "modules/Analyzer/LuaImpl.h"

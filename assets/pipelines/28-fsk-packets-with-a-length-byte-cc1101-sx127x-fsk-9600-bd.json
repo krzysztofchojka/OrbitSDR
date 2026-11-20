@@ -1,0 +1,29 @@
+{
+  "preset": "FSK packets with a length byte (CC1101 / SX127x FSK, 9600 Bd)",
+  "name": "FSK packets 9600",
+  "nodes": [
+    {"id": 1, "type": "input", "x": 20, "y": 30},
+    {"id": 2, "type": "gate", "x": 240, "y": 30, "params": {"thr": 8, "mode": 0}},
+    {"id": 3, "type": "fm", "x": 480, "y": 30},
+    {"id": 4, "type": "slicer", "x": 700, "y": 30, "params": {"baud": 9600, "lv": 0}},
+    {"id": 5, "type": "map", "x": 940, "y": 30, "params": {"m": 0}},
+    {"id": 6, "type": "sync", "x": 940, "y": 170, "params": {"pat": "0xD391D391", "err": 2, "len": 2100, "inv": 1}},
+    {"id": 7, "type": "lenpkt", "x": 700, "y": 330, "params": {"skip": 32, "lpos": 0, "lsz": 0, "add": 2, "inc": 0, "max": 255}},
+    {"id": 8, "type": "crc", "x": 940, "y": 400, "params": {"p": 5, "m": 1, "w": 16, "poly": "0x8005", "init": "0xFFFF", "xo": "0x0000", "rf": 0}},
+    {"id": 9, "type": "fields", "x": 240, "y": 560, "params": {"f": "len u8 @0; addr u8 @1; data hex 4 @2"}},
+    {"id": 10, "type": "text", "x": 700, "y": 620, "params": {"f": 2}},
+    {"id": 11, "type": "scope", "x": 240, "y": 200, "params": {"ms": 20, "mode": 1, "src": 1}}
+  ],
+  "links": [
+    {"from": 1, "out": 0, "to": 2, "in": 0},
+    {"from": 2, "out": 0, "to": 3, "in": 0},
+    {"from": 3, "out": 0, "to": 4, "in": 0},
+    {"from": 4, "out": 0, "to": 5, "in": 0},
+    {"from": 5, "out": 0, "to": 6, "in": 0},
+    {"from": 6, "out": 0, "to": 7, "in": 0},
+    {"from": 7, "out": 0, "to": 8, "in": 0},
+    {"from": 8, "out": 0, "to": 9, "in": 0},
+    {"from": 8, "out": 0, "to": 10, "in": 0},
+    {"from": 3, "out": 0, "to": 11, "in": 0}
+  ]
+}

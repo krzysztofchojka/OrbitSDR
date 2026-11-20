@@ -1,0 +1,23 @@
+{
+  "preset": "FSK data -> bits (4FSK 4800)",
+  "name": "FSK data -> bits",
+  "nodes": [
+    {"id": 1, "type": "input", "x": 30, "y": 40},
+    {"id": 2, "type": "gate", "x": 250, "y": 40, "params": {"thr": 8, "mode": 0}},
+    {"id": 3, "type": "fm", "x": 520, "y": 40},
+    {"id": 4, "type": "slicer", "x": 760, "y": 40, "params": {"baud": 4800, "lv": 1}},
+    {"id": 5, "type": "map", "x": 1000, "y": 40, "params": {"m": 2}},
+    {"id": 6, "type": "bits", "x": 760, "y": 420, "params": {"fmt": 1, "len": 256}},
+    {"id": 7, "type": "scope", "x": 330, "y": 200, "params": {"ms": 20, "mode": 1, "src": 1}},
+    {"id": 8, "type": "analyzer", "x": 30, "y": 540}
+  ],
+  "links": [
+    {"from": 1, "out": 0, "to": 2, "in": 0},
+    {"from": 2, "out": 0, "to": 3, "in": 0},
+    {"from": 3, "out": 0, "to": 4, "in": 0},
+    {"from": 4, "out": 0, "to": 5, "in": 0},
+    {"from": 5, "out": 0, "to": 6, "in": 0},
+    {"from": 3, "out": 0, "to": 7, "in": 0},
+    {"from": 1, "out": 0, "to": 8, "in": 0}
+  ]
+}

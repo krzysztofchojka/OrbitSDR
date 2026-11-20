@@ -1,0 +1,26 @@
+{
+  "preset": "Lab: control loop (PID, step response, no radio)",
+  "description": "Control engineering: unit steps (square 0 -> 1 -> 0 every 20 s) into a PID loop around G(s) = 1 / (s+1)^3, the same G(s) open loop for comparison, metrics of the response",
+  "name": "Lab control loop",
+  "nodes": [
+    {"id": 1, "type": "input", "x": 20, "y": 620},
+    {"id": 2, "type": "srcreal", "x": 20, "y": 20, "params": {"rate": 1000, "w": 1, "f": 0.025, "a": 0.5, "off": 0.5}},
+    {"id": 3, "type": "loop", "x": 290, "y": 20, "params": {"num": "1", "den": "1, 3, 3, 1", "kp": 2, "ki": 1, "kd": 0.5, "nf": 100, "h": 1}},
+    {"id": 4, "type": "tf", "x": 290, "y": 470, "params": {"num": "1", "den": "1, 3, 3, 1"}},
+    {"id": 5, "type": "scope", "x": 720, "y": 20, "params": {"ms": 20000, "mode": 1, "src": 0, "lvl": 0.5, "tch": 1, "scale": 0}},
+    {"id": 6, "type": "stepinfo", "x": 720, "y": 380},
+    {"id": 7, "type": "scope", "x": 1150, "y": 20, "params": {"ms": 20000, "mode": 1, "src": 0, "lvl": 0.5, "tch": 1, "scale": 1}}
+  ],
+  "links": [
+    {"from": 2, "out": 0, "to": 3, "in": 0},
+    {"from": 2, "out": 0, "to": 4, "in": 0},
+    {"from": 2, "out": 0, "to": 5, "in": 0},
+    {"from": 3, "out": 0, "to": 5, "in": 1},
+    {"from": 4, "out": 0, "to": 5, "in": 2},
+    {"from": 2, "out": 0, "to": 6, "in": 0},
+    {"from": 3, "out": 0, "to": 6, "in": 1},
+    {"from": 2, "out": 0, "to": 7, "in": 0},
+    {"from": 3, "out": 1, "to": 7, "in": 1},
+    {"from": 3, "out": 2, "to": 7, "in": 2}
+  ]
+}

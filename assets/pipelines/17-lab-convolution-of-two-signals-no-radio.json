@@ -1,0 +1,23 @@
+{
+  "preset": "Lab: convolution of two signals (no radio)",
+  "description": "Convolution of two signals: a square wave convolved with one period of a positive triangle (held): the edges come out rounded (a smoothing kernel); below the same as a correlation (the kernel reversed)",
+  "name": "Lab convolution",
+  "nodes": [
+    {"id": 1, "type": "input", "x": 20, "y": 560},
+    {"id": 2, "type": "srcreal", "x": 20, "y": 20, "params": {"rate": 48000, "w": 1, "f": 50, "a": 1}},
+    {"id": 3, "type": "srcreal", "x": 20, "y": 250, "params": {"rate": 48000, "w": 2, "f": 200, "a": 0.5, "off": 0.5}},
+    {"id": 4, "type": "conv", "x": 300, "y": 20, "params": {"n": 240, "src": 1, "op": 0, "sc": 1}},
+    {"id": 5, "type": "conv", "x": 300, "y": 330, "params": {"n": 240, "src": 1, "op": 1, "sc": 1}},
+    {"id": 6, "type": "scope", "x": 700, "y": 20, "params": {"ms": 60, "mode": 0, "src": 0, "lvl": 0, "tch": 1, "scale": 1}}
+  ],
+  "links": [
+    {"from": 2, "out": 0, "to": 4, "in": 0},
+    {"from": 3, "out": 0, "to": 4, "in": 1},
+    {"from": 2, "out": 0, "to": 5, "in": 0},
+    {"from": 3, "out": 0, "to": 5, "in": 1},
+    {"from": 2, "out": 0, "to": 6, "in": 0},
+    {"from": 3, "out": 0, "to": 6, "in": 1},
+    {"from": 4, "out": 0, "to": 6, "in": 2},
+    {"from": 5, "out": 0, "to": 6, "in": 3}
+  ]
+}
