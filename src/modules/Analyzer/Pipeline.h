@@ -20,6 +20,7 @@
 #include <random>
 #include <array>
 #include <ctime>
+#include <chrono>
 #include <cstring>
 #include "../../DSP.h"
 #include "../../orbit/Json.h"
@@ -204,6 +205,8 @@ public:
     bool isInput = false;          // a Channel input (filled by the workspace, not processed)
     bool syncInputs = false;       // its sample inputs are lined up (same length, same rate) before process()
     std::string note;              // set by the pipeline: e.g. an input converted to another rate (shown amber)
+    double cpu = 0.0;              // the share of real time its work takes (smoothed; set by the pipeline)
+    double cpuAcc = 0.0;           // (seconds of work since the last update)
 
     // A dynamic choice list (receivers, sound cards) read again; the chosen entry stays chosen
     // by name, and one that went away stays in the list marked "(not available)"
@@ -828,7 +831,7 @@ public:
     SyncBlock() { type = "sync"; title = "Frame sync"; category = "Bits"; ins = {{"bits", PT::Sym}}; setOuts({{"frames", PT::Sym}});
                   addText("pat", "Sync word (0x.. or bits)", "0x7CD215D8");
                   addNum("err", "Max. wrong bits", 2, 0, 16, 1, "");
-                  addNum("len", "Frame length after it", 512, 0, 100000, 8, "bits");
+                  addNum("len", "Frame length after it", 512, 0, 10000000, 8, "bits");
                   addChoice("inv", "Inverted word too", {"no", "yes (and invert the frame)"}); }
     std::string status() const override {
         char b[96];
@@ -1308,6 +1311,8 @@ public:
 
 #include "PipelineControl.h"  // convolution of two signals; control: G(s), PID, closed loop, step metrics
 
+#include "PipelineSat.h"      // pictures: analog lines by a sync pattern, image lines from frames
+
 // ---------------------------------------------------------------------
 //  Registry: the palette lists the blocks in this order, grouped by category
 // ---------------------------------------------------------------------
@@ -1355,7 +1360,8 @@ inline const std::vector<BlockInfo>& blockList() {
         {"crc", "CRC check / append", "Frames"}, {"slice", "Bytes of a frame (from, count)", "Frames"}, {"rs", "Reed-Solomon (255,223)", "Frames"},
         {"ccsds", "CCSDS packets (from VCDU)", "Frames"}, {"msumr", "Meteor MSU-MR image", "Frames"},
         // pictures
-        {"raster", "Raster lines", "Image"},
+        {"raster", "Raster lines", "Image"}, {"linesync", "Line sync (pattern) -> lines", "Image"},
+        {"framelines", "Frame -> image line (N-bit samples)", "Image"},
         // control engineering
         {"tf", "Transfer function G(s)", "Control"}, {"pid", "PID controller", "Control"},
         {"loop", "Closed loop (PID + G(s))", "Control"}, {"stepinfo", "Step response (metrics)", "Control"},
@@ -1461,6 +1467,8 @@ inline const char* blockTags(const std::string& t) {
         {"rs", "reed solomon fec error correction ccsds 255 223 korekcja bledow satellite satelita"},
         {"ccsds", "ccsds vcdu mpdu packets space protocol satellite telemetry pakiety satelita telemetria"},
         {"msumr", "meteor msu mr image jpeg lrpt satellite picture weather obraz satelita pogoda"},
+        {"linesync", "line sync pattern apt noaa analog image lines correlate sync a slant weather satellite obraz synchronizacja linii satelita pogodowy"},
+        {"framelines", "frame to image line pixels words 10 bit samples hrpt avhrr noaa meteor metop ahrpt fengyun channel interleave obraz ramka piksele kanal"},
         {"raster", "raster image lines wefax apt fax picture scan obraz linie"},
         {"scope", "oscilloscope scope time domain waveform plot oscyloskop przebieg czas"},
         {"spectrum", "spectrum fft frequency domain psd analyzer widmo czestotliwosc analizator"},
@@ -1523,6 +1531,8 @@ inline std::unique_ptr<Block> makeBlockRaw(const std::string& t) {
     if (t == "ccsds") return std::make_unique<CcsdsPackets>();
     if (t == "msumr") return std::make_unique<MsuMrBlock>();
     if (t == "raster") return std::make_unique<RasterBlock>();
+    if (t == "linesync") return std::make_unique<LineSyncBlock>();
+    if (t == "framelines") return std::make_unique<FrameLinesBlock>();
     if (t == "image") return std::make_unique<ImageView>();
     if (t == "ax25") return std::make_unique<Ax25View>();
     if (t == "framesview") return std::make_unique<FramesView>();
@@ -1780,10 +1790,19 @@ public:
                 Block* src = find(lk.from);
                 return src && lk.out < (int)src->out.size() ? &src->out[lk.out] : nullptr;
             });
+            const auto t0 = std::chrono::steady_clock::now();
             if (b->syncInputs) lineUp(b, ins);
             b->process(ins);
+            b->cpuAcc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        }
+        // the blocks' share of real time, about twice a second
+        cpuSignal += tick;
+        if (cpuSignal >= 0.5) {
+            for (auto& n : nodes) { n->cpu = n->cpu * 0.5 + 0.5 * n->cpuAcc / cpuSignal; n->cpuAcc = 0.0; }
+            cpuSignal = 0.0;
         }
     }
+    double cpuSignal = 0.0;   // seconds of signal since the CPU shares were updated
 
     // The inputs of b, checked for their kind; `source` gives the stream behind a wire
     template <typename F>
@@ -1884,10 +1903,12 @@ public:
             const size_t len = std::min(S, L - pos);
             for (size_t k = 0; k < delays.size(); k++) { delays[k]->tick = len / R; delays[k]->loopEmit(len, dType[k], R); }
             for (Block* b : others) {
+                const auto t0 = std::chrono::steady_clock::now();
                 b->tick = len / R;
                 gather(b, ins, [&](const Link& lk) { return source(b, lk, pos, len); });
                 if (b->syncInputs) lineUp(b, ins);
                 b->process(ins);
+                b->cpuAcc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             }
             for (Block* d : delays) {
                 const Link* lk = linkInto(d->id, 0);
@@ -2238,6 +2259,56 @@ inline const std::vector<Preset>& presets() {
                      {"from":10,"out":0,"to":11,"in":0},{"from":11,"out":0,"to":12,"in":0},{"from":12,"out":0,"to":13,"in":0},
                      {"from":13,"out":0,"to":14,"in":0},{"from":14,"out":0,"to":15,"in":0},{"from":14,"out":0,"to":16,"in":0},
                      {"from":15,"out":0,"to":17,"in":0},{"from":16,"out":0,"to":18,"in":0}]})"},
+        // NOAA APT (NOAA 15 / 18 / 19, 137.62 / 137.9125 / 137.1 MHz): FM, a 2400 Hz AM subcarrier,
+        // 2 lines a second of 2080 pixels (4160 / s): sync A, image A (visible / IR), telemetry,
+        // sync B, image B (IR), telemetry. Orange channel ~40 kHz wide.
+        {"NOAA APT (137 MHz, analog)", R"({"name":"NOAA APT","nodes":[
+            {"id":1,"type":"input","x":20,"y":30},
+            {"id":2,"type":"fm","x":250,"y":30},
+            {"id":3,"type":"hilbert","x":480,"y":30},
+            {"id":4,"type":"mag","x":710,"y":30,"params":{"m":0}},
+            {"id":5,"type":"linesync","x":940,"y":30,"params":{"width":2080,"lps":2,"min":0.5,"lev":0}},
+            {"id":6,"type":"image","x":940,"y":330},
+            {"id":7,"type":"spectrum","x":250,"y":250},
+            {"id":8,"type":"scope","x":250,"y":450,"params":{"ms":500,"mode":0}}],
+            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
+                     {"from":4,"out":0,"to":5,"in":0},{"from":5,"out":0,"to":6,"in":0},{"from":2,"out":0,"to":7,"in":0},
+                     {"from":4,"out":0,"to":8,"in":0}]})"},
+        // NOAA HRPT (1698 / 1702.5 / 1707 MHz): PM +-67 deg with a residual carrier, Manchester
+        // (split-phase) 665.4 kbps. Carrier PLL from blocks (x * conj(v) -> phase -> PI -> VCO ->
+        // z^-64, wn = 2 pi 500 rad/s) with FLL help for large offsets (Doppler, the radio's ppm):
+        // the frequency of x * conj(v) (FM demodulator, averaged over 512 samples) x 1e-4 is
+        // added to the phase error. The phase is the data; clock at 1.3308 Mchip/s; Manchester;
+        // minor frames of 11090 10-bit words with a 60-bit sync; AVHRR from word 750, five
+        // channels interleaved, 2048 pixels (here channels 2 and 4). Orange channel ~1.6 MHz wide
+        // (the radio at >= 3.2 MS/s).
+        {"NOAA HRPT (1.7 GHz, 665.4 kbps)", R"({"name":"NOAA HRPT","nodes":[
+            {"id":1,"type":"input","x":20,"y":30},
+            {"id":2,"type":"mulconj","x":250,"y":30,"params":{"k":1}},
+            {"id":3,"type":"c2r","x":480,"y":30},
+            {"id":4,"type":"pid","x":940,"y":470,"params":{"kp":707,"ki":1571000,"kd":0,"nf":100,"lo":-200000,"hi":200000}},
+            {"id":16,"type":"fm","x":250,"y":250},
+            {"id":17,"type":"movavg","x":250,"y":400,"params":{"n":512}},
+            {"id":18,"type":"affine","x":480,"y":400,"params":{"k":0.0001,"c":0}},
+            {"id":19,"type":"add","x":710,"y":400,"params":{"k":1}},
+            {"id":5,"type":"fmmod","x":940,"y":620,"params":{"dev":1}},
+            {"id":6,"type":"delay","x":480,"y":620,"params":{"n":64}},
+            {"id":7,"type":"symsync","x":940,"y":30,"params":{"baud":1330800,"gain":0.1}},
+            {"id":8,"type":"decide","x":1170,"y":30,"params":{"lv":2,"th":1,"t":"0"}},
+            {"id":9,"type":"manch","x":1400,"y":30,"params":{"m":0}},
+            {"id":10,"type":"sync","x":940,"y":250,"params":{"pat":"101000010001011011111101011100011001110100001000001111001101","err":6,"len":110840,"inv":1}},
+            {"id":11,"type":"framelines","x":1170,"y":250,"params":{"nb":10,"first":751,"stride":5,"count":2048,"lev":0}},
+            {"id":12,"type":"image","x":1170,"y":470},
+            {"id":13,"type":"framelines","x":1640,"y":250,"params":{"nb":10,"first":753,"stride":5,"count":2048,"lev":0}},
+            {"id":14,"type":"image","x":1640,"y":470},
+            {"id":15,"type":"constel","x":20,"y":250,"params":{"dec":16}}],
+            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":6,"out":0,"to":2,"in":1},{"from":2,"out":0,"to":3,"in":0},
+                     {"from":2,"out":0,"to":16,"in":0},{"from":16,"out":0,"to":17,"in":0},{"from":17,"out":0,"to":18,"in":0},
+                     {"from":3,"out":3,"to":19,"in":0},{"from":18,"out":0,"to":19,"in":1},
+                     {"from":19,"out":0,"to":4,"in":0},{"from":4,"out":0,"to":5,"in":0},{"from":5,"out":0,"to":6,"in":0},
+                     {"from":3,"out":3,"to":7,"in":0},{"from":7,"out":0,"to":8,"in":0},{"from":8,"out":0,"to":9,"in":0},
+                     {"from":9,"out":0,"to":10,"in":0},{"from":10,"out":0,"to":11,"in":0},{"from":11,"out":0,"to":12,"in":0},
+                     {"from":10,"out":0,"to":13,"in":0},{"from":13,"out":0,"to":14,"in":0},{"from":2,"out":0,"to":15,"in":0}]})"},
         // Learning, no radio needed (the sources run on their own): an AX.25 / AFSK 1200 modem
         // built from basic blocks, transmitter and receiver, with a noisy channel between them
         {"Lab: AFSK 1200 modem loopback (no radio)", R"({"name":"Lab AFSK loopback","nodes":[

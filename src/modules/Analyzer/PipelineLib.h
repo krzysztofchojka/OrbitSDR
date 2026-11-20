@@ -942,7 +942,12 @@ public:
         passOn(in[0], o, PT::IQ, in[0] ? in[0]->rate : 0);
         if (!in[0] || in[0]->rate <= 0) return;
         const double k = 2 * PI_D * num("dev") / in[0]->rate;
-        for (float x : in[0]->re) { ph += k * x; if (ph > PI_D) ph -= 2 * PI_D; else if (ph < -PI_D) ph += 2 * PI_D; o.iq.push_back(std::polar(1.0f, (float)ph)); }
+        o.iq.reserve(in[0]->re.size());
+        for (float x : in[0]->re) {
+            ph += k * x;
+            if (ph > PI_D || ph < -PI_D) ph = std::remainder(ph, 2 * PI_D);   // (any step size: also above half a turn)
+            o.iq.push_back(std::polar(1.0f, (float)ph));
+        }
     }
 };
 

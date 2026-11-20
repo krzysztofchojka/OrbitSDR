@@ -870,9 +870,16 @@ public:
                 d.rect(g.head, sf::Color(cc.r / 2, cc.g / 2, cc.b / 2), sf::Color::Transparent);
                 d.rect(sf::FloatRect(g.head.position, {4, HEAD}), cc);
                 {
+                    // the share of real time this block's work takes, when it is worth knowing
+                    std::string cpuTxt;
+                    if (b.cpu >= 0.01) { char cb[24]; std::snprintf(cb, sizeof(cb), "%.0f %%", b.cpu * 100.0); cpuTxt = cb; }
+                    const float cw = cpuTxt.empty() ? 0.0f : measure(cpuTxt, 10) + 8;
                     std::string t = b.title;
-                    while (t.size() > 3 && measure(t, 12) > g.head.size.x - 34) t.pop_back();
+                    while (t.size() > 3 && measure(t, 12) > g.head.size.x - 34 - cw) t.pop_back();
                     d.text(t, g.head.position.x + 10, g.head.position.y + 4, 12, sf::Color::White);
+                    if (!cpuTxt.empty())
+                        d.text(cpuTxt, g.head.position.x + g.head.size.x - 22 - cw, g.head.position.y + 5, 10,
+                               b.cpu > 0.5 ? sf::Color(255, 110, 110) : b.cpu > 0.2 ? sf::Color(255, 200, 90) : sf::Color(170, 190, 170));
                 }
                 if (b.removable) {
                     const bool hot = hover.node == b.id && hover.kind == 1 && mouseC.x > g.head.position.x + g.head.size.x - 20;

@@ -407,9 +407,9 @@ public:
     PidBlock() {
         type = "pid"; title = "PID controller"; category = "Control";
         ins = {{"e", PT::Real}}; setOuts({{"u", PT::Real}});
-        addNum("kp", "Kp", 1, -1e6, 1e6, 0.1, "", 3);
-        addNum("ki", "Ki", 0, -1e6, 1e6, 0.1, "1/s", 3);
-        addNum("kd", "Kd", 0, -1e6, 1e6, 0.01, "s", 3);
+        addNum("kp", "Kp", 1, -1e9, 1e9, 0.1, "", 3);
+        addNum("ki", "Ki", 0, -1e12, 1e12, 0.1, "1/s", 3);
+        addNum("kd", "Kd", 0, -1e9, 1e9, 0.01, "s", 3);
         addNum("nf", "Derivative filter N", 100, 0.1, 1e6, 10, "rad/s", 1);
         addNum("lo", "Output min", -1e6, -1e9, 1e9, 1, "", 2);
         addNum("hi", "Output max", 1e6, -1e9, 1e9, 1, "", 2);
