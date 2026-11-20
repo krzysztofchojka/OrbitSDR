@@ -891,10 +891,20 @@ class ScopeBlock : public Block {
     double rate = 0.0;               // of the triggering channel
     int trigCh = 0;
     bool singleDone = false;
+    // Slow sweeps (a span of half a second or more, the control labs use 20 s) are drawn while
+    // they are captured, left to right, like a real scope's slow time base: the capture would
+    // otherwise appear only when it is complete, many seconds after the trigger. Before the
+    // first trigger the input rolls in. showFrac: how much of the width the shown samples fill
+    // (1 = a whole capture).
+    float showFrac = 1.0f;
+    bool everTriggered = false;
 
-    // Shows the last `need` samples of every channel, ending at sample i (of nT) of the
-    // triggering channel's block; the other channels end at the same moment of theirs
-    void snapshot(const std::vector<const Stream*>& in, size_t i, size_t nT) {
+    // Shows the last `need` samples of every channel (frac < 1: that share of them), ending at
+    // sample i (of nT) of the triggering channel's block; the other channels end at the same
+    // moment of theirs
+    void snapshot(const std::vector<const Stream*>& in, size_t i, size_t nT, double frac = 1.0) {
+        frac = std::clamp(frac, 0.0, 1.0);
+        showFrac = (float)frac;
         for (size_t k = 0; k < ch.size(); k++) {
             Ch& c = ch[k];
             c.showA.clear(); c.showB.clear();
@@ -906,7 +916,7 @@ class ScopeBlock : public Block {
                 drop = nk - std::min(nk, upto);
             }
             const size_t end = c.a.size() - std::min(drop, c.a.size());
-            const size_t n = std::min(c.need, end);
+            const size_t n = std::min((size_t)std::llround(c.need * frac), end);
             c.showA.assign(c.a.begin() + (end - n), c.a.begin() + end);
             if (c.iq && c.b.size() == c.a.size()) c.showB.assign(c.b.begin() + (end - n), c.b.begin() + end);
         }
@@ -929,8 +939,9 @@ public:
     }
     std::vector<std::string> buttons() const override { return {"Arm (Single)"}; }
     void onButton(int) override { singleDone = false; capturing = -1; }
+    bool slowSweep() const { return num("ms") >= 500.0; }
     const std::vector<float>& trace(size_t k) const { static const std::vector<float> none; return k < ch.size() ? ch[k].showA : none; }
-    void reset() override { ch.clear(); capturing = -1; sinceTrig = sinceShow = 0; }
+    void reset() override { ch.clear(); capturing = -1; sinceTrig = sinceShow = 0; everTriggered = false; showFrac = 1.0f; }
     std::string status() const override {
         const int m = choice("mode");
         std::string s = m == 2 ? (singleDone ? "Single: captured (Arm for the next)" : "Single: armed, waiting")
@@ -973,6 +984,8 @@ public:
         const bool burstTrig = choice("src") == 1;
         const float lvl = (float)num("lvl");
         const size_t n = t->size();
+        const bool slow = slowSweep();
+        const long long liveStep = std::max<long long>(1, (long long)(rate * 0.05));   // a slow sweep is redrawn every 50 ms
         for (size_t i = 0; i < n; i++) {
             float va, vb = 0.0f;
             if (T.iq) { va = t->iq[i].real(); vb = t->iq[i].imag(); } else va = t->re[i];
@@ -985,10 +998,13 @@ public:
             prevV = lv;
             if (capturing >= 0) {
                 if (--capturing <= 0) { snapshot(in, i, n); capturing = -1; if (mode == 2) singleDone = true; }
+                else if (slow && sinceShow >= liveStep) snapshot(in, i, n, (double)(need - (size_t)capturing) / need);
                 continue;
             }
-            if (trig && !(mode == 2 && singleDone)) { capturing = (int)(need - preN); sinceTrig = 0; continue; }
+            if (trig && !(mode == 2 && singleDone)) { capturing = (int)(need - preN); sinceTrig = 0; everTriggered = true; continue; }
             if (mode == 0 && sinceShow > (long long)need * 2 && sinceTrig > (long long)need * 2) snapshot(in, i, n);
+            // nothing captured yet: the input rolls in (the last `need` samples, growing from the left)
+            else if (slow && !everTriggered && sinceShow >= liveStep) snapshot(in, i, n, (double)std::min(T.a.size(), need) / need);
         }
     }
     void drawView(const Draw& d, const sf::FloatRect& r) override {
@@ -1011,8 +1027,9 @@ public:
             sf::VertexArray va(sf::PrimitiveType::LineStrip);
             const size_t n = v.size();
             const size_t step = std::max<size_t>(1, n / 1500);
+            const float w = lane.size.x * showFrac;
             for (size_t i = 0; i < n; i += step)
-                va.append({{lane.position.x + lane.size.x * i / (n - 1), lane.position.y + lane.size.y * (1.0f - (v[i] - lo) / (hi - lo))}, c});
+                va.append({{lane.position.x + w * i / (n - 1), lane.position.y + lane.size.y * (1.0f - (v[i] - lo) / (hi - lo))}, c});
             d.win->draw(va);
         };
         auto colors = [&](int k, sf::Color& ci, sf::Color& cq) {

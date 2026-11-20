@@ -49,6 +49,7 @@
 #include "modules/Maritime/NAVTEX_Decoder.h"
 #include "modules/Maritime/DSC_Decoder.h"
 #include "modules/Analyzer/Analyzer_Decoder.h"
+#include "modules/Meshtastic/Meshtastic_Decoder.h"
 
 // Satellite map and tracking
 #include "orbit/MapWindow.h"
@@ -116,6 +117,7 @@ struct Receiver {
     SSTVModule* sstv = nullptr;
     WEFAXModule* wefax = nullptr;
     ISMDecoder* ism = nullptr;
+    MeshtasticDecoder* mesh = nullptr;
     ACARSDecoder* acars = nullptr;
     VDL2Decoder* vdl2 = nullptr;
     ADSBDecoder* adsb = nullptr;
@@ -349,6 +351,9 @@ int main() {
         rx->ism = add(new ISMDecoder());
         rx->ism->log.setPath(getIsmLogFilePath());
         rx->ism->exportDir = getDefaultExportPath();
+        rx->mesh = add(new MeshtasticDecoder());
+        rx->mesh->log.setPath(getConfigFilePath("meshtastic.log"));
+        rx->mesh->onOpenMap = [&]() { mapWindow.openOrFocus(); };
         rx->acars = add(new ACARSDecoder());
         rx->acars->log.setPath(getAcarsLogFilePath());
         rx->acars->exportDir = getDefaultExportPath();
@@ -381,7 +386,7 @@ int main() {
             pipeShown = true;
         };
         // the order of the Decoders checkboxes
-        rx->decMods = { nullptr, rx->dvoice, rx->ais, rx->sstv, rx->wefax, rx->ism, rx->acars, rx->vdl2, rx->adsb, rx->wsjt, rx->cw, rx->navtex, rx->dsc, rx->analyzer };
+        rx->decMods = { nullptr, rx->dvoice, rx->ais, rx->sstv, rx->wefax, rx->ism, rx->mesh, rx->acars, rx->vdl2, rx->adsb, rx->wsjt, rx->cw, rx->navtex, rx->dsc, rx->analyzer };
         rx->sd.visible = false;
         rx->sd.audioOut = true;          // its speaker button on the tab (on by default)
         rx->sd.audioStream = rx->id;     // its own stream in the speaker's mix
@@ -1415,6 +1420,7 @@ int main() {
     auto chkWEFAX = std::make_shared<Checkbox>("WEFAX (HF weather fax)", font);
     auto chkISM   = std::make_shared<Checkbox>(ISMDecoder::available() ? "ISM (433/868 MHz sensors)"
                                                                        : "ISM (not in this build)", font);
+    auto chkMesh  = std::make_shared<Checkbox>("Meshtastic / MeshCore (LoRa mesh, 869.5 MHz)", font);
     auto chkACARS = std::make_shared<Checkbox>("ACARS (aircraft, 131.x MHz)", font);
     auto chkADSB  = std::make_shared<Checkbox>("ADS-B (aircraft, 1090 MHz)", font);
     auto chkVDL2  = std::make_shared<Checkbox>("VDL2 (aircraft datalink, 136.975)", font);
@@ -1430,7 +1436,7 @@ int main() {
     // The checkboxes; the modules are the shown receiver's (cur->decMods[i], nullptr = APRS)
     struct DecoderEntry { std::shared_ptr<Checkbox> chk; };
     std::vector<DecoderEntry> decoders = {
-        {chkAprs}, {chkDV}, {chkAIS}, {chkSSTV}, {chkWEFAX}, {chkISM}, {chkACARS}, {chkVDL2}, {chkADSB}, {chkWSJT}, {chkCW}, {chkNAVTEX}, {chkDSC},
+        {chkAprs}, {chkDV}, {chkAIS}, {chkSSTV}, {chkWEFAX}, {chkISM}, {chkMesh}, {chkACARS}, {chkVDL2}, {chkADSB}, {chkWSJT}, {chkCW}, {chkNAVTEX}, {chkDSC},
         {chkAnalyzer} };
 
     auto activateDecoderOn = [&](Receiver* r, size_t idx, bool on) {
@@ -3230,7 +3236,10 @@ int main() {
         positionBus().setClock(orbit::jdToUnix(mapWindow.trackerJd()));
         // ADS-B: the receiver for distances / surface positions, and the "Tune to 1090 MHz" button
         for (auto& rxp : receivers) rxp->adsb->setReceiver(satTracker.obs.latDeg, satTracker.obs.lonDeg);
-        if (const long long want = cur->adsb->tuneRequest.exchange(0); want > 0) {
+        // the same for the LoRa mesh decoder's "Tune to 869.4 MHz"
+        long long tuneWant = cur->adsb->tuneRequest.exchange(0);
+        if (const long long m = cur->mesh->tuneRequest.exchange(0); m > 0) tuneWant = m;
+        if (const long long want = tuneWant; want > 0) {
             if (isHw) {   // only the frequency; the sample rate stays the user's choice
                 cur->centerFreq = want;
                 {

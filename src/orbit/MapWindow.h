@@ -21,6 +21,7 @@
 #include "TileLayer.h"
 #include "../modules/Core/PositionBus.h"
 #include "../modules/Core/AprsPosition.h"
+#include "../modules/Core/EmojiText.h"
 #include "../NativeDialogs.h"
 #include "../MacWindowFix.h"
 #include <SFML/Graphics.hpp>
@@ -119,9 +120,10 @@ public:
         baseLayer = std::clamp(s.getInt("map_layer", 0), 0, 2);
         placeNames = s.getBool("map_place_names", true);
         const int kinds = s.getInt("map_pos_kinds", 15);
-        for (int i = 0; i < TOGGLE_KINDS; i++) showKind[i] = (kinds >> i) & 1;
+        for (int i = 0; i < MASK_KINDS; i++) showKind[i] = (kinds >> i) & 1;
         showKind[(int)PosKind::HF] = s.getBool("map_pos_hf", true);   // added later: own key, on by default
         showKind[(int)PosKind::TETRA] = true;   // rare: always shown, no toolbar toggle
+        showKind[(int)PosKind::MESH] = s.getBool("map_pos_mesh", true);
         posWindowIdx = std::clamp(s.getInt("map_pos_window", 2), 0, (int)POS_WINDOWS.size() - 1);
         syncPanelFromState();
     }
@@ -138,9 +140,10 @@ public:
         s.set("map_layer", baseLayer);
         s.set("map_place_names", placeNames);
         int kinds = 0;
-        for (int i = 0; i < TOGGLE_KINDS; i++) if (showKind[i]) kinds |= 1 << i;
+        for (int i = 0; i < MASK_KINDS; i++) if (showKind[i]) kinds |= 1 << i;
         s.set("map_pos_kinds", kinds);
         s.set("map_pos_hf", showKind[(int)PosKind::HF]);
+        s.set("map_pos_mesh", showKind[(int)PosKind::MESH]);
         s.set("map_pos_window", posWindowIdx);
     }
 
@@ -185,17 +188,20 @@ private:
     int baseLayer = 0;          // 0 satellite photos, 1 street map, 2 Blue Marble only
     bool placeNames = true;     // borders + names over the photos
     std::set<int> layersDrawn;  // for the attribution line
-    bool showKind[(int)PosKind::Count] = {true, true, true, true, true, true};
+    bool showKind[(int)PosKind::Count] = {true, true, true, true, true, true, true};
     int posWindowIdx = 2;
     inline static const std::vector<std::pair<double, const char*>> POS_WINDOWS = {
         {15 * 60.0, "15 min"}, {3600.0, "1 h"}, {6 * 3600.0, "6 h"}, {24 * 3600.0, "24 h"}, {1e12, "all"}};
     std::vector<PosTrack> posTracks;   // this frame
     int hoveredPos = -1;               // index into posTracks
     sf::Vector2f hoveredPosUi;
-    // kinds with an on/off button on the toolbar: all before TETRA (TETRA LIP positions are
-    // rare and always shown, without a button)
-    static constexpr int TOGGLE_KINDS = (int)PosKind::TETRA;
-    SdrButton tbKind[TOGGLE_KINDS] = {{64, 24, "AIS", font}, {64, 24, "APRS", font}, {70, 24, "ACARS", font}, {66, 24, "ADS-B", font}, {56, 24, "HF", font}};
+    // kinds with an on/off button on the toolbar: all but TETRA (TETRA LIP positions are rare
+    // and always shown, without a button). The first MASK_KINDS are saved as one bit mask.
+    static constexpr int MASK_KINDS = (int)PosKind::TETRA;
+    static constexpr int TOGGLE_KINDS = 6;
+    static PosKind toggleKind(int i) { return i < MASK_KINDS ? (PosKind)i : PosKind::MESH; }
+    SdrButton tbKind[TOGGLE_KINDS] = {{64, 24, "AIS", font}, {64, 24, "APRS", font}, {70, 24, "ACARS", font}, {66, 24, "ADS-B", font},
+                                      {56, 24, "HF", font}, {64, 24, "Mesh", font}};
     SdrButton tbWindow{92, 24, "Last 6 h", font};
 
     // map picture
@@ -545,7 +551,7 @@ private:
         tbNow.onClick = [this]() { simOffsetSec = 0; };
         tbP10.onClick = [this]() { simOffsetSec += 600; };
         tbP1h.onClick = [this]() { simOffsetSec += 3600; };
-        for (int i = 0; i < TOGGLE_KINDS; i++) tbKind[i].onClick = [this, i]() { showKind[i] = !showKind[i]; };
+        for (int i = 0; i < TOGGLE_KINDS; i++) tbKind[i].onClick = [this, i]() { showKind[(int)toggleKind(i)] = !showKind[(int)toggleKind(i)]; };
         tbWindow.onClick = [this]() { posWindowIdx = (posWindowIdx + 1) % (int)POS_WINDOWS.size(); };
     }
 
@@ -1240,6 +1246,7 @@ private:
         case PosKind::ACARS: case PosKind::ADSB: return Icon::Plane;
         case PosKind::HF: return Icon::Tower;
         case PosKind::TETRA: return Icon::Person;   // a handheld / vehicle radio
+        case PosKind::MESH: return Icon::Person;    // (drawn as its badge when it has one)
         default: break;
         }
         const std::string n = aprspos::symbolName(p.symTable, p.symCode);
@@ -1262,6 +1269,7 @@ private:
         case PosKind::ADSB: return sf::Color(255, 220, 0);
         case PosKind::HF: return sf::Color(120, 235, 140);
         case PosKind::TETRA: return sf::Color::White;
+        case PosKind::MESH: return sf::Color(103, 234, 148);   // Meshtastic green
         default: return sf::Color::White;
         }
     }
@@ -1347,6 +1355,11 @@ private:
         return false;
     }
 
+    sf::Vector2f drawBadge(sf::Vector2f p, const PosReport& r, std::uint8_t alpha, bool hl) {
+        const sf::Color c((r.badgeRgb >> 16) & 0xFF, (r.badgeRgb >> 8) & 0xFF, r.badgeRgb & 0xFF, alpha);
+        return emoji::badge(*win, font, r.badge, p, hl ? 24.0f : 18.0f, c, hl);
+    }
+
     void drawPositions(const sf::FloatRect& r) {
         posTracks = positionBus().snapshot();
         hoveredPos = -1;
@@ -1381,12 +1394,18 @@ private:
             // old reports fade out
             const double age = std::max(0.0, nowU - wh);
             const sf::Color c(col.r, col.g, col.b, (std::uint8_t)(age > 1800 ? 150 : 255));
+            if (!t.last.badge.empty()) {   // a Meshtastic node: its short name in its colour
+                const sf::Vector2f bs = drawBadge(p, t.last, age > 1800 ? 150 : 255, false);
+                if (labels) drawText(*win, font, t.last.label, p.x + bs.x / 2 + 4, p.y - 7, 10, sf::Color(235, 235, 240));
+                continue;
+            }
             drawIcon(p, iconFor(t.last), t.last.courseDeg, c, false);
             if (labels) drawText(*win, font, t.last.label, p.x + 9, p.y - 7, 10, sf::Color(235, 235, 240));
         }
         if (hoveredPos >= 0) {
             const PosTrack& t = posTracks[hoveredPos];
-            drawIcon(hoveredPosUi, iconFor(t.last), t.last.courseDeg, kindColor(t.last.kind), true);
+            if (!t.last.badge.empty()) drawBadge(hoveredPosUi, t.last, 255, true);
+            else drawIcon(hoveredPosUi, iconFor(t.last), t.last.courseDeg, kindColor(t.last.kind), true);
         }
     }
 
@@ -1926,7 +1945,8 @@ private:
                                    panel.isAnyWidgetHovered(*win) || tbNow.isMouseOver(*win) || tbM1h.isMouseOver(*win) ||
                                    tbM10.isMouseOver(*win) || tbP10.isMouseOver(*win) || tbP1h.isMouseOver(*win) ||
                                    tbWindow.isMouseOver(*win) || tbKind[0].isMouseOver(*win) || tbKind[1].isMouseOver(*win) ||
-                                   tbKind[2].isMouseOver(*win) || tbKind[3].isMouseOver(*win) || tbKind[4].isMouseOver(*win);
+                                   tbKind[2].isMouseOver(*win) || tbKind[3].isMouseOver(*win) || tbKind[4].isMouseOver(*win) ||
+                                   tbKind[5].isMouseOver(*win);
         static auto curArrow = sf::Cursor::createFromSystem(sf::Cursor::Type::Arrow);
         static auto curHand = sf::Cursor::createFromSystem(sf::Cursor::Type::Hand);
         static auto curCross = sf::Cursor::createFromSystem(sf::Cursor::Type::Cross);
@@ -1954,9 +1974,9 @@ private:
             tbWindow.setPosition(rx, 6); tbWindow.draw(*win);
             rx -= 8.0f;
             for (int i = TOGGLE_KINDS - 1; i >= 0; i--) {
-                const size_t n = positionBus().count((PosKind)i);
-                tbKind[i].setText(std::string(posKindName((PosKind)i)) + (n ? " " + std::to_string(n) : ""));
-                tbKind[i].setActive(showKind[i]);
+                const size_t n = positionBus().count(toggleKind(i));
+                tbKind[i].setText(std::string(posKindName(toggleKind(i))) + (n ? " " + std::to_string(n) : ""));
+                tbKind[i].setActive(showKind[(int)toggleKind(i)]);
                 rx -= tbKind[i].shape.getSize().x;
                 tbKind[i].setPosition(rx, 6); tbKind[i].draw(*win);
                 rx -= 4.0f;

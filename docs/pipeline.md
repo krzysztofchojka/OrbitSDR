@@ -172,7 +172,9 @@ The two give nearly the same curve; the difference is the Delay's extra sample.
 - *Amplitude* 0.5 and *Offset* 0.5, so r goes 0 → 1 → 0.
 
 Set the *Scope* to a *Time span* longer than the response (up to 120 s), with *Trigger:
-Normal* and *Level* 0.5 on r.
+Normal* and *Level* 0.5 on r. With a span of half a second or more the Scope draws the
+capture while it runs, left to right (a slow time base), and lets the input roll in before
+the first trigger, so the response appears at once instead of when the whole span is in.
 
 **Ready-made:** preset `Lab: control loop (PID, step response, no radio)`. It runs
 1/(s+1)³ with a PID next to the same plant in open loop, with metrics and a second Scope

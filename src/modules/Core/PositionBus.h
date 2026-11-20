@@ -2,7 +2,8 @@
 
 // =====================================================================
 //  Positions heard by the decoders (AIS ships, APRS stations, ACARS / ADS-B
-//  aircraft, FT8 / WSPR stations by their locator, TETRA radios' LIP reports),
+//  aircraft, FT8 / WSPR stations by their locator, TETRA radios' LIP reports,
+//  Meshtastic nodes),
 //  shown on the satellite map.
 //
 //  Decoders call positionBus().report(...) from their DSP thread; the map
@@ -13,6 +14,7 @@
 // =====================================================================
 
 #include <string>
+#include <cstdint>
 #include <vector>
 #include <map>
 #include <deque>
@@ -20,7 +22,7 @@
 #include <atomic>
 #include <chrono>
 
-enum class PosKind { AIS = 0, APRS = 1, ACARS = 2, ADSB = 3, HF = 4, TETRA = 5, Count = 6 };
+enum class PosKind { AIS = 0, APRS = 1, ACARS = 2, ADSB = 3, HF = 4, TETRA = 5, MESH = 6, Count = 7 };
 
 inline const char* posKindName(PosKind k) {
     switch (k) {
@@ -30,6 +32,7 @@ inline const char* posKindName(PosKind k) {
     case PosKind::ADSB: return "ADS-B";
     case PosKind::HF: return "HF";   // FT8 / FT4 / WSPR stations (grid locator)
     case PosKind::TETRA: return "TETRA";   // LIP position reports of TETRA radios
+    case PosKind::MESH: return "Mesh";     // Meshtastic nodes
     default: return "?";
     }
 }
@@ -44,6 +47,8 @@ struct PosReport {
     double speedKn = -1;
     double altM = -1e9;      // aircraft altitude (-1e9 = unknown)
     char symTable = 0, symCode = 0;   // APRS symbol (0 = none)
+    std::string badge;       // drawn instead of an icon: a node's short name (Meshtastic)
+    uint32_t badgeRgb = 0;   // its colour (0xRRGGBB)
     double unix = 0;         // map clock when heard
 };
 
@@ -72,6 +77,7 @@ public:
         if (r.label.empty()) r.label = t.last.label;          // keep what earlier messages told us
         if (r.info.empty()) r.info = t.last.info;
         if (r.symCode == 0) { r.symTable = t.last.symTable; r.symCode = t.last.symCode; }
+        if (r.badge.empty()) { r.badge = t.last.badge; r.badgeRgb = t.last.badgeRgb; }
         // a jump back in time (seek in a recording): the trail starts again
         if (!t.trail.empty() && r.unix < t.trail.back().unix - 1.0) t.trail.clear();
         if (t.trail.empty() || t.trail.back().lat != r.lat || t.trail.back().lon != r.lon) t.trail.push_back({r.lat, r.lon, r.unix});
@@ -83,12 +89,14 @@ public:
     }
 
     // Name / details without a position (AIS static data, ...)
-    void describe(PosKind kind, const std::string& id, const std::string& label, const std::string& info) {
+    void describe(PosKind kind, const std::string& id, const std::string& label, const std::string& info,
+                  const std::string& badge = std::string(), uint32_t badgeRgb = 0) {
         std::lock_guard<std::mutex> l(mtx);
         auto it = tracks.find({(int)kind, id});
         if (it == tracks.end()) return;
         if (!label.empty()) it->second.last.label = label;
         if (!info.empty()) it->second.last.info = info;
+        if (!badge.empty()) { it->second.last.badge = badge; it->second.last.badgeRgb = badgeRgb; }
         version++;
     }
 

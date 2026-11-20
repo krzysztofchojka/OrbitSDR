@@ -386,7 +386,7 @@ class LoraRx : public Block {
         const std::string want = text("sw");
         if (!want.empty() && want != "any") {
             const int sw = (int)std::strtol(want.c_str(), nullptr, 0) & 0xFF;
-            if (circ(r.v1, ((sw >> 4) & 15) << 3, N) > 2 || circ(r.v2, (sw & 15) << 3, N) > 2) { wrongSync++; toSearch(r); r.pos = D + 2 * N; return; }
+            if (circ(r.v1 & 127, ((sw >> 4) & 15) << 3, 128) > 2 || circ(r.v2 & 127, (sw & 15) << 3, 128) > 2) { wrongSync++; toSearch(r); r.pos = D + 2 * N; return; }
         }
         r.cfo = cfo;
         r.p0 = D + N * 2.25;
@@ -463,8 +463,10 @@ class LoraRx : public Block {
         const double snr = r.snrN ? 10.0 * std::log10(std::max(1e-12, r.snrAcc / r.snrN)) : 0.0;
         char sw[16] = "?";
         // the sync symbols are nibble x 8 (+-1 left over from the timing)
-        const int s1 = ((r.v1 + 4) / 8) & 15, s2 = ((r.v2 + 4) / 8) & 15;
-        if (circ(r.v1, s1 * 8, r.N) <= 1 && circ(r.v2, s2 * 8, r.N) <= 1) std::snprintf(sw, sizeof(sw), "0x%X%X", s1, s2);
+        // (only the low 7 bits: above SF7 an SX126x sets high bits in the second symbol, a
+        // Meshtastic node at SF9 sends 0x2B as 16, 472 = 3 x 128 + 0xB x 8)
+        const int s1 = (((r.v1 & 127) + 4) / 8) & 15, s2 = (((r.v2 & 127) + 4) / 8) & 15;
+        if (circ(r.v1 & 127, s1 * 8, 128) <= 1 && circ(r.v2 & 127, s2 * 8, 128) <= 1) std::snprintf(sw, sizeof(sw), "0x%X%X", s1, s2);
         char b[200];
         std::snprintf(b, sizeof(b), "SF%d  BW %.4g kHz  CR 4/%d  %s%s  sync %s  CFO %+.2f kHz  SNR %.1f dB%s",
                       r.sf, c.bw / 1000.0, r.cr + 4, choice("hdr") == 0 ? "explicit header" : "implicit", r.crc ? "" : ", no CRC",
@@ -480,7 +482,11 @@ class LoraRx : public Block {
         }
         recent.push_back(line);
         while (recent.size() > 40) recent.pop_front();
-        if (ok || choice("bad") == 1) { o.frames.push_back(pay); if (o.frames.size() == 1) o.newBurst = true; }
+        if (ok || choice("bad") == 1) {
+            o.frames.push_back(pay); if (o.frames.size() == 1) o.newBurst = true;
+            const bool swOk = std::strcmp(sw, "?") != 0;
+            meta.push_back({r.sf, c.bw, snr, r.cfo * c.bw / r.N, swOk ? (s1 << 4 | s2) : -1, r.cr + 4, r.ldro, ok, r.v1, r.v2});
+        }
         toSearch(r);
         r.pos = std::floor(r.p0 + (double)used * r.N);
     }
@@ -560,6 +566,10 @@ public:
     }
     void reset() override { chans.clear(); inRate = 0.0; seenVersion = -1; }
     const std::string& lastPacketParams() const { return lastParams; }
+    // what was measured for each frame of the last process() (same order as out[0].frames),
+    // for decoders that host the receiver outside a pipeline (Meshtastic)
+    struct Meta { int sf; double bwHz, snrDb, cfoHz; int sync; int cr; bool ldro, crcOk; int v1, v2; };
+    std::vector<Meta> meta;
     std::vector<std::string> buttons() const override { return {"Copy", "Clear"}; }
     void onButton(int i) override {
         if (i == 1) { recent.clear(); good = badCrc = hdrErr = syncSeen = wrongSync = 0; lastParams.clear(); return; }
@@ -593,6 +603,7 @@ public:
     void process(const std::vector<const Stream*>& in) override {
         Stream& o = out[0];
         o.clear(); o.type = PT::Frames;
+        meta.clear();
         if (!in[0] || in[0]->rate <= 0) return;
         o.rate = in[0]->rate;
         if (changed(in[0]->rate)) { inRate = in[0]->rate; reconfigure(inRate); }
