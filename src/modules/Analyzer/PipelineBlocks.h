@@ -1205,7 +1205,7 @@ public:
     void onButton(int i) override {
         if (i == 1) { px.clear(); rows = 0; texRows = -1; saved.clear(); return; }
         if (!rows || !width) { saved = "nothing to save yet"; return; }
-        sf::Image img({(unsigned)width, (unsigned)rows});
+        sf::Image img(sf::Vector2u{(unsigned)width, (unsigned)rows});
         for (int y = 0; y < rows; y++)
             for (int x = 0; x < width; x++) { const uint8_t g = px[(size_t)y * width + x]; img.setPixel({(unsigned)x, (unsigned)y}, sf::Color(g, g, g)); }
         std::string dir = hooks().imageDir ? hooks().imageDir() : std::string(".");
