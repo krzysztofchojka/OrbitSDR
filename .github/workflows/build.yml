@@ -127,8 +127,9 @@ jobs:
         shell: msys2 {0}
         run: |
           if [ -f sfml/include/SFML/Graphics.hpp ]; then echo "SFML from the cache"; exit 0; fi
+          # any 3.x (the check reads pacman's version: Config.hpp's layout changes between releases)
           if pacman -S --noconfirm --needed mingw-w64-clang-aarch64-sfml \
-             && grep -q "SFML_VERSION_MAJOR 3" "$MINGW_PREFIX/include/SFML/Config.hpp"; then
+             && pacman -Q mingw-w64-clang-aarch64-sfml | grep -Eq ' 3\.'; then
             echo "SFML_PATH_MSYS=$MINGW_PREFIX" >> "$GITHUB_ENV"
             echo "SFML from MSYS2"; exit 0
           fi
@@ -136,6 +137,7 @@ jobs:
           cmake -S sfml-src -B sfml-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
             -DSFML_BUILD_AUDIO=OFF -DSFML_BUILD_NETWORK=OFF -DSFML_BUILD_EXAMPLES=OFF -DSFML_BUILD_DOC=OFF \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DCMAKE_INSTALL_PREFIX="$(pwd)/sfml"
           cmake --build sfml-build
           cmake --install sfml-build

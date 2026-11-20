@@ -1172,6 +1172,31 @@ public:
     }
 };
 
+// Every byte of a frame XORed with a key (one byte or more, repeated): simple scrambling such as
+// an EByte E32's, which XORs its payload with 0x12
+class XorBytes : public Block {
+public:
+    XorBytes() { type = "xorbytes"; title = "XOR bytes with a key"; category = "Frames"; ins = {{"frames", PT::Frames}}; setOuts({{"frames", PT::Frames}});
+                 addText("key", "Key (hex bytes)", "0x12"); }
+    void process(const std::vector<const Stream*>& in) override {
+        Stream& o = out[0]; o.clear(); o.type = PT::Frames;
+        if (!in[0]) return;
+        o.rate = in[0]->rate; o.newBurst = in[0]->newBurst;
+        // "0x12", "12", "12 34", "0x1234": the hex digits, two per byte
+        std::vector<uint8_t> key;
+        std::string t = text("key"), hex;
+        if (t.size() >= 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X')) t = t.substr(2);
+        for (char ch : t) if (std::isxdigit((unsigned char)ch)) hex += ch;
+        if (hex.size() % 2) hex = "0" + hex;
+        for (size_t i = 0; i + 1 < hex.size(); i += 2) key.push_back((uint8_t)std::strtol(hex.substr(i, 2).c_str(), nullptr, 16));
+        for (const auto& f : in[0]->frames) {
+            std::vector<uint8_t> g = f;
+            if (!key.empty()) for (size_t i = 0; i < g.size(); i++) g[i] ^= key[i % key.size()];
+            o.frames.push_back(std::move(g));
+        }
+    }
+};
+
 // ---------------------------------------------------------------------
 //  Displays
 // ---------------------------------------------------------------------

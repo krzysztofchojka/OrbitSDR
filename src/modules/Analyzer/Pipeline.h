@@ -20,6 +20,7 @@
 #include <random>
 #include <array>
 #include <ctime>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include "../../DSP.h"
@@ -1363,7 +1364,7 @@ inline const std::vector<BlockInfo>& blockList() {
         {"codedsync", "Coded sync + QPSK phase", "Bits"}, {"viterbi", "Viterbi decoder (K=7, 1/2)", "Bits"},
         {"pack", "Bits to bytes (frames)", "Bits"}, {"unpack", "Bytes to bits (frames)", "Bits"}, {"hdlc", "HDLC deframer", "Bits"},
         // frames and packets
-        {"crc", "CRC check / append", "Frames"}, {"slice", "Bytes of a frame (from, count)", "Frames"}, {"rs", "Reed-Solomon (255,223)", "Frames"},
+        {"crc", "CRC check / append", "Frames"}, {"slice", "Bytes of a frame (from, count)", "Frames"}, {"xorbytes", "XOR bytes with a key", "Frames"}, {"rs", "Reed-Solomon (255,223)", "Frames"},
         {"ccsds", "CCSDS packets (from VCDU)", "Frames"}, {"msumr", "Meteor MSU-MR image", "Frames"},
         {"lenpkt", "Packets by a length field", "Frames"}, {"fields", "Telemetry fields (decode a frame)", "Frames"},
         // pictures
@@ -1475,6 +1476,7 @@ inline const char* blockTags(const std::string& t) {
         {"hdlc", "hdlc deframer flags bit stuffing ax25 packet fcs crc aprs ramki"},
         {"crc", "crc checksum fcs crc16 crc32 x25 ccitt error detection suma kontrolna wykrywanie bledow"},
         {"slice", "slice bytes field extract header payload substring wycinanie pole naglowek"},
+        {"xorbytes", "xor key bytes scramble descramble unscramble obfuscation ebyte e32 klucz szyfrowanie odszyfrowanie"},
         {"rs", "reed solomon fec error correction ccsds 255 223 korekcja bledow satellite satelita"},
         {"ccsds", "ccsds vcdu mpdu packets space protocol satellite telemetry pakiety satelita telemetria"},
         {"msumr", "meteor msu mr image jpeg lrpt satellite picture weather obraz satelita pogoda"},
@@ -1603,6 +1605,7 @@ inline std::unique_ptr<Block> makeBlockRaw(const std::string& t) {
     if (t == "unpack") return std::make_unique<UnpackBytes>();
     if (t == "crc") return std::make_unique<CrcBlock>();
     if (t == "slice") return std::make_unique<SliceFrames>();
+    if (t == "xorbytes") return std::make_unique<XorBytes>();
     if (t == "text") return std::make_unique<TextDisplay>();
     if (t == "probe") return std::make_unique<ProbeBlock>();
     if (t == "waterfall") return std::make_unique<WaterfallBlock>();
@@ -2618,6 +2621,19 @@ inline const std::vector<Preset>& presets() {
             {"id":3,"type":"text","x":280,"y":470,"params":{"f":2,"ts":0}},
             {"id":4,"type":"waterfall","x":20,"y":180,"params":{"range":50}}],
             "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":1,"out":0,"to":4,"in":0}]})"},
+        // An EByte E32 (SX1278) in transparent mode, as measured on an E32-433T20D: SF7 / 500 kHz,
+        // CR 4/6, LDRO on, a 32-symbol preamble. Its payload is an 8-byte header (2C 17, two check
+        // bytes, 00 00 00, the data length) and then the data XORed with 0x12.
+        {"LoRa EByte E32 (header cut, data unscrambled)", R"({"name":"LoRa EByte E32","nodes":[
+            {"id":1,"type":"input","x":20,"y":30},
+            {"id":2,"type":"lora","x":280,"y":30,"params":{"sf":0,"bw":0,"sw":"any"}},
+            {"id":3,"type":"slice","x":820,"y":30,"params":{"from":8,"n":0}},
+            {"id":4,"type":"xorbytes","x":820,"y":150,"params":{"key":"0x12"}},
+            {"id":5,"type":"text","x":820,"y":270,"params":{"f":0,"ts":0}},
+            {"id":6,"type":"text","x":280,"y":470,"params":{"f":1,"ts":0}},
+            {"id":7,"type":"waterfall","x":20,"y":180,"params":{"range":50}}],
+            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
+                     {"from":4,"out":0,"to":5,"in":0},{"from":2,"out":0,"to":6,"in":0},{"from":1,"out":0,"to":7,"in":0}]})"},
         {"Lab: LoRa modem loopback (no radio)", R"({"name":"Lab LoRa loopback","nodes":[
             {"id":1,"type":"input","x":20,"y":30},
             {"id":2,"type":"msgsrc","x":20,"y":140,"params":{"m":"LoRa test %n","every":1.5}},

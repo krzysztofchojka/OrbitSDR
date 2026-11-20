@@ -151,11 +151,58 @@ inline std::vector<int> encodeSymbols(const std::vector<uint8_t>& pay, int sf, i
         const int sfApp = (first || ldro) ? sf - 2 : sf, crApp = first ? 4 : cr, cwLen = crApp + 4;
         std::vector<int> cw(sfApp);
         for (int r = 0; r < sfApp; r++) cw[r] = hammingEnc(k < nib.size() ? nib[k++] : 0, crApp);
-        for (int v : interleave(cw, cwLen, sfApp)) out.push_back((grayToBin(v << (sf - sfApp)) + 1) % N);
+        // reduced rate (header block, LDRO): the sf - sfApp low bits are 0, as the chips send them
+        // (an SX1278 in an EByte E32 measured: every such symbol is 4 m + 1)
+        for (int v : interleave(cw, cwLen, sfApp)) out.push_back(((grayToBin(v) << (sf - sfApp)) + 1) % N);
         first = false;
     }
     return out;
 }
+
+// A low-pass FIR (Blackman windowed sinc) that is computed only for the samples kept. I and Q
+// sit in separate arrays, stored twice so that a window is always contiguous, and the sums run
+// four at a time, which the compiler keeps in vector registers.
+struct DecimFir {
+    std::vector<float> h, re, im;
+    size_t pos = 0, n = 0;
+    // -6 dB at `cutoff`, the transition `trans` wide around it
+    void design(double fs, double cutoff, double trans) {
+        int taps = (int)std::ceil(5.5 * fs / trans) | 1;
+        taps = std::clamp(taps, 15, 401);
+        h.assign(taps, 0.0f);
+        const double fc = cutoff / fs;
+        double sum = 0.0;
+        for (int i = 0; i < taps; i++) {
+            const int m = i - taps / 2;
+            const double s = m == 0 ? 2.0 * fc : std::sin(2.0 * PI_D * fc * m) / (PI_D * m);
+            const double w = 0.42 - 0.5 * std::cos(2.0 * PI_D * i / (taps - 1)) + 0.08 * std::cos(4.0 * PI_D * i / (taps - 1));
+            h[i] = (float)(s * w);
+            sum += h[i];
+        }
+        for (auto& v : h) v = (float)(v / sum);
+        n = h.size();
+        re.assign(2 * n, 0.0f); im.assign(2 * n, 0.0f); pos = 0;
+    }
+    void push(CF x) {
+        re[pos] = re[pos + n] = x.real();
+        im[pos] = im[pos + n] = x.imag();
+        pos = pos + 1 == n ? 0 : pos + 1;
+    }
+    CF output() const {
+        const float* a = &re[pos];
+        const float* b = &im[pos];
+        const float* c = h.data();
+        float r0 = 0, r1 = 0, r2 = 0, r3 = 0, i0 = 0, i1 = 0, i2 = 0, i3 = 0;
+        size_t k = 0;
+        for (; k + 4 <= n; k += 4) {
+            r0 += a[k] * c[k]; r1 += a[k + 1] * c[k + 1]; r2 += a[k + 2] * c[k + 2]; r3 += a[k + 3] * c[k + 3];
+            i0 += b[k] * c[k]; i1 += b[k + 1] * c[k + 1]; i2 += b[k + 2] * c[k + 2]; i3 += b[k + 3] * c[k + 3];
+        }
+        float R = (r0 + r1) + (r2 + r3), I = (i0 + i1) + (i2 + i3);
+        for (; k < n; k++) { R += a[k] * c[k]; I += b[k] * c[k]; }
+        return CF(R, I);
+    }
+};
 
 }  // namespace lora
 
@@ -175,13 +222,14 @@ class LoraRx : public Block {
         std::vector<int> syms;
         bool hdrDone = false;
         int need = 0, len = 0, cr = 1;
-        bool crc = false, ldro = false;
+        bool crc = false, ldro = false, ldroAuto = true;
         double snrAcc = 0.0; int snrN = 0;
     };
     struct Chan {
         double bw = 125000;
-        Fir<CF> lp;
+        lora::DecimFir lp;
         bool useLp = false;
+        int D = 1, dcnt = 0;         // decimation before the interpolation
         CF h[4] = {};
         double mu = 0.0, step = 1.0;
         std::vector<CF> buf;         // at 2 x BW (a window can then start between two chips)
@@ -283,12 +331,17 @@ class LoraRx : public Block {
             if (fs < bw * 1.5) continue;
             Chan c;
             c.bw = bw;
-            c.step = fs / (2.0 * bw);
             // The chirp fills -BW/2 .. +BW/2 right to the edge: a filter that cuts there bends the
-            // chirp's ends and the peaks move by up to a bin. 0.65 BW keeps the chirp whole (the
-            // noise between 0.5 and 0.65 BW that folds back costs about 1 dB).
+            // chirp's ends and the peaks move by up to a bin. Flat to 0.55 BW keeps the chirp
+            // whole; it only has to be down by BW, where the output at 2 x BW folds (wider than
+            // that costs taps: the noise between 0.5 and 0.95 BW that folds back costs about 1 dB).
+            // It is computed only for every D-th input (kept at 2.4 x BW or more, which the cubic
+            // interpolation to 2 x BW handles): at 2 MS/s and three bandwidths full-rate filters
+            // took more than a core, and the pipeline fell behind.
             c.useLp = fs > bw * 2.4;
-            if (c.useLp) c.lp.set(designLowpass(fs, bw * 0.65));
+            c.D = c.useLp ? std::max(1, (int)std::floor(fs / (bw * 2.4))) : 1;
+            c.step = fs / c.D / (2.0 * bw);
+            if (c.useLp) c.lp.design(fs, bw * 0.75, bw * 0.4);
             for (int sf = 7; sf <= 12; sf++) {
                 if (wantSf() && sf != wantSf()) continue;
                 Rx r; r.sf = sf; r.N = 1 << sf;
@@ -341,6 +394,7 @@ class LoraRx : public Block {
         r.st = 2;
         r.syms.clear(); r.hdrDone = false; r.snrAcc = 0.0; r.snrN = 0;
         r.ldro = lora::ldroFor(choice("ldro"), r.sf, c.bw);
+        r.ldroAuto = choice("ldro") == 0;
         if (choice("hdr") == 1) {   // implicit: the length, CR and CRC are given
             r.len = (int)num("len"); r.cr = choice("cr") + 1; r.crc = choice("crc") == 0;
         }
@@ -349,38 +403,62 @@ class LoraRx : public Block {
     // the nibbles of a block of symbols (raw FFT bins)
     std::vector<int> block(const Rx& r, size_t from, int cwLen, int sfApp, int crApp, int& fixes) const {
         std::vector<int> v;
+        const int sh = r.sf - sfApp;
         for (int i = 0; i < cwLen; i++) {
             const int raw = ((r.syms[from + i] - 1) % r.N + r.N) % r.N;
-            v.push_back(lora::binToGray(raw >> (r.sf - sfApp)));
+            // reduced rate: the low bits are 0 when sent, so a peak a bin off rounds back
+            const int val = sh ? ((raw + (1 << (sh - 1))) >> sh) & ((1 << sfApp) - 1) : raw;
+            v.push_back(lora::binToGray(val));
         }
         std::vector<int> nib;
         for (int cw : lora::deinterleave(v, cwLen, sfApp)) { bool f = false; nib.push_back(lora::hammingDec(cw, crApp, &f)); fixes += f; }
         return nib;
     }
-    int symbolsFor(const Rx& r) const {
+    int symbolsFor(const Rx& r, bool ldro) const {
         const int total = 2 * r.len + (r.crc ? 4 : 0);
         const int inHdr = choice("hdr") == 1 ? r.sf - 2 : r.sf - 7;
-        const int sfApp = r.ldro ? r.sf - 2 : r.sf;
+        const int sfApp = ldro ? r.sf - 2 : r.sf;
         const int rest = std::max(0, total - inHdr);
         return 8 + (rest + sfApp - 1) / sfApp * (r.cr + 4);
     }
-    void finish(Chan& c, Rx& r, Stream& o) {
+    // the payload as sent with or without low data rate optimisation; false: bad CRC
+    bool decodeAs(const Rx& r, bool ldro, std::vector<uint8_t>& pay) const {
         int fixes = 0;
         std::vector<int> nib = block(r, 0, 8, r.sf - 2, 4, fixes);
         if (choice("hdr") == 0) nib.erase(nib.begin(), nib.begin() + 5);
-        const int sfApp = r.ldro ? r.sf - 2 : r.sf;
-        for (size_t s = 8; s + (size_t)(r.cr + 4) <= r.syms.size(); s += (size_t)(r.cr + 4)) {
-            auto b = block(r, s, r.cr + 4, sfApp, r.cr, fixes);
+        const int sfApp = ldro ? r.sf - 2 : r.sf, n = std::min((int)r.syms.size(), symbolsFor(r, ldro));
+        for (int s = 8; s + r.cr + 4 <= n; s += r.cr + 4) {
+            auto b = block(r, (size_t)s, r.cr + 4, sfApp, r.cr, fixes);
             nib.insert(nib.end(), b.begin(), b.end());
         }
-        std::vector<uint8_t> pay;
+        pay.clear();
         const auto& w = lora::whitening();
         for (int i = 0; i < r.len && 2 * i + 1 < (int)nib.size(); i++) pay.push_back((uint8_t)(((nib[2 * i + 1] << 4) | nib[2 * i]) ^ w[i]));
-        bool ok = true;
-        if (r.crc && (int)nib.size() >= 2 * r.len + 4) {
-            const int c0 = nib[2 * r.len + 1] << 4 | nib[2 * r.len], c1 = nib[2 * r.len + 3] << 4 | nib[2 * r.len + 2];
-            ok = (uint16_t)(c0 | c1 << 8) == lora::payloadCrc(pay.data(), pay.size());
-        }
+        if (!r.crc) return true;
+        if ((int)nib.size() < 2 * r.len + 4) return false;
+        const int c0 = nib[2 * r.len + 1] << 4 | nib[2 * r.len], c1 = nib[2 * r.len + 3] << 4 | nib[2 * r.len + 2];
+        return (uint16_t)(c0 | c1 << 8) == lora::payloadCrc(pay.data(), pay.size());
+    }
+    // LDRO from the payload symbols: with it their two low bits are 0 (raw = 4 m), without it
+    // they are random (a quarter of them 0)
+    bool looksLdro(const Rx& r) const {
+        const int n = std::min((int)r.syms.size(), symbolsFor(r, false));
+        int zero = 0, all = 0;
+        for (int s = 8; s < n; s++, all++) zero += ((((r.syms[s] - 1) % r.N + r.N) % r.N) & 3) == 0;
+        return all > 0 && zero > 0.6 * all;
+    }
+    void finish(Chan& c, Rx& r, Stream& o) {
+        std::vector<uint8_t> pay;
+        bool ok;
+        if (r.ldroAuto) {
+            // auto: what the symbols say first, the other way if its CRC fails. (The 16 ms rule
+            // is Semtech's advice, not what modules do: an EByte E32 sends SF7 / 500 kHz with LDRO.)
+            r.ldro = looksLdro(r);
+            ok = decodeAs(r, r.ldro, pay);
+            std::vector<uint8_t> alt;
+            if (!ok && r.crc && decodeAs(r, !r.ldro, alt)) { ok = true; r.ldro = !r.ldro; pay = alt; }
+        } else ok = decodeAs(r, r.ldro, pay);
+        const int used = std::min((int)r.syms.size(), symbolsFor(r, r.ldro));
         if (ok) good++; else badCrc++;
         const double snr = r.snrN ? 10.0 * std::log10(std::max(1e-12, r.snrAcc / r.snrN)) : 0.0;
         char sw[16] = "?";
@@ -403,9 +481,8 @@ class LoraRx : public Block {
         recent.push_back(line);
         while (recent.size() > 40) recent.pop_front();
         if (ok || choice("bad") == 1) { o.frames.push_back(pay); if (o.frames.size() == 1) o.newBurst = true; }
-        (void)fixes;
         toSearch(r);
-        r.pos = std::floor(r.p0 + (double)r.syms.size() * r.N);
+        r.pos = std::floor(r.p0 + (double)used * r.N);
     }
 
     // one window of one receiver
@@ -461,7 +538,8 @@ class LoraRx : public Block {
                     return;
                 }
             }
-            r.need = symbolsFor(r);
+            // auto LDRO: enough symbols for the longer of the two, decided in finish()
+            r.need = r.ldroAuto ? std::max(symbolsFor(r, false), symbolsFor(r, true)) : symbolsFor(r, r.ldro);
         }
         if (r.hdrDone && (int)r.syms.size() >= r.need) finish(c, r, o);
     }
@@ -476,7 +554,7 @@ public:
         addNum("len", "Implicit: length", 16, 1, 255, 1, "bytes");
         addChoice("cr", "Implicit: coding rate", {"4/5", "4/6", "4/7", "4/8"});
         addChoice("crc", "Implicit: CRC", {"on", "off"});
-        addChoice("ldro", "Low data rate optim.", {"auto (symbol > 16 ms)", "on", "off"});
+        addChoice("ldro", "Low data rate optim.", {"auto (detected)", "on", "off"});
         addChoice("bad", "Bad CRC", {"drop", "pass on"});
         for (const char* k : {"len", "cr", "crc"}) showOnly(k, "hdr", {1});
     }
@@ -521,7 +599,13 @@ public:
         for (Chan& c : chans) {
             // to twice the bandwidth: low-pass, then cubic interpolation
             for (CF x : in[0]->iq) {
-                const CF y = c.useLp ? c.lp.step(x) : x;
+                CF y = x;
+                if (c.useLp) {
+                    c.lp.push(x);
+                    if (++c.dcnt < c.D) continue;
+                    c.dcnt = 0;
+                    y = c.lp.output();
+                }
                 c.h[0] = c.h[1]; c.h[1] = c.h[2]; c.h[2] = c.h[3]; c.h[3] = y;
                 while (c.mu < 1.0) {
                     const float m = (float)c.mu, m2 = m * m, m3 = m2 * m;

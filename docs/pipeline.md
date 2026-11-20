@@ -265,7 +265,7 @@ is above 1 % (yellow above 20 %, red above 50 %). The pipeline tab shows the tot
 | FSK / GFSK packets with a length byte (CC1101, Si4463, RFM69, nRF905, SX127x in FSK mode, many sensors) | FM demodulator → Clock recovery + slicer → Symbols to bits → **Frame sync** (the sync word; *Frame length after it* = the longest packet in bits) → **Packets by a length field** → **CRC check** → **Telemetry fields** or Text display. Preset `FSK packets with a length byte`. If the radio whitens its data, put **Scrambler / descrambler** (additive, taps `9 5`, seed `0x1FF`, restart at a frame start) after the Frame sync. |
 | Frames of a fixed length | Frame sync → **Bits to bytes** (*Frame length*). |
 | Numbers out of a frame | **Telemetry fields** (below). |
-| LoRa (SX127x, SX126x, LLCC68, EByte E22 / E32 / E220, RFM95, Heltec ...) | **LoRa receiver**. Presets `LoRa receiver` and `Lab: LoRa modem loopback`. |
+| LoRa (SX127x, SX126x, LLCC68, EByte E22 / E32 / E220, RFM95, Heltec ...) | **LoRa receiver**. Presets `LoRa receiver`, `LoRa EByte E32` and `Lab: LoRa modem loopback`. |
 
 **Packets by a length field** reads the length from a byte of the packet (or 2 bytes, either byte
 order, or the low 6 / 7 bits of a byte) and cuts the packet there. *Bytes after the field =
@@ -294,7 +294,7 @@ the up- and down-chirps, decodes the header, the Hamming code and the whitening,
 and gives the payload of every packet as a frame.
 
 - *Spreading factor* and *Bandwidth* may be **auto**: SF7 to SF12 at 125, 250 and 500 kHz are all
-  searched at once. That costs about half a CPU core at 1 MS/s. Once a packet has been received,
+  searched at once. That costs about a third of a CPU core at 1 to 2 MS/s. Once a packet has been received,
   the block shows what it found (SF, bandwidth, coding rate, sync word, frequency offset, SNR):
   set those in the block to save CPU and avoid false starts.
 - *Sync word* `any` takes every network and shows the sync word heard. `0x12` is the usual
@@ -303,10 +303,14 @@ and gives the payload of every packet as a frame.
   must be 1.5 times the bandwidth or more) and centred on the transmitter. A frequency error of up
   to a quarter of the bandwidth is corrected.
 - *Implicit header* packets carry no length: give the length, coding rate and CRC in the block.
+- *Low data rate optimisation* on **auto** is read from the packet (with it, the two low bits of
+  every payload symbol are 0) and, with a CRC, the other choice is tried when the CRC fails.
+  Semtech's rule (on for symbols over 16 ms) is not what modules do: an EByte E32 has it on at
+  SF7 / 500 kHz, where a symbol lasts 0.26 ms.
 - Checked with the LoRa modulator in the loopback lab: SF7 to SF12, 125 to 500 kHz, all coding rates,
   frequency offsets up to ±7 kHz, any sample rate from 1.6 times the bandwidth up, and SNR down to
-  −10 dB at SF12. The coding follows gr-lora_sdr, which works with real chips. It has not yet been
-  checked here on a recording of a real transmitter.
+  −10 dB at SF12. The coding follows gr-lora_sdr, which works with real chips, and has been checked
+  on a real EByte E32-433T20D (SX1278) received with an RTL-SDR.
 
 **EByte modules.** The 9600 in their documentation is the **UART** speed between the module and
 the microcontroller (9600 8N1 by default), not the speed on air. The E22, E32 and E220 are LoRa
@@ -314,6 +318,14 @@ modules; their *air data rate* (2.4 kbps by default) stands for a spreading fact
 that EByte does not publish. Use SF and bandwidth on *auto*, send a packet, and read the
 parameters from the block. In fixed (addressed) transmission the first bytes of the payload
 may hold the address and channel; look at them in hex and cut them off with **Bytes of a frame**.
+
+Measured on an **E32-433T20D** in transparent mode: SF7, 500 kHz, CR 4/6, explicit header with
+CRC, LDRO on, a 32-symbol preamble, at 433 MHz (channel 0x17). The LoRa payload is not the data
+as written to the UART: it is an 8-byte header `2C 17 c2 c1 00 00 00 n` (`n` = the data length,
+`c1` = the XOR of the data bytes XOR `0x01`, `c2` = `c1` XOR `0xA1`), then the data, every byte
+XORed with `0x12`. The preset `LoRa EByte E32` cuts the header off (**Bytes of a frame**, from 8)
+and undoes the XOR (**XOR bytes with a key**, `0x12`); a second Text display shows the whole
+payload in hex. Other EByte models or settings may differ: compare the hex with what was sent.
 EByte modules that are not LoRa (E07 with a CC1101, E30 / E31 and others) send FSK: use the
 FSK packets preset with their data rate.
 
@@ -994,7 +1006,7 @@ parameters (key, default, range).
 | `len` | Implicit: length | 16 bytes | 1 .. 255 bytes |
 | `cr` | Implicit: coding rate | 0 | 0 = 4/5, 1 = 4/6, 2 = 4/7, 3 = 4/8 |
 | `crc` | Implicit: CRC | 0 | 0 = on, 1 = off |
-| `ldro` | Low data rate optim. | 0 | 0 = auto (symbol > 16 ms), 1 = on, 2 = off |
+| `ldro` | Low data rate optim. | 0 | 0 = auto (detected), 1 = on, 2 = off |
 | `bad` | Bad CRC | 0 | 0 = drop, 1 = pass on |
 
 
@@ -1376,6 +1388,16 @@ parameters (key, default, range).
 |---|---|---|---|
 | `from` | From byte | 0 | 0 .. 1e+06  |
 | `n` | Count (0: to the end) | 0 | 0 .. 1e+06  |
+
+#### XOR bytes with a key  (`xorbytes`)
+
+- in: frames (frames)
+- out: frames (frames)
+- keywords: xor key bytes scramble descramble unscramble obfuscation ebyte e32 klucz szyfrowanie odszyfrowanie
+
+| key | parameter | default | range / choices |
+|---|---|---|---|
+| `key` | Key (hex bytes) | "0x12" | text |
 
 #### Reed-Solomon (255,223)  (`rs`)
 

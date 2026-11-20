@@ -110,9 +110,16 @@ private:
                     Feed& f = kv.second;
                     Got& g = got[kv.first];
                     g.x.clear();
-                    for (auto& c : f.q) g.x.insert(g.x.end(), c.begin(), c.end());
-                    f.q.clear();
-                    f.queued = 0;
+                    // at most ~50 ms of signal per run: the run holds pipe.mtx, which the editor
+                    // needs to draw, so a pipeline behind by a second (up to a second queued)
+                    // froze the window for as long as that took. The rest waits for the next
+                    // pass (the wait above returns at once while anything is queued).
+                    const size_t most = std::max<size_t>(1, (size_t)(f.rate * 0.05));
+                    while (!f.q.empty() && (g.x.empty() || g.x.size() + f.q.front().size() <= most)) {
+                        g.x.insert(g.x.end(), f.q.front().begin(), f.q.front().end());
+                        f.queued -= f.q.front().size();
+                        f.q.pop_front();
+                    }
                     g.rate = f.rate; g.info = f.info; g.dropped = f.dropped; g.rx = f.rx;
                     any = any || !g.x.empty();
                 }
