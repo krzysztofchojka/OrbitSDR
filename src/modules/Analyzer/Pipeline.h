@@ -1313,6 +1313,10 @@ public:
 
 #include "PipelineSat.h"      // pictures: analog lines by a sync pattern, image lines from frames
 
+#include "PipelineLora.h"     // LoRa (chirp spread spectrum): receiver and modulator
+
+#include "PipelineTelemetry.h" // packets by a length field, telemetry fields of a frame
+
 // ---------------------------------------------------------------------
 //  Registry: the palette lists the blocks in this order, grouped by category
 // ---------------------------------------------------------------------
@@ -1342,6 +1346,7 @@ inline const std::vector<BlockInfo>& blockList() {
         // demodulators
         {"fm", "FM demodulator", "Demodulate"}, {"am", "AM demodulator", "Demodulate"}, {"ssb", "SSB / real part", "Demodulate"},
         {"phase", "Phase demodulator", "Demodulate"}, {"fsktones", "FSK tone detector", "Demodulate"}, {"matrix", "Stereo matrix", "Demodulate"},
+        {"lora", "LoRa receiver", "Demodulate"},
         // synchronisation and decisions
         {"symsync", "Symbol sync (real)", "Sync"}, {"clockiq", "Clock recovery (I/Q)", "Sync"}, {"decide", "Slicer (decision)", "Sync"},
         {"threshold", "Threshold (with hysteresis)", "Sync"}, {"slicer", "Clock recovery + slicer", "Sync"}, {"costas", "Costas loop", "Sync"},
@@ -1350,6 +1355,7 @@ inline const std::vector<BlockInfo>& blockList() {
         {"levels", "Bits to levels (NRZ, 4-level ...)", "Modulate"}, {"psk", "Bits to PSK / QAM symbols", "Modulate"},
         {"fmmod", "FM modulator", "Modulate"}, {"ammod", "AM modulator", "Modulate"},
         {"convenc", "Convolutional encoder (K=7, 1/2)", "Modulate"}, {"hdlcframer", "HDLC framer", "Modulate"},
+        {"loramod", "LoRa modulator", "Modulate"},
         // bits
         {"map", "Symbols to bits", "Bits"}, {"invbits", "Invert bits", "Bits"}, {"nrzi", "NRZI decode", "Bits"}, {"manch", "Manchester decode", "Bits"},
         {"diffbits", "Differential (bits)", "Bits"}, {"diff", "Differential decode (soft)", "Bits"}, {"lfsr", "Scrambler / descrambler (LFSR)", "Bits"},
@@ -1359,6 +1365,7 @@ inline const std::vector<BlockInfo>& blockList() {
         // frames and packets
         {"crc", "CRC check / append", "Frames"}, {"slice", "Bytes of a frame (from, count)", "Frames"}, {"rs", "Reed-Solomon (255,223)", "Frames"},
         {"ccsds", "CCSDS packets (from VCDU)", "Frames"}, {"msumr", "Meteor MSU-MR image", "Frames"},
+        {"lenpkt", "Packets by a length field", "Frames"}, {"fields", "Telemetry fields (decode a frame)", "Frames"},
         // pictures
         {"raster", "Raster lines", "Image"}, {"linesync", "Line sync (pattern) -> lines", "Image"},
         {"framelines", "Frame -> image line (N-bit samples)", "Image"},
@@ -1431,6 +1438,10 @@ inline const char* blockTags(const std::string& t) {
         {"ssb", "ssb usb lsb real part product detector cw sideband wstega boczna"},
         {"phase", "phase demodulator pm atan2 angle unwrap demodulator fazy kat"},
         {"fsktones", "fsk tone detector goertzel mark space afsk dtmf wykrywanie tonow"},
+        {"lora", "lora chirp css spread spectrum semtech sx1276 sx1278 sx1262 llcc68 ebyte e22 e32 e220 rfm95 lorawan meshtastic ttn spreading factor iot telemetria modul radiowy"},
+        {"loramod", "lora modulator transmitter chirp css test loopback semtech nadajnik"},
+        {"lenpkt", "packet length field byte cc1101 sx1276 fsk rfm69 si4463 variable length frame sync payload pakiet dlugosc ramki telemetria"},
+        {"fields", "telemetry fields decode bytes integer uint16 int16 float little big endian scale parse sensor value temperature voltage telemetria pola dekodowanie czujnik"},
         {"matrix", "stereo matrix l r left right mpx sum difference wfm broadcast radio stereo lewy prawy"},
         {"symsync", "symbol sync timing recovery clock gardner mueller muller baud synchronizacja symboli zegar odzyskiwanie"},
         {"clockiq", "clock recovery timing gardner symbol sync psk qpsk complex odzyskiwanie zegara synchronizacja"},
@@ -1599,6 +1610,10 @@ inline std::unique_ptr<Block> makeBlockRaw(const std::string& t) {
     if (t == "eye") return std::make_unique<EyeBlock>();
     if (t == "wavsink") return std::make_unique<WavSink>();
     if (t == "bytesink") return std::make_unique<ByteSink>();
+    if (t == "lora") return std::make_unique<LoraRx>();
+    if (t == "loramod") return std::make_unique<LoraMod>();
+    if (t == "lenpkt") return std::make_unique<LengthPackets>();
+    if (t == "fields") return std::make_unique<FieldsBlock>();
     return nullptr;
 }
 
@@ -2597,6 +2612,41 @@ inline const std::vector<Preset>& presets() {
             {"id":6,"type":"scope","x":980,"y":30,"params":{"ms":500,"mode":0}}],
             "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
                      {"from":4,"out":0,"to":5,"in":0},{"from":3,"out":0,"to":6,"in":0}]})"},
+        {"LoRa receiver (auto SF / BW: EByte E22 / E32 / E220, RFM95 ...)", R"({"name":"LoRa receiver","nodes":[
+            {"id":1,"type":"input","x":20,"y":30},
+            {"id":2,"type":"lora","x":280,"y":30,"params":{"sf":0,"bw":0,"sw":"any"}},
+            {"id":3,"type":"text","x":280,"y":470,"params":{"f":2,"ts":0}},
+            {"id":4,"type":"waterfall","x":20,"y":180,"params":{"range":50}}],
+            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":1,"out":0,"to":4,"in":0}]})"},
+        {"Lab: LoRa modem loopback (no radio)", R"({"name":"Lab LoRa loopback","nodes":[
+            {"id":1,"type":"input","x":20,"y":30},
+            {"id":2,"type":"msgsrc","x":20,"y":140,"params":{"m":"LoRa test %n","every":1.5}},
+            {"id":3,"type":"loramod","x":280,"y":140,"params":{"sf":2,"bw":7,"cr":0,"os":4,"sw":"0x12"}},
+            {"id":4,"type":"shift","x":560,"y":140,"params":{"hz":2000}},
+            {"id":5,"type":"noiseiq","x":560,"y":330,"params":{"rate":500000,"a":0.7}},
+            {"id":6,"type":"add","x":820,"y":140},
+            {"id":7,"type":"lora","x":1060,"y":30,"params":{"sf":0,"bw":0}},
+            {"id":8,"type":"text","x":1060,"y":470,"params":{"f":0}},
+            {"id":9,"type":"waterfall","x":820,"y":330,"params":{"range":40}}],
+            "links":[{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},{"from":4,"out":0,"to":6,"in":0},
+                     {"from":5,"out":0,"to":6,"in":1},{"from":6,"out":0,"to":7,"in":0},{"from":7,"out":0,"to":8,"in":0},
+                     {"from":6,"out":0,"to":9,"in":0}]})"},
+        {"FSK packets with a length byte (CC1101 / SX127x FSK, 9600 Bd)", R"({"name":"FSK packets 9600","nodes":[
+            {"id":1,"type":"input","x":20,"y":30},
+            {"id":2,"type":"gate","x":240,"y":30,"params":{"thr":8,"mode":0}},
+            {"id":3,"type":"fm","x":480,"y":30},
+            {"id":4,"type":"slicer","x":700,"y":30,"params":{"baud":9600,"lv":0}},
+            {"id":5,"type":"map","x":940,"y":30,"params":{"m":0}},
+            {"id":6,"type":"sync","x":940,"y":170,"params":{"pat":"0xD391D391","err":2,"len":2100,"inv":1}},
+            {"id":7,"type":"lenpkt","x":700,"y":330,"params":{"skip":32,"lpos":0,"lsz":0,"add":2,"inc":0,"max":255}},
+            {"id":8,"type":"crc","x":940,"y":400,"params":{"p":5,"m":1,"w":16,"poly":"0x8005","init":"0xFFFF","xo":"0x0000","rf":0}},
+            {"id":9,"type":"fields","x":240,"y":560,"params":{"f":"len u8 @0; addr u8 @1; data hex 4 @2"}},
+            {"id":10,"type":"text","x":700,"y":620,"params":{"f":2}},
+            {"id":11,"type":"scope","x":240,"y":200,"params":{"ms":20,"mode":1,"src":1}}],
+            "links":[{"from":1,"out":0,"to":2,"in":0},{"from":2,"out":0,"to":3,"in":0},{"from":3,"out":0,"to":4,"in":0},
+                     {"from":4,"out":0,"to":5,"in":0},{"from":5,"out":0,"to":6,"in":0},{"from":6,"out":0,"to":7,"in":0},
+                     {"from":7,"out":0,"to":8,"in":0},{"from":8,"out":0,"to":9,"in":0},{"from":8,"out":0,"to":10,"in":0},
+                     {"from":3,"out":0,"to":11,"in":0}]})"},
     };
     return p;
 }

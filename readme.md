@@ -23,6 +23,7 @@ Get the latest build from the **[Releases page](https://github.com/krzysztofchoj
 |---|---|---|
 | **macOS 15+ (Apple Silicon)** | `OrbitSDR_vX.Y.Z_macOS_arm64.zip` | Primary platform. See [first launch on macOS](#first-launch-on-macos). |
 | **Windows 10/11 x64** | `OrbitSDR_vX.Y.Z_windows_x64_setup.exe` or `_portable.zip` | Installer or portable zip. |
+| **Windows 11 ARM64** | `OrbitSDR_vX.Y.Z_windows_arm64_setup.exe` or `_portable.zip` | Native build for Snapdragon / ARM laptops. The bundled SDRplay API is x64 only, so SDRplay works only if an ARM64 SDRplay API is installed; the x64 build also runs there (emulated). |
 | **Linux x64** | `OrbitSDR_vX.Y.Z_linux_amd64.deb` or `.tar.gz` | Ubuntu 24.04 and newer (and other distributions with glibc 2.39+). |
 | **Linux ARM64** | `OrbitSDR_vX.Y.Z_linux_arm64.deb` or `.tar.gz` | Raspberry Pi 4/5 (64-bit Raspberry Pi OS Bookworm), other ARM boards. |
 
@@ -164,6 +165,14 @@ Install [MSYS2](https://www.msys2.org/), open the **UCRT64** shell in the projec
 ```
 
 The script installs the compiler and librtlsdr with `pacman`, downloads SFML 3.0 for MinGW and builds `orbitsdr.exe` with all DLLs next to it.
+
+**Windows on ARM (ARM64):** open the **CLANGARM64** shell, install `mingw-w64-clang-aarch64-clang`, `-cmake`, `-ninja` and `-libusb` with `pacman`, build or install SFML 3 and rtl-sdr for ARM64 (see the `build-windows-arm64` job in [`.github/workflows/build.yml`](.github/workflows/build.yml)), then run:
+
+```sh
+SFML_PATH=/path/to/sfml RTLSDR_PATH=/path/to/rtlsdr ./scripts/build_mingw.sh
+```
+
+The script sees the CLANGARM64 shell and uses Clang; `ORBITSDR_ARCH=arm64` forces it.
 
 ### SDRplay API
 

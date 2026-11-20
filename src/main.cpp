@@ -1849,6 +1849,52 @@ int main() {
     struct PipeTabHit { sf::FloatRect tab, close; int uid; };
     std::vector<PipeTabHit> pipeTabHits;
     sf::FloatRect pipeAddHit;
+    // The tab row in order: receiver tabs and pipeline tabs, a pipeline standing after
+    // `slot` receiver tabs (Workspace::slot, -1: after all of them; same slot: the Hub's order)
+    struct StripItem { Receiver* rx; int uid; };
+    struct StripHit { sf::FloatRect tab; Receiver* rx; int uid; };
+    std::vector<StripHit> stripHits;   // where they were drawn (dragging a pipeline tab)
+    auto tabStrip = [&]() {
+        std::vector<StripItem> v;
+        const auto ws = pl::Hub::get().list();
+        const int N = (int)receivers.size();
+        for (int s = 0; s <= N; s++) {
+            for (pl::Workspace* w : ws) {
+                const int ws_ = (w->slot < 0 || w->slot > N) ? N : w->slot;
+                if (ws_ == s) v.push_back({nullptr, w->uid});
+            }
+            if (s < N) v.push_back({receivers[s].get(), 0});
+        }
+        return v;
+    };
+    // A pipeline tab dragged onto the place of tab `target` of the row: its slot and the
+    // order of the pipelines follow the new row
+    auto movePipeTab = [&](int uid, size_t target) {
+        std::vector<StripItem> v = tabStrip();
+        size_t from = v.size();
+        for (size_t k = 0; k < v.size(); k++) if (!v[k].rx && v[k].uid == uid) from = k;
+        if (from >= v.size() || target >= v.size() || from == target) return;
+        const StripItem me = v[from];
+        v.erase(v.begin() + from);
+        v.insert(v.begin() + target, me);
+        std::vector<int> order;
+        int rxBefore = 0;
+        for (const StripItem& it : v) {
+            if (it.rx) { rxBefore++; continue; }
+            order.push_back(it.uid);
+            if (it.uid == uid) {
+                if (pl::Workspace* w = pl::Hub::get().byUid(uid)) w->slot = rxBefore >= (int)receivers.size() ? -1 : rxBefore;
+            }
+        }
+        // the other pipelines keep their places: give every one the slot it has now
+        rxBefore = 0;
+        for (const StripItem& it : v) {
+            if (it.rx) { rxBefore++; continue; }
+            if (it.uid == uid) continue;
+            if (pl::Workspace* w = pl::Hub::get().byUid(it.uid)) if (w->slot >= 0) w->slot = rxBefore >= (int)receivers.size() ? -1 : rxBefore;
+        }
+        pl::Hub::get().reorder(order);
+    };
     int pipeDragUid = 0;             // a pipeline tab being dragged (to another place)
     float pipeDragX = 0.0f;
     bool pipeDragMoved = false;
@@ -2032,9 +2078,8 @@ int main() {
         };
         float x = 6.0f;
         const float y = (float)TOPBAR_DRAW_H + 2.0f, h = (float)RX_TAB_H - 2.0f;
-        for (auto& rxp : receivers) {
-            Receiver* r = rxp.get();
-            const bool sel = r == cur;
+        auto drawOneRx = [&](Receiver* r) {
+            const bool sel = r == cur && !pipeShown;
             bool playing, dec = false;
             {
                 std::lock_guard<std::mutex> l(r->sd.mtx);
@@ -2098,11 +2143,13 @@ int main() {
                 txt("x", x + tw - 13.0f, y + 2.0f, closeR.contains(mp) ? sf::Color(255, 120, 120) : sf::Color(130, 130, 140));
             }
             rxTabHits.push_back({sf::FloatRect({x, y}, {tw, h}), closeR, spkR, r});
+            stripHits.push_back({sf::FloatRect({x, y}, {tw, h}), r, 0});
             x += tw + 4.0f;
-        }
-        // the pipeline tabs (drag one sideways to put it elsewhere)
+        };
+        // the pipeline tabs (drag one sideways to put it elsewhere, also between receivers)
         pipeTabHits.clear();
-        for (pl::Workspace* w : pl::Hub::get().list()) {
+        stripHits.clear();
+        auto drawOnePipe = [&](pl::Workspace* w) {
             const bool sel = pipeShown && w->uid == pipeUid;
             std::string title = "Pipeline: " + w->editor.title();
             if (title.size() > 42) title = title.substr(0, 40) + "..";
@@ -2127,8 +2174,10 @@ int main() {
             const sf::FloatRect closeR({x + tw - 18.0f, y}, {18.0f, h});
             txt("x", x + tw - 13.0f, y + 2.0f, closeR.contains(mp) ? sf::Color(255, 120, 120) : sf::Color(150, 130, 110));
             pipeTabHits.push_back({sf::FloatRect({x, y}, {tw, h}), closeR, w->uid});
+            stripHits.push_back({sf::FloatRect({x, y}, {tw, h}), nullptr, w->uid});
             x += tw + 4.0f;
-        }
+        };
+        for (const StripItem& it : tabStrip()) { if (it.rx) drawOneRx(it.rx); else if (pl::Workspace* w = pl::Hub::get().byUid(it.uid)) drawOnePipe(w); }
         // "+": another receiver
         const float aw = 128.0f;
         rxAddHit = sf::FloatRect({x, y}, {aw, h});
@@ -2229,7 +2278,12 @@ int main() {
         const int n = std::clamp(settingsMgr.getInt("pipe_tabs", 0), 0, 32);
         for (int i = 0; i < n; i++) {
             const std::string name = fromHex(settingsMgr.getString("pipe_tab" + std::to_string(i), ""));
-            if (!name.empty() && !pl::Hub::get().openIn(name, nullptr)) pl::Hub::get().add(name, "", &font);
+            if (!name.empty() && !pl::Hub::get().openIn(name, nullptr)) {
+                pl::Workspace* w = pl::Hub::get().add(name, "", &font);
+                // where it stood among the receiver tabs (-1: after all of them)
+                w->slot = std::clamp(settingsMgr.getInt("pipe_tab_slot" + std::to_string(i), -1), -1, (int)receivers.size());
+                if (w->slot == (int)receivers.size()) w->slot = -1;
+            }
         }
         const auto tabsNow = pl::Hub::get().list();
         const int sh = settingsMgr.getInt("pipe_shown", -1);
@@ -2767,13 +2821,19 @@ int main() {
                     const sf::Vector2f m = window.mapPixelToCoords(sf::Mouse::getPosition(window));
                     if (std::fabs(m.x - pipeDragX) > 6.0f) pipeDragMoved = true;
                     if (pipeDragMoved) {
+                        // past the middle of a neighbour (receiver or pipeline): take its place.
+                        // (The middle, not the edge: tabs of other widths would swap back and forth.)
                         int from = -1, to = -1;
-                        for (size_t k = 0; k < pipeTabHits.size(); k++) {
-                            if (pipeTabHits[k].uid == pipeDragUid) from = (int)k;
-                            const sf::FloatRect& t = pipeTabHits[k].tab;
-                            if (m.x >= t.position.x && m.x < t.position.x + t.size.x) to = (int)k;
+                        for (size_t k = 0; k < stripHits.size(); k++)
+                            if (!stripHits[k].rx && stripHits[k].uid == pipeDragUid) from = (int)k;
+                        for (size_t k = 0; from >= 0 && k < stripHits.size(); k++) {
+                            if ((int)k == from) continue;
+                            const sf::FloatRect& t = stripHits[k].tab;
+                            const float mid = t.position.x + t.size.x * 0.5f;
+                            if ((int)k > from && m.x > mid) to = (int)k;                 // the right-most one passed
+                            if ((int)k < from && m.x < mid && to < 0) to = (int)k;       // the left-most one passed
                         }
-                        if (from >= 0 && to >= 0 && from != to) pl::Hub::get().move(from, to);
+                        if (from >= 0 && to >= 0) movePipeTab(pipeDragUid, (size_t)to);
                     }
                     continue;
                 }
@@ -4340,6 +4400,7 @@ int main() {
         int shownIdx = -1;
         for (size_t i = 0; i < tabsNow.size(); i++) {
             saveMgr.set("pipe_tab" + std::to_string(i), toHex(tabsNow[i]->editor.title()));
+            saveMgr.set("pipe_tab_slot" + std::to_string(i), tabsNow[i]->slot);
             if (pipeShown && tabsNow[i]->uid == pipeUid) shownIdx = (int)i;
         }
         saveMgr.set("pipe_shown", shownIdx);

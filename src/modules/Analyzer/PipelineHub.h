@@ -31,6 +31,8 @@ namespace pl {
 class Workspace {
 public:
     const int uid;
+    // where its tab stands in the tab row: after this many receiver tabs (-1: after all of them)
+    int slot = -1;
     Pipeline pipe;
     PipelineEditor editor {pipe};
 
@@ -214,6 +216,15 @@ public:
         auto w = std::move(tabs[from]);
         tabs.erase(tabs.begin() + from);
         tabs.insert(tabs.begin() + to, std::move(w));
+    }
+    // The tabs in this order (by uid); tabs not named keep their place after them
+    void reorder(const std::vector<int>& uids) {
+        std::lock_guard<std::mutex> l(m);
+        std::vector<std::unique_ptr<Workspace>> v;
+        for (int u : uids)
+            for (auto& t : tabs) if (t && t->uid == u) { v.push_back(std::move(t)); break; }
+        for (auto& t : tabs) if (t) v.push_back(std::move(t));
+        tabs = std::move(v);
     }
     std::vector<Workspace*> list() {
         std::lock_guard<std::mutex> l(m);

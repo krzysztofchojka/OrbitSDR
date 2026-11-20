@@ -89,6 +89,125 @@ jobs:
             installer_output/OrbitSDR_*_windows_x64_setup.exe
 
   # --------------------------------------------------------
+  # WINDOWS ARM64 (MSYS2 CLANGARM64, native on a Windows 11 ARM runner): portable zip + installer
+  #  - SFML 3 and rtl-sdr from MSYS2 when it has them for ARM64, otherwise built from source (cached)
+  #  - the bundled SDRplay API DLL is x64 only, so it is left out (an ARM64 program cannot load it)
+  # --------------------------------------------------------
+  build-windows-arm64:
+    name: Windows ARM64 (Clang)
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANGARM64
+          update: true
+          install: >-
+            mingw-w64-clang-aarch64-clang
+            mingw-w64-clang-aarch64-cmake
+            mingw-w64-clang-aarch64-ninja
+            mingw-w64-clang-aarch64-pkgconf
+            mingw-w64-clang-aarch64-libusb
+            git
+            unzip
+            wget
+
+      - name: Cache SFML / rtl-sdr builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            sfml
+            rtlsdr
+          key: winarm64-sfml-3.0.0-rtlsdr-v2.0.2-v1
+
+      # SFML 3: the MSYS2 package if it is version 3, else built from source
+      - name: SFML 3.0
+        shell: msys2 {0}
+        run: |
+          if [ -f sfml/include/SFML/Graphics.hpp ]; then echo "SFML from the cache"; exit 0; fi
+          if pacman -S --noconfirm --needed mingw-w64-clang-aarch64-sfml \
+             && grep -q "SFML_VERSION_MAJOR 3" "$MINGW_PREFIX/include/SFML/Config.hpp"; then
+            echo "SFML_PATH_MSYS=$MINGW_PREFIX" >> "$GITHUB_ENV"
+            echo "SFML from MSYS2"; exit 0
+          fi
+          git clone --depth 1 --branch 3.0.0 https://github.com/SFML/SFML.git sfml-src
+          cmake -S sfml-src -B sfml-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+            -DSFML_BUILD_AUDIO=OFF -DSFML_BUILD_NETWORK=OFF -DSFML_BUILD_EXAMPLES=OFF -DSFML_BUILD_DOC=OFF \
+            -DCMAKE_INSTALL_PREFIX="$(pwd)/sfml"
+          cmake --build sfml-build
+          cmake --install sfml-build
+
+      # rtl-sdr (with RTL-SDR Blog V4 support): the MSYS2 package, else Osmocom's sources
+      - name: rtl-sdr
+        shell: msys2 {0}
+        run: |
+          if [ -f rtlsdr/include/rtl-sdr.h ]; then echo "rtl-sdr from the cache"; exit 0; fi
+          if pacman -S --noconfirm --needed mingw-w64-clang-aarch64-rtl-sdr; then
+            mkdir -p rtlsdr/include rtlsdr/lib rtlsdr/bin
+            cp "$MINGW_PREFIX"/include/rtl-sdr*.h rtlsdr/include/
+            cp "$MINGW_PREFIX"/lib/librtlsdr* rtlsdr/lib/
+            cp "$MINGW_PREFIX"/bin/librtlsdr*.dll rtlsdr/bin/ || cp "$MINGW_PREFIX"/bin/rtlsdr*.dll rtlsdr/bin/ || true
+            echo "rtl-sdr from MSYS2"; exit 0
+          fi
+          git clone --depth 1 --branch v2.0.2 https://gitea.osmocom.org/sdr/rtl-sdr.git rtlsdr-src \
+            || git clone --depth 1 --branch v2.0.2 https://github.com/osmocom/rtl-sdr.git rtlsdr-src
+          cmake -S rtlsdr-src -B rtlsdr-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DDETACH_KERNEL_DRIVER=OFF -DCMAKE_INSTALL_PREFIX="$(pwd)/rtlsdr"
+          cmake --build rtlsdr-build
+          cmake --install rtlsdr-build
+
+      # rtl_433 (ISM decoder) sources + compiled library, see scripts/rtl433.sh
+      - name: Cache rtl_433
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: rtl433-windows-clangarm64-${{ hashFiles('scripts/rtl433.sh') }}
+
+      - name: Compile OrbitSDR
+        shell: msys2 {0}
+        run: |
+          chmod +x scripts/build_mingw.sh
+          export SFML_PATH="${SFML_PATH_MSYS:-$(pwd)/sfml}" RTLSDR_PATH="$(pwd)/rtlsdr" ORBITSDR_ARCH=arm64
+          ./scripts/build_mingw.sh
+          llvm-objdump -f orbitsdr.exe | grep -i "file format"
+          ls *.dll
+
+      - name: Determine version
+        shell: pwsh
+        run: |
+          $ver = "0.0.0-dev"; $tag = "dev"
+          if ("${{ github.ref_type }}" -eq "tag") { $tag = "${{ github.ref_name }}"; $ver = $tag.TrimStart("v") }
+          "VERSION=$ver"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "FILE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Create portable zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path orbitsdr.exe, *.dll, assets/bandplan.json, assets/orbitsdr.ini -DestinationPath "OrbitSDR_${env:FILE_TAG}_windows_arm64_portable.zip"
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc "/DAppVersion=$env:VERSION" "/DFileTag=$env:FILE_TAG" "/DArch=arm64" packaging\orbitsdr.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem installer_output
+
+      - name: Upload Windows ARM64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrbitSDR-windows-arm64
+          path: |
+            OrbitSDR_*_windows_arm64_portable.zip
+            installer_output/OrbitSDR_*_windows_arm64_setup.exe
+
+  # --------------------------------------------------------
   # LINUX: amd64 + arm64  (portable tar.gz + .deb)
   #  - amd64 : Ubuntu 24.04, prebuilt SFML 3 from deps/
   #  - arm64 : Ubuntu 22.04 ARM (older glibc => also runs on Raspberry Pi OS Bookworm),
@@ -382,7 +501,7 @@ jobs:
   release:
     name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-windows-mingw, build-linux, build-macos]
+    needs: [build-windows-mingw, build-windows-arm64, build-linux, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
