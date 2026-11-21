@@ -1,0 +1,22 @@
+{
+  "preset": "Lab: AES encrypt and decrypt (no radio)",
+  "description": "Learning, no radio needed: real encryption. AES-128 in CTR mode scrambles the message (middle, shown as hex); the same key and nonce bring it back (right). Unlike a short XOR key, an AES key cannot be brute forced - 2^128 keys is beyond any computer. Change one hex digit of the key on the right to see the output turn to noise.",
+  "name": "Lab AES encrypt decrypt",
+  "version": 1,
+  "nodes": [
+    {"id": 1, "type": "input", "x": 20, "y": 640},
+    {"id": 2, "type": "msgsrc", "x": 20, "y": 40, "params": {"m": "MEET AT 0900 - ALL CLEAR %n", "every": 1.5}},
+    {"id": 3, "type": "text", "x": 300, "y": 40, "params": {"f": 2, "ts": 1}},
+    {"id": 4, "type": "cipher", "x": 300, "y": 260, "params": {"algo": 0, "key": "000102030405060708090A0B0C0D0E0F", "nonce": "0"}},
+    {"id": 5, "type": "text", "x": 580, "y": 260, "params": {"f": 1, "ts": 1}},
+    {"id": 6, "type": "cipher", "x": 860, "y": 260, "params": {"algo": 0, "key": "000102030405060708090A0B0C0D0E0F", "nonce": "0"}},
+    {"id": 7, "type": "text", "x": 1140, "y": 260, "params": {"f": 0, "ts": 1}}
+  ],
+  "links": [
+    {"from": 2, "out": 0, "to": 3, "in": 0},
+    {"from": 2, "out": 0, "to": 4, "in": 0},
+    {"from": 4, "out": 0, "to": 5, "in": 0},
+    {"from": 4, "out": 0, "to": 6, "in": 0},
+    {"from": 6, "out": 0, "to": 7, "in": 0}
+  ]
+}

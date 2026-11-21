@@ -29,6 +29,7 @@
 
 // (its headers - Lua's, NativeDialogs.h, <filesystem> - are included at the top of Pipeline.h,
 // outside namespace pl)
+#include "../Core/CryptoLite.h"   // aes_ctr / aes_ecb / sha256 / hmac the script can call
 
 class ScriptBlock : public Block {
     lua_State* L = nullptr;
@@ -118,6 +119,44 @@ class ScriptBlock : public Block {
         lua_pushstring(l, h.c_str());
         return 1;
     }
+    // --- crypto (CryptoLite): keys and data are byte strings (or tables of byte values) ---
+    static int l_aesCtr(lua_State* l) {   // aes_ctr(key, data [, nonce]) -> string (en/decrypt)
+        const std::string key = bytesArg(l, 1), data = bytesArg(l, 2);
+        std::string nonce = lua_isnoneornil(l, 3) ? std::string() : bytesArg(l, 3);
+        if (key.size() != 16 && key.size() != 32) return luaL_error(l, "aes_ctr: key must be 16 or 32 bytes");
+        crypto::Aes a; a.setKey((const uint8_t*)key.data(), key.size());
+        uint8_t n[16] = {};
+        for (size_t i = 0; i < nonce.size() && i < 16; i++) n[i] = (uint8_t)nonce[i];
+        std::string out(data.size(), 0);
+        a.ctr(n, (const uint8_t*)data.data(), (uint8_t*)out.data(), data.size());
+        lua_pushlstring(l, out.data(), out.size());
+        return 1;
+    }
+    static int aesEcb(lua_State* l, bool enc) {
+        const std::string key = bytesArg(l, 1), data = bytesArg(l, 2);
+        if (key.size() != 16 && key.size() != 32) return luaL_error(l, "aes_ecb: key must be 16 or 32 bytes");
+        crypto::Aes a; a.setKey((const uint8_t*)key.data(), key.size());
+        std::string out = data;
+        out.resize((data.size() + 15) / 16 * 16, 0);
+        if (enc) a.ecbEncrypt((const uint8_t*)out.data(), (uint8_t*)out.data(), out.size());
+        else a.ecbDecrypt((const uint8_t*)out.data(), (uint8_t*)out.data(), out.size());
+        lua_pushlstring(l, out.data(), out.size());
+        return 1;
+    }
+    static int l_aesEcbEnc(lua_State* l) { return aesEcb(l, true); }
+    static int l_aesEcbDec(lua_State* l) { return aesEcb(l, false); }
+    static int l_sha256(lua_State* l) {   // sha256(data) -> 32-byte string
+        const std::string s = bytesArg(l, 1);
+        auto d = crypto::Sha256::of((const uint8_t*)s.data(), s.size());
+        lua_pushlstring(l, (const char*)d.data(), d.size());
+        return 1;
+    }
+    static int l_hmac(lua_State* l) {     // hmac_sha256(key, data) -> 32-byte string
+        const std::string key = bytesArg(l, 1), s = bytesArg(l, 2);
+        auto d = crypto::hmacSha256((const uint8_t*)key.data(), key.size(), (const uint8_t*)s.data(), s.size());
+        lua_pushlstring(l, (const char*)d.data(), d.size());
+        return 1;
+    }
 
     void closeState() {
         if (L) lua_close(L);
@@ -147,7 +186,9 @@ class ScriptBlock : public Block {
         for (const char* g : {"dofile", "loadfile", "collectgarbage"}) { lua_pushnil(L); lua_setglobal(L, g); }
         const luaL_Reg fns[] = {{"emit", l_emit}, {"out_real", l_outReal}, {"out_bit", l_outBit}, {"out_iq", l_outIq},
                                 {"set_levels", l_setLevels}, {"show", l_show}, {"log", l_log}, {"print", l_log},
-                                {"clear_log", l_clearLog}, {"rate", l_rate}, {"hex", l_hex}};
+                                {"clear_log", l_clearLog}, {"rate", l_rate}, {"hex", l_hex},
+                                {"aes_ctr", l_aesCtr}, {"aes_ecb_encrypt", l_aesEcbEnc}, {"aes_ecb_decrypt", l_aesEcbDec},
+                                {"sha256", l_sha256}, {"hmac_sha256", l_hmac}};
         for (const auto& f : fns) { lua_pushcfunction(L, f.func); lua_setglobal(L, f.name); }
         lua_createtable(L, 4, 0);
         for (int i = 1; i <= 4; i++) { lua_pushnumber(L, num("p" + std::to_string(i))); lua_rawseti(L, -2, i); }

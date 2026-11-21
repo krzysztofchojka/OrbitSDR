@@ -1,0 +1,22 @@
+{
+  "preset": "Lab: key bank, loop and random keys (no radio)",
+  "description": "Learning, no radio needed: where keys come from. The Key source emits one key at a time - set its mode to fixed, counter (a loop that walks the key space), random, or bank (a list you type in). Watch the keys in the Frames view, and see the same message encrypted differently by each key. This is the 'memory of keys' a brute-force attack walks through.",
+  "name": "Lab key bank",
+  "version": 1,
+  "nodes": [
+    {"id": 1, "type": "input", "x": 20, "y": 640},
+    {"id": 2, "type": "keysrc", "x": 20, "y": 60, "params": {"mode": 3, "bytes": 1, "bank": "0x11\n0x22\n0x5B\n0xC4", "every": 1.0}},
+    {"id": 3, "type": "framesview", "x": 300, "y": 40},
+    {"id": 4, "type": "msgsrc", "x": 20, "y": 300, "params": {"m": "HELLO %n", "every": 1.0}},
+    {"id": 5, "type": "xorbytes", "x": 300, "y": 300},
+    {"id": 6, "type": "framesview", "x": 580, "y": 300},
+    {"id": 7, "type": "text", "x": 860, "y": 300, "params": {"f": 2, "ts": 0}}
+  ],
+  "links": [
+    {"from": 2, "out": 0, "to": 3, "in": 0},
+    {"from": 4, "out": 0, "to": 5, "in": 0},
+    {"from": 2, "out": 0, "to": 5, "in": 1},
+    {"from": 5, "out": 0, "to": 6, "in": 0},
+    {"from": 5, "out": 0, "to": 7, "in": 0}
+  ]
+}

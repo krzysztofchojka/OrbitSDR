@@ -335,6 +335,34 @@ payload in hex. Other EByte models or settings may differ: compare the hex with 
 EByte modules that are not LoRa (E07 with a CC1101, E30 / E31 and others) send FSK: use the
 FSK packets preset with their data rate.
 
+## 9b. Encryption (teaching labs)
+
+A small set of blocks shows, on signals you make up yourself, how a message is scrambled before
+it is sent and why the whole strength is in the key. They are a classroom, not a tool against
+other people's traffic: everything works on the frames produced in the same pipeline, and
+breaking into someone else's radio is a crime (in Poland, art. 267 k.k.).
+
+| Block | What it does |
+|---|---|
+| **Key source** | emits a key as bytes: a fixed value, a counter (a loop that walks the key space), random, or a bank (a list you type). The "memory of keys". |
+| **XOR bytes with a key** | the weak cipher: XOR with a short repeating key. Wire a **Key source** into its *key* input, or type the key. The same block, same key, undoes it. |
+| **Cipher (AES)** | the strong cipher: AES-128 / 256, CTR or ECB. The same key (and CTR nonce) decrypts. |
+| **Brute force (XOR key)** | tries every key of a chosen length, keeps the one whose result reads as text (or starts with a known string, or passes a CRC), and shows the keys/second and how long the same search would take for a real 128-bit key. |
+
+The lesson: a 1 - 3 byte XOR key falls in well under a second; the brute-force block then prints
+that a 128-bit key at the same rate would take far longer than the age of the universe. A weak
+cipher is worse than none - it only looks safe. Ready-made:
+
+| Preset | Shows |
+|---|---|
+| `Lab: XOR encrypt and decrypt (no radio)` | a message, a key, scrambled, then readable again with the same key |
+| `Lab: AES encrypt and decrypt (no radio)` | real encryption; change one hex digit of the key and the output is noise |
+| `Lab: key bank, loop and random keys (no radio)` | where keys come from (fixed / counter / random / bank) |
+| `Lab: break a weak key over the air (no radio)` | the whole story: a message modulated (AFSK), demodulated readable; the same message XOR-encrypted, demodulated to garbage; the key brute-forced and the text readable again |
+
+For AES / SHA / HMAC inside your own logic, the Script block has `aes_ctr`, `aes_ecb_encrypt`
+/ `aes_ecb_decrypt`, `sha256` and `hmac_sha256` (section 11).
+
 ## 10. Saving and sharing
 
 - Every change is saved a moment later to `pipelines.json` in the settings folder.
@@ -342,7 +370,7 @@ FSK packets preset with their data rate.
   tab at a time.
 - **New / Duplicate / Rename / Delete:** manage chains.
 - **Presets:** ready-made chains (FSK, FSK packets, POCSAG, FM/AM/WFM stereo, WFM stereo + RDS, AX.25, WEFAX,
-  LRPT Meteor, LoRa, and labs that need no radio). A preset keeps the tab's receiver.
+  LRPT Meteor, LoRa, encryption labs, and labs that need no radio). A preset keeps the tab's receiver.
   - Each preset is a JSON file. The ones that come with OrbitSDR are in `assets/pipelines/` in
     the repository; after installing they are in `pipelines/` next to the program (on macOS
     in the app's `Contents/Resources/pipelines`).
@@ -495,6 +523,10 @@ What the script can call:
 | `clear_log()` | empties the log |
 | `rate(port)` | the sample rate of an input (S/s), 0 if unconnected |
 | `hex(s)` | `"01 A2 FF"` from a string or byte table |
+| `aes_ctr(key, data [, nonce])` | AES-128/256 in CTR mode (key 16 or 32 bytes); the same call en- and decrypts |
+| `aes_ecb_encrypt(key, data)` / `aes_ecb_decrypt(key, data)` | AES ECB over whole 16-byte blocks (data zero-padded) |
+| `sha256(data)` | 32-byte digest (a byte string; wrap in `hex()` to show) |
+| `hmac_sha256(key, data)` | 32-byte HMAC-SHA256 |
 | `P[1]` .. `P[4]` | the block's numeric parameters `p1` .. `p4` (tunable without editing the code) |
 | `ARG` | the block's text parameter `arg` |
 
@@ -1501,13 +1533,13 @@ parameters (key, default, range).
 
 #### XOR bytes with a key  (`xorbytes`)
 
-- in: frames (frames)
+- in: frames (frames), key (frames, optional - its latest frame is the key, overriding the parameter)
 - out: frames (frames)
 - keywords: xor key bytes scramble descramble unscramble obfuscation ebyte e32 klucz szyfrowanie odszyfrowanie
 
 | key | parameter | default | range / choices |
 |---|---|---|---|
-| `key` | Key (hex bytes) | "0x12" | text |
+| `key` | Key (hex bytes) | "0x12" | text (used when nothing is wired into the key input) |
 
 #### Reed-Solomon (255,223)  (`rs`)
 
@@ -1820,6 +1852,50 @@ parameters (key, default, range).
 
 
 ### Sinks
+
+### Crypto
+
+#### Key source  (`keysrc`)
+
+- in: none
+- out: key (frames)
+- keywords: key source bank loop counter random encryption klucz bank petla losowy szyfrowanie
+
+| key | parameter | default | range / choices |
+|---|---|---|---|
+| `mode` | Keys | 0 | 0 = fixed, 1 = counter (loop), 2 = random, 3 = bank (list) |
+| `bytes` | Key length | 1 | 1 .. 32 bytes (counter / random) |
+| `fixed` | Fixed key (hex) | "0x12" | text (mode fixed) |
+| `bank` | Bank (one hex key per line) | "0x12 / 0x37 / 0xAB" | text (mode bank) |
+| `every` | Every | 1 s | 0.01 .. 3600 s |
+
+#### Cipher (AES)  (`cipher`)
+
+- in: frames (frames), key (frames, optional - overrides the key parameter)
+- out: frames (frames)
+- keywords: cipher aes encrypt decrypt ctr ecb crypto szyfr szyfrowanie odszyfrowanie klucz
+
+| key | parameter | default | range / choices |
+|---|---|---|---|
+| `algo` | Algorithm | 0 | 0 = AES-128 CTR, 1 = AES-256 CTR, 2 = AES-128 ECB, 3 = AES-256 ECB |
+| `key` | Key (hex; 16 or 32 bytes) | 00..0F | text |
+| `nonce` | CTR nonce (hex, 16 bytes) | "0" | text (CTR modes) |
+
+CTR en- and decrypts with the same settings; ECB only encrypts whole 16-byte blocks (short data is zero-padded).
+
+#### Brute force (XOR key)  (`xorbrute`)
+
+- in: ciphertext (frames)
+- out: plaintext (frames, when a key is found)
+- keywords: brute force xor crack break key attack guess bruteforce lamanie klucz atak slabe szyfrowanie
+
+| key | parameter | default | range / choices |
+|---|---|---|---|
+| `bytes` | Key length to try | 2 | 1 .. 4 bytes |
+| `test` | Recognise plaintext by | 0 | 0 = readable text, 1 = known start, 2 = CRC-16/CCITT |
+| `prefix` | Known start | "" | text (test = known start) |
+
+Works on the ciphertext frames in the same pipeline, as a lesson in why short keys are weak.
 
 #### Audio out (speaker / sound card)  (`audio`)
 

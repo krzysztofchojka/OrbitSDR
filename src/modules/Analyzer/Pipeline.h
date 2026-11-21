@@ -1343,6 +1343,7 @@ public:
 
 #include "PipelineLora.h"     // LoRa (chirp spread spectrum): receiver and modulator
 #include "PipelineScript.h"   // Script (Lua): a protocol's logic written into the pipeline
+#include "PipelineCrypto.h"   // Crypto teaching blocks (Key source, Cipher, Brute force)
 
 #include "PipelineTelemetry.h" // packets by a length field, telemetry fields of a frame
 
@@ -1409,6 +1410,8 @@ inline const std::vector<BlockInfo>& blockList() {
         {"analyzer", "Analyzer", "Displays"},
         // code
         {"script", "Script (Lua)", "Code"},
+        // crypto (teaching labs)
+        {"keysrc", "Key source", "Crypto"}, {"cipher", "Cipher (AES)", "Crypto"}, {"xorbrute", "Brute force (XOR key)", "Crypto"},
         // outputs
         {"audio", "Audio out (speaker / sound card)", "Sinks"}, {"wavsink", "WAV file (record)", "Sinks"}, {"bytesink", "Byte file (record)", "Sinks"},
     };
@@ -1527,6 +1530,9 @@ inline const char* blockTags(const std::string& t) {
         {"image", "image view picture png save display obraz zdjecie zapis"},
         {"analyzer", "analyzer classify modulation identify what is this signal analizator rozpoznawanie modulacji"},
         {"script", "script lua code program custom protocol logic syndrome checksum parser state machine kod skrypt wlasny protokol"},
+        {"keysrc", "key source bank loop counter random encryption klucz bank petla losowy szyfrowanie"},
+        {"cipher", "cipher aes encrypt decrypt ctr ecb crypto szyfr szyfrowanie odszyfrowanie klucz"},
+        {"xorbrute", "brute force xor crack break key attack guess bruteforce lamanie klucz atak slabe szyfrowanie"},
         {"audio", "audio speaker sound card output headphones play dzwiek glosnik karta dzwiekowa sluchawki"},
         {"wavsink", "wav file record save output iq recording zapis nagrywanie plik"},
         {"bytesink", "file record save bytes binary output dump zapis plik binarny"},
@@ -1638,6 +1644,9 @@ inline std::unique_ptr<Block> makeBlockRaw(const std::string& t) {
     if (t == "slice") return std::make_unique<SliceFrames>();
     if (t == "xorbytes") return std::make_unique<XorBytes>();
     if (t == "script") return std::make_unique<ScriptBlock>();
+    if (t == "keysrc") return std::make_unique<KeySource>();
+    if (t == "cipher") return std::make_unique<CipherBlock>();
+    if (t == "xorbrute") return std::make_unique<XorBrute>();
     if (t == "text") return std::make_unique<TextDisplay>();
     if (t == "probe") return std::make_unique<ProbeBlock>();
     if (t == "waterfall") return std::make_unique<WaterfallBlock>();
@@ -1675,6 +1684,7 @@ inline sf::Color categoryColor(const std::string& c) {
     if (c == "Sinks") return sf::Color(150, 200, 90);
     if (c == "Control") return sf::Color(80, 200, 150);
     if (c == "Code") return sf::Color(240, 220, 90);
+    if (c == "Crypto") return sf::Color(210, 130, 230);
     return sf::Color(120, 125, 140);   // Displays
 }
 

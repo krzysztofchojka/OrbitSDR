@@ -1,0 +1,25 @@
+{
+  "preset": "Lab: XOR encrypt and decrypt (no radio)",
+  "description": "Learning, no radio needed: a message and a shared key. XOR with the key scrambles it (the middle Text display); XOR with the same key again brings it back (the right Text display). The Key source can be a fixed key, a counter, random, or a bank of keys. XOR with a short repeating key is a weak cipher - see the brute-force lab.",
+  "name": "Lab XOR encrypt decrypt",
+  "version": 1,
+  "nodes": [
+    {"id": 1, "type": "input", "x": 20, "y": 640},
+    {"id": 2, "type": "msgsrc", "x": 20, "y": 40, "params": {"m": "MEET AT 0900 - ALL CLEAR %n", "every": 1.5}},
+    {"id": 3, "type": "keysrc", "x": 20, "y": 240, "params": {"mode": 0, "fixed": "0x5B", "every": 1.5}},
+    {"id": 4, "type": "text", "x": 300, "y": 40, "params": {"f": 2, "ts": 1}},
+    {"id": 5, "type": "xorbytes", "x": 300, "y": 260},
+    {"id": 6, "type": "text", "x": 580, "y": 260, "params": {"f": 2, "ts": 1}},
+    {"id": 7, "type": "xorbytes", "x": 860, "y": 260},
+    {"id": 8, "type": "text", "x": 1140, "y": 260, "params": {"f": 0, "ts": 1}}
+  ],
+  "links": [
+    {"from": 2, "out": 0, "to": 4, "in": 0},
+    {"from": 2, "out": 0, "to": 5, "in": 0},
+    {"from": 3, "out": 0, "to": 5, "in": 1},
+    {"from": 5, "out": 0, "to": 6, "in": 0},
+    {"from": 5, "out": 0, "to": 7, "in": 0},
+    {"from": 3, "out": 0, "to": 7, "in": 1},
+    {"from": 7, "out": 0, "to": 8, "in": 0}
+  ]
+}
